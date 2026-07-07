@@ -104,6 +104,12 @@ def exists(val):
 def default(val, d):
     return val if exists(val) else d
 
+def safe_float(val, default_value = 0.):
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default_value
+
 def noop(*args, **kwargs):
     pass
 
@@ -605,6 +611,7 @@ class SoundStreamTrainer(nn.Module):
         self.best_eval_batches = best_eval_batches
         self.best_validation_seed = random_split_seed
         self.fixed_best_valid_waves = None
+        self.fixed_result_valid_samples = None
         self.save_results_every = save_results_every
         self.log_losses_every = log_losses_every
         self.best_checkpoint_metric = best_checkpoint_metric
@@ -1031,6 +1038,37 @@ class SoundStreamTrainer(nn.Module):
         rms_ratio = (recon_rms / target_rms).mean()
         boundary_loss = target.new_tensor(0.)
 
+        target_peak = target.abs().amax(dim = -1).mean()
+        recon_peak = recon.abs().amax(dim = -1).mean()
+        target_clip_fraction = (target.abs() >= 0.98).float().mean()
+        recon_clip_fraction = (recon.abs() >= 0.98).float().mean()
+
+        if target.shape[-1] > 1 and recon.shape[-1] > 1:
+            target_jump = target.diff(dim = -1).abs()
+            recon_jump = recon.diff(dim = -1).abs()
+            target_max_jump = target_jump.amax(dim = -1).mean()
+            recon_max_jump = recon_jump.amax(dim = -1).mean()
+            target_p999_jump = torch.quantile(
+                target_jump.flatten(),
+                0.999
+            )
+            recon_p999_jump = torch.quantile(
+                recon_jump.flatten(),
+                0.999
+            )
+        else:
+            target_max_jump = target.new_tensor(0.)
+            recon_max_jump = recon.new_tensor(0.)
+            target_p999_jump = target.new_tensor(0.)
+            recon_p999_jump = recon.new_tensor(0.)
+
+        jump_ratio = recon_max_jump / target_max_jump.clamp_min(1e-8)
+        p999_jump_ratio = recon_p999_jump / target_p999_jump.clamp_min(1e-8)
+        click_score = (
+            recon_max_jump /
+            recon_rms.mean().clamp_min(1e-8)
+        )
+
         if hasattr(model, 'frame_boundary_loss'):
             boundary_loss = model.frame_boundary_loss(recon)
 
@@ -1137,6 +1175,17 @@ class SoundStreamTrainer(nn.Module):
             boundary_loss = float(boundary_loss.detach().cpu()),
             energy_loss = float(energy_loss.detach().cpu()),
             rms_ratio = float(rms_ratio.detach().cpu()),
+            target_peak = float(target_peak.detach().cpu()),
+            recon_peak = float(recon_peak.detach().cpu()),
+            target_clip_fraction = float(target_clip_fraction.detach().cpu()),
+            recon_clip_fraction = float(recon_clip_fraction.detach().cpu()),
+            target_max_jump = float(target_max_jump.detach().cpu()),
+            recon_max_jump = float(recon_max_jump.detach().cpu()),
+            target_p999_jump = float(target_p999_jump.detach().cpu()),
+            recon_p999_jump = float(recon_p999_jump.detach().cpu()),
+            jump_ratio = float(jump_ratio.detach().cpu()),
+            p999_jump_ratio = float(p999_jump_ratio.detach().cpu()),
+            click_score = float(click_score.detach().cpu()),
             correlation = float(correlation.detach().cpu()),
             si_sdr = float(si_sdr.detach().cpu()),
             aligned_correlation = float(aligned_correlation.detach().cpu()),
@@ -1449,6 +1498,215 @@ class SoundStreamTrainer(nn.Module):
         averaged_metrics['code_counts'] = total_code_counts.detach().cpu()
         averaged_metrics['num_samples'] = total_samples
         return averaged_metrics
+
+    def dataset_file_at(self, dataset, index):
+        if isinstance(dataset, Subset):
+            return self.dataset_file_at(dataset.dataset, dataset.indices[index])
+
+        files = getattr(dataset, 'files', None)
+        if exists(files) and index < len(files):
+            return Path(files[index])
+
+        return None
+
+    def speaker_gender_map(self, files):
+        speaker_file = None
+        for file in files:
+            if not exists(file):
+                continue
+            for parent in Path(file).parents:
+                candidate = parent / 'SPEAKERS.TXT'
+                if candidate.exists():
+                    speaker_file = candidate
+                    break
+            if exists(speaker_file):
+                break
+
+        if not exists(speaker_file):
+            return {}
+
+        genders = {}
+        try:
+            lines = speaker_file.read_text(
+                encoding = 'utf-8',
+                errors = 'ignore'
+            ).splitlines()
+        except OSError:
+            return {}
+
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith(';') or '|' not in line:
+                continue
+
+            parts = [part.strip() for part in line.split('|')]
+            if len(parts) < 2:
+                continue
+
+            speaker_id, gender = parts[0], parts[1].upper()
+            if gender in {'M', 'F'}:
+                genders[speaker_id] = gender
+
+        return genders
+
+    def validation_sample_profile(self, index):
+        wave = self.valid_dataset[index]
+        wave = wave[0] if isinstance(wave, (tuple, list)) else wave
+        wave = wave.detach().cpu().float()
+
+        file = self.dataset_file_at(self.valid_dataset, index)
+        speaker_id = Path(file).parts[-3] if exists(file) and len(Path(file).parts) >= 3 else ''
+
+        rms = wave.square().mean().clamp_min(1e-8).sqrt().item()
+        peak = wave.abs().max().item()
+        silence_fraction = (
+            wave.abs() < max(0.005, rms * 0.1)
+        ).float().mean().item()
+        duration = wave.numel() / max(float(self.unwrapped_soundstream.target_sample_hz), 1.)
+        original_duration = duration
+
+        if exists(file):
+            try:
+                info = torchaudio.info(str(file))
+                original_duration = info.num_frames / max(float(info.sample_rate), 1.)
+            except Exception:
+                original_duration = duration
+
+        onset_samples = min(
+            wave.numel(),
+            max(1, int(0.08 * self.unwrapped_soundstream.target_sample_hz))
+        )
+        onset = wave[:onset_samples]
+        onset_peak = onset.abs().max().item() if onset.numel() > 0 else 0.
+        onset_jump = (
+            onset.diff().abs().max().item()
+            if onset.numel() > 1
+            else 0.
+        )
+
+        return dict(
+            index = index,
+            file = str(file) if exists(file) else '',
+            speaker_id = speaker_id,
+            gender = '',
+            wave = wave,
+            rms = rms,
+            peak = peak,
+            silence_fraction = silence_fraction,
+            duration = duration,
+            original_duration = original_duration,
+            onset_peak = onset_peak,
+            onset_jump = onset_jump,
+            onset_score = onset_peak / max(rms, 1e-8) + onset_jump / max(rms, 1e-8)
+        )
+
+    def fixed_result_validation_samples(self):
+        if exists(getattr(self, 'fixed_result_valid_samples', None)):
+            return self.fixed_result_valid_samples
+
+        max_candidates = min(len(self.valid_dataset), max(128, self.best_eval_batches * 20))
+        profiles = [
+            self.validation_sample_profile(index)
+            for index in range(max_candidates)
+        ]
+        genders = self.speaker_gender_map(
+            [profile['file'] for profile in profiles if profile['file']]
+        )
+        for profile in profiles:
+            profile['gender'] = genders.get(profile['speaker_id'], '')
+
+        selected = []
+        selected_indices = set()
+
+        def add_best(label, key, *, reverse = True, predicate = lambda profile: True):
+            candidates = [
+                profile
+                for profile in profiles
+                if (
+                    profile['index'] not in selected_indices and
+                    predicate(profile)
+                )
+            ]
+            if not candidates:
+                return
+
+            chosen = sorted(
+                candidates,
+                key = lambda profile: safe_float(profile.get(key)),
+                reverse = reverse
+            )[0]
+            chosen = dict(chosen)
+            chosen['label'] = label
+            selected.append(chosen)
+            selected_indices.add(chosen['index'])
+
+        add_best('male_loud', 'rms', predicate = lambda profile: profile['gender'] == 'M')
+        add_best('male_quiet', 'rms', reverse = False, predicate = lambda profile: profile['gender'] == 'M')
+        add_best('female_loud', 'rms', predicate = lambda profile: profile['gender'] == 'F')
+        add_best('female_quiet', 'rms', reverse = False, predicate = lambda profile: profile['gender'] == 'F')
+        add_best('short_utterance', 'original_duration', reverse = False)
+        add_best('long_utterance', 'original_duration')
+        add_best('opening_plosive_or_transient', 'onset_score')
+        add_best('silence_rich', 'silence_fraction')
+        add_best('high_peak', 'peak')
+
+        median_candidates = [
+            profile
+            for profile in profiles
+            if profile['index'] not in selected_indices
+        ]
+        if median_candidates:
+            median_rms = float(np.median([profile['rms'] for profile in profiles]))
+            chosen = sorted(
+                median_candidates,
+                key = lambda profile: abs(profile['rms'] - median_rms)
+            )[0]
+            chosen = dict(chosen)
+            chosen['label'] = 'median_reference'
+            selected.append(chosen)
+            selected_indices.add(chosen['index'])
+
+        for profile in profiles:
+            if len(selected) >= 10:
+                break
+            if profile['index'] in selected_indices:
+                continue
+            profile = dict(profile)
+            profile['label'] = f'extra_{len(selected):02d}'
+            selected.append(profile)
+            selected_indices.add(profile['index'])
+
+        selected = selected[:10]
+        self.fixed_result_valid_samples = selected
+
+        if self.is_main:
+            sample_dir = self.results_folder / 'fixed_validation_samples'
+            sample_dir.mkdir(parents = True, exist_ok = True)
+            manifest = sample_dir / 'manifest.tsv'
+            with manifest.open('w', encoding = 'utf-8') as f:
+                f.write(
+                    'slot\tlabel\tgender\tspeaker_id\trms\tpeak\t'
+                    'silence_fraction\toriginal_duration\tonset_peak\t'
+                    'onset_jump\tsource_file\n'
+                )
+                for slot, profile in enumerate(selected):
+                    f.write(
+                        f"{slot:02d}\t{profile['label']}\t{profile['gender']}\t"
+                        f"{profile['speaker_id']}\t{profile['rms']:.9f}\t"
+                        f"{profile['peak']:.9f}\t{profile['silence_fraction']:.9f}\t"
+                        f"{profile['original_duration']:.3f}\t"
+                        f"{profile['onset_peak']:.9f}\t"
+                        f"{profile['onset_jump']:.9f}\t{profile['file']}\n"
+                    )
+
+        return selected
+
+    def fixed_result_validation_batch(self):
+        samples = self.fixed_result_validation_samples()
+        waves = [sample['wave'] for sample in samples]
+        min_len = min(wave.shape[-1] for wave in waves)
+        waves = [wave[:min_len] for wave in waves]
+        return torch.stack(waves), samples
 
     def fixed_validation_waves(self):
         if exists(self.fixed_best_valid_waves):
@@ -1903,7 +2161,11 @@ class SoundStreamTrainer(nn.Module):
             if self.use_ema:
                 models.append((self.ema_soundstream.ema_model if self.use_ema else self.unwrapped_soundstream, f'{steps}.ema'))
 
-            wave, = next(self.valid_dl_iter)
+            sample_infos = None
+            if self.best_checkpoint_metric == 'recon_pretrain':
+                wave, sample_infos = self.fixed_result_validation_batch()
+            else:
+                wave, = next(self.valid_dl_iter)
             wave = wave.to(device)
 
             for model, label in models:
@@ -1914,12 +2176,50 @@ class SoundStreamTrainer(nn.Module):
                     recons = model(wave, return_recons_only = True)
 
                 if self.is_main:
+                    fixed_sample_dir = self.results_folder / 'fixed_validation_samples'
                     for ind, recon in enumerate(recons.unbind(dim = 0)):
-                        filename = str(
-                            self.results_folder /
-                            f'sample_{label}_{ind:02d}.flac'
-                        )
-                        torchaudio.save(filename, recon.cpu().detach(), self.unwrapped_soundstream.target_sample_hz)
+                        if exists(sample_infos):
+                            sample_info = sample_infos[ind]
+                            sample_label = re.sub(
+                                r'[^A-Za-z0-9_.-]+',
+                                '_',
+                                sample_info['label']
+                            )
+                            source_filename = (
+                                fixed_sample_dir /
+                                f"input_{ind:02d}_{sample_label}.flac"
+                            )
+                            if not source_filename.exists():
+                                source_wave = wave[ind].detach().cpu()
+                                if source_wave.ndim == 1:
+                                    source_wave = source_wave.unsqueeze(0)
+                                save_audio_file(
+                                    source_filename,
+                                    source_wave,
+                                    self.unwrapped_soundstream.target_sample_hz
+                                )
+
+                            filename = (
+                                fixed_sample_dir /
+                                f"recon_{label}_{ind:02d}_{sample_label}.flac"
+                            )
+                            recon_wave = recon.cpu().detach()
+                            if recon_wave.ndim == 1:
+                                recon_wave = recon_wave.unsqueeze(0)
+                            save_audio_file(
+                                filename,
+                                recon_wave,
+                                self.unwrapped_soundstream.target_sample_hz
+                            )
+                        else:
+                            filename = str(
+                                self.results_folder /
+                                f'sample_{label}_{ind:02d}.flac'
+                            )
+                            recon_wave = recon.cpu().detach()
+                            if recon_wave.ndim == 1:
+                                recon_wave = recon_wave.unsqueeze(0)
+                            torchaudio.save(filename, recon_wave, self.unwrapped_soundstream.target_sample_hz)
 
             self.print(f'{steps}: saving to {str(self.results_folder)}')
 
@@ -1989,6 +2289,10 @@ class SoundStreamTrainer(nn.Module):
                 f"ema_si_sdr={ema_score['si_sdr']:.3f}, "
                 f"ema_aligned_corr={ema_score['aligned_correlation']:.3f}, "
                 f"ema_aligned_si_sdr={ema_score['aligned_si_sdr']:.3f}, "
+                f"ema_peak={ema_score.get('recon_peak', 0.):.3f}, "
+                f"ema_clip={ema_score.get('recon_clip_fraction', 0.) * 100:.3f}%, "
+                f"ema_jump_ratio={ema_score.get('jump_ratio', 0.):.2f}, "
+                f"ema_click={ema_score.get('click_score', 0.):.1f}, "
                 f"ema_active_codes={ema_score['active_code_ratio']:.3f}, "
                 f"ema_perplexity={ema_score['codebook_perplexity']:.1f}, "
                 f"ema_rvq_ok={ema_score.get('rvq_validation_eligible', 0.):.0f}, "
@@ -2005,6 +2309,10 @@ class SoundStreamTrainer(nn.Module):
                 f"online_si_sdr={online_score['si_sdr']:.3f}, "
                 f"online_aligned_corr={online_score['aligned_correlation']:.3f}, "
                 f"online_aligned_si_sdr={online_score['aligned_si_sdr']:.3f}, "
+                f"online_peak={online_score.get('recon_peak', 0.):.3f}, "
+                f"online_clip={online_score.get('recon_clip_fraction', 0.) * 100:.3f}%, "
+                f"online_jump_ratio={online_score.get('jump_ratio', 0.):.2f}, "
+                f"online_click={online_score.get('click_score', 0.):.1f}, "
                 f"online_active_codes={online_score['active_code_ratio']:.3f}, "
                 f"online_perplexity={online_score['codebook_perplexity']:.1f}, "
                 f"online_q00_ok={online_score.get('q00_validation_eligible', 0.):.0f}, "

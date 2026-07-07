@@ -64,7 +64,11 @@ def latest_checkpoint(*, use_ema: bool) -> Path | None:
             "best.pt",
         )
         if use_ema
-        else ("best.pt",)
+        else (
+            "best_by_aligned_si_sdr.pt",
+            "best_selected.pt",
+            "best.pt",
+        )
     )
 
     for results_dir in DEFAULT_RESULTS_DIRS:
@@ -126,6 +130,29 @@ def parse_args() -> argparse.Namespace:
         choices=tuple(BITRATE_TO_QUANTIZERS),
         default=None,
         help="Codec payload bitrate. Defaults to all RVQ quantizers in the checkpoint.",
+    )
+    parser.add_argument(
+        "--block-seconds",
+        type=float,
+        default=5.0,
+        help=(
+            "Block size for non-streaming SoundStream inference. "
+            "Defaults to the stage-1 final-test setting."
+        ),
+    )
+    parser.add_argument(
+        "--context-ms",
+        type=float,
+        default=60.0,
+        help=(
+            "Previous-audio context prepended to each non-streaming block. "
+            "The context is discarded from the output. Defaults to the stage-1 final-test setting."
+        ),
+    )
+    parser.add_argument(
+        "--whole-file",
+        action="store_true",
+        help="Disable block/context inference and run ordinary whole-file inference.",
     )
 
     return parser.parse_args()
@@ -220,6 +247,65 @@ def run_frame_streaming_codec(
     return torch.cat(reconstructed_frames, dim=-1)
 
 
+def run_block_context_codec(
+    model: SoundStream,
+    wave: torch.Tensor,
+    *,
+    num_quantizers: int,
+    block_seconds: float,
+    context_ms: float,
+) -> torch.Tensor:
+    sample_rate = int(model.target_sample_hz)
+    frame_multiple = int(model.seq_len_multiple_of)
+    block_samples = int(round(block_seconds * sample_rate))
+    context_samples = int(round(context_ms * sample_rate / 1000.0))
+
+    if block_samples <= 0:
+        raise ValueError("--block-seconds must be greater than 0.")
+    if context_samples < 0:
+        raise ValueError("--context-ms cannot be negative.")
+    if block_samples % frame_multiple != 0:
+        raise ValueError(
+            f"--block-seconds={block_seconds} gives {block_samples} samples, "
+            f"which is not divisible by model seq_len_multiple_of={frame_multiple}."
+        )
+    if context_samples % frame_multiple != 0:
+        raise ValueError(
+            f"--context-ms={context_ms} gives {context_samples} samples, "
+            f"which is not divisible by model seq_len_multiple_of={frame_multiple}."
+        )
+
+    reconstructed_blocks = []
+    for start in range(0, wave.shape[-1], block_samples):
+        current = wave[..., start:(start + block_samples)]
+        valid_samples = current.shape[-1]
+        padded_length = (
+            (valid_samples + frame_multiple - 1)
+            // frame_multiple
+            * frame_multiple
+        )
+        current_padded = F.pad(
+            current,
+            (0, padded_length - valid_samples)
+        )
+
+        previous_start = max(0, start - context_samples)
+        context = wave[..., previous_start:start]
+        codec_input = torch.cat((context, current_padded), dim=-1)
+        reconstructed = model(
+            codec_input.unsqueeze(0),
+            return_recons_only=True,
+            num_quantizers=num_quantizers,
+        )
+        reconstructed = reconstructed[
+            ...,
+            context.shape[-1]:(context.shape[-1] + valid_samples)
+        ]
+        reconstructed_blocks.append(reconstructed)
+
+    return torch.cat(reconstructed_blocks, dim=-1)
+
+
 def main() -> None:
     args = parse_args()
 
@@ -267,22 +353,36 @@ def main() -> None:
     wave = load_audio(args.input_audio, target_sample_rate=sample_rate)
     original_num_samples = wave.shape[-1]
     frame_multiple = int(model.seq_len_multiple_of)
-    padded_num_samples = (
-        (original_num_samples + frame_multiple - 1)
-        // frame_multiple
-        * frame_multiple
-    )
-    wave = F.pad(wave, (0, padded_num_samples - original_num_samples))
 
     with torch.inference_mode():
         wave = wave.to(args.device)
         if isinstance(model, FrameStreamingSoundStream):
+            padded_num_samples = (
+                (original_num_samples + frame_multiple - 1)
+                // frame_multiple
+                * frame_multiple
+            )
+            wave = F.pad(wave, (0, padded_num_samples - original_num_samples))
             recon = run_frame_streaming_codec(model, wave, num_quantizers)
-        else:
+        elif args.whole_file:
+            padded_num_samples = (
+                (original_num_samples + frame_multiple - 1)
+                // frame_multiple
+                * frame_multiple
+            )
+            wave = F.pad(wave, (0, padded_num_samples - original_num_samples))
             recon = model(
                 wave.unsqueeze(0),
                 return_recons_only=True,
                 num_quantizers=num_quantizers,
+            )
+        else:
+            recon = run_block_context_codec(
+                model,
+                wave,
+                num_quantizers=num_quantizers,
+                block_seconds=args.block_seconds,
+                context_ms=args.context_ms,
             )
 
     recon = recon.squeeze(0).detach().cpu()
@@ -318,6 +418,15 @@ def main() -> None:
     )
     print(f"RVQ quantizers: {num_quantizers}/{model.num_quantizers}")
     print(f"Codec payload bitrate: {bitrate:.0f} bps")
+    if isinstance(model, FrameStreamingSoundStream):
+        print(f"Inference mode: frame streaming ({model.stream_frame_size} samples/frame)")
+    elif args.whole_file:
+        print("Inference mode: whole file")
+    else:
+        print(
+            "Inference mode: block/context "
+            f"({args.block_seconds:.3f} s blocks, {args.context_ms:.3f} ms context)"
+        )
 
 
 if __name__ == "__main__":

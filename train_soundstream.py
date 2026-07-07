@@ -53,7 +53,7 @@ STAGE_DEFAULTS = {
         save_every=2_000, eval_every=250, min_steps=10_000, patience=40,
         lr=2e-4, discr_lr=None, ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
-        use_ema=True,
+        use_ema=False,
         gan_start=0, gan_ramp=0,
     ),
     "gan_pretrain": dict(
@@ -232,7 +232,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--si-sdr-loss-weight",
         type=float,
-        default=0.02,
+        default=0.01,
         help=(
             "Maximum SI-SDR loss weight for recon_pretrain. "
             "Use 0 for the pure Saturday baseline; other stages keep it disabled."
@@ -241,7 +241,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--si-sdr-loss-warmup-steps",
         type=int,
-        default=10_000,
+        default=15_000,
         help="Linearly ramp SI-SDR loss weight over this many recon_pretrain steps.",
     )
     parser.add_argument(
@@ -897,6 +897,10 @@ def main() -> None:
                 f"si_sdr={test_metrics['si_sdr']:.6f}, "
                 f"aligned_corr={test_metrics['aligned_correlation']:.6f}, "
                 f"aligned_si_sdr={test_metrics['aligned_si_sdr']:.6f}, "
+                f"recon_peak={test_metrics.get('recon_peak', 0.):.6f}, "
+                f"recon_clip={test_metrics.get('recon_clip_fraction', 0.) * 100:.6f}%, "
+                f"jump_ratio={test_metrics.get('jump_ratio', 0.):.6f}, "
+                f"click_score={test_metrics.get('click_score', 0.):.6f}, "
                 f"active_codes={test_metrics['active_code_ratio']:.6f}, "
                 f"perplexity={test_metrics['codebook_perplexity']:.6f}"
             )
