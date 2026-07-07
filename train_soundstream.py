@@ -1,0 +1,865 @@
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import random
+import re
+import shutil
+import tempfile
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.optim.lr_scheduler import LambdaLR
+
+PROJECT_DIR = Path(__file__).resolve().parent
+RUNTIME_TMP_DIR = PROJECT_DIR / ".runtime-tmp"
+RUNTIME_TMP_DIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("TMP", str(RUNTIME_TMP_DIR))
+os.environ.setdefault("TEMP", str(RUNTIME_TMP_DIR))
+os.environ.setdefault("WANDB_MODE", "disabled")
+os.environ.setdefault("WANDB_SILENT", "true")
+tempfile.tempdir = str(RUNTIME_TMP_DIR)
+
+from audiolm_pytorch import FrameStreamingSoundStream, SoundStream, SoundStreamTrainer
+
+DEFAULT_AUDIO_DIR = (
+    PROJECT_DIR
+    / "data"
+    / "librispeech"
+    / "LibriSpeech"
+    / "train-clean-100"
+)
+
+STAGE_RESULTS_DIRS = {
+    "overfit": PROJECT_DIR / "results" / "overfit-64d-23q",
+    "recon_pretrain": PROJECT_DIR / "results" / "recon-pretrain-64d-23q",
+    "gan_pretrain": PROJECT_DIR / "results" / "gan-pretrain-64d-23q",
+    "stream_finetune": PROJECT_DIR / "results" / "stream-finetune-64d-23q",
+    "stream_finetune_long": PROJECT_DIR / "results" / "stream-finetune-long-64d-23q",
+}
+
+STAGE_DEFAULTS = {
+    "overfit": dict(
+        steps=5_000, batch_size=4, segment_seconds=2.,
+        save_every=500, eval_every=100, min_steps=0, patience=30,
+        lr=3e-4, discr_lr=None, ema_beta=0.95,
+        ema_update_after_step=0, ema_update_every=1,
+        gan_start=0, gan_ramp=0,
+    ),
+    "recon_pretrain": dict(
+        steps=60_000, batch_size=6, segment_seconds=2.,
+        save_every=2_000, eval_every=250, min_steps=10_000, patience=40,
+        lr=2e-4, discr_lr=None, ema_beta=0.999,
+        ema_update_after_step=0, ema_update_every=1,
+        use_ema=False,
+        gan_start=0, gan_ramp=0,
+    ),
+    "gan_pretrain": dict(
+        steps=30_000, batch_size=4, segment_seconds=2.,
+        save_every=2_000, eval_every=250, min_steps=5_000, patience=30,
+        lr=5e-5, discr_lr=5e-5, ema_beta=0.999,
+        ema_update_after_step=0, ema_update_every=1,
+        gan_start=0, gan_ramp=10_000,
+    ),
+    "stream_finetune": dict(
+        steps=20_000, batch_size=4, segment_seconds=2.,
+        save_every=1_000, eval_every=250, min_steps=5_000, patience=30,
+        lr=3e-5, discr_lr=5e-5, ema_beta=0.999,
+        ema_update_after_step=0, ema_update_every=1,
+        gan_start=5_000, gan_ramp=10_000,
+    ),
+    "stream_finetune_long": dict(
+        steps=5_000, batch_size=2, segment_seconds=4.,
+        save_every=1_000, eval_every=250, min_steps=1_000, patience=15,
+        lr=1e-5, discr_lr=2e-5, ema_beta=0.999,
+        ema_update_after_step=0, ema_update_every=1,
+        gan_start=1_000, gan_ramp=2_000,
+    ),
+}
+
+
+def recon_pretrain_lr_multiplier(step: int) -> float:
+    """Stage-1 LR: 2e-4 -> 5e-5 at 30k -> 1e-5 at 50k."""
+    if step < 30_000:
+        return 1.0
+    if step < 50_000:
+        return 0.25
+    return 0.05
+
+
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+SUPPORTED_AUDIO_EXTENSIONS = {
+    ".wav",
+    ".flac",
+    ".mp3",
+    ".webm",
+}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Train a staged 9.2 kbps streaming SoundStream speech codec."
+    )
+
+    parser.add_argument(
+        "--audio-dir",
+        type=Path,
+        default=DEFAULT_AUDIO_DIR,
+    )
+    parser.add_argument(
+        "--results-dir",
+        type=Path,
+        default=None,
+    )
+    parser.add_argument(
+        "--stage",
+        choices=tuple(STAGE_DEFAULTS),
+        default="overfit",
+        help="Training phase: overfit, reconstruction, GAN, or streaming fine-tuning.",
+    )
+    parser.add_argument(
+        "--init-checkpoint",
+        type=Path,
+        default=None,
+        help="Optional model-only checkpoint used to initialize a new stage.",
+    )
+    parser.add_argument(
+        "--predecessor-results-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional results directory for the preceding stage. "
+            "Uses best_selected.pt unless --init-checkpoint is provided."
+        ),
+    )
+    parser.add_argument(
+        "--overfit-files",
+        type=int,
+        default=10,
+        help="Number of deterministic files used by the overfit diagnostic stage.",
+    )
+    parser.add_argument(
+        "--num-train-steps",
+        type=int,
+        default=None,
+        help="Defaults depend on --stage.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Per-GPU batch size; defaults depend on --stage.",
+    )
+    parser.add_argument(
+        "--segment-seconds",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--save-model-every",
+        type=int,
+        default=None,
+        help="Defaults depend on --stage.",
+    )
+    parser.add_argument(
+        "--best-eval-every",
+        type=int,
+        default=None,
+        help="Defaults depend on --stage.",
+    )
+    parser.add_argument(
+        "--best-eval-batches",
+        type=int,
+        default=26,
+        help="Number of fixed validation batches averaged for best checkpoint selection.",
+    )
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=None,
+        help="Validation checks without improvement before stopping.",
+    )
+    parser.add_argument(
+        "--early-stopping-min-delta",
+        type=float,
+        default=0.0,
+        help="Minimum validation-score decrease required to reset early-stopping patience.",
+    )
+    parser.add_argument(
+        "--early-stopping-min-steps",
+        type=int,
+        default=None,
+        help="Minimum completed steps before patience can accumulate.",
+    )
+    parser.add_argument(
+        "--save-results-every",
+        type=int,
+        default=1_000,
+    )
+    parser.add_argument(
+        "--grad-accum-every",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
+        "--dl-num-workers",
+        type=int,
+        default=6,
+        help="DataLoader worker processes per GPU. Use 0 for fully synchronous loading.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for Python, NumPy, PyTorch, data split, and dataloader shuffle.",
+    )
+    parser.add_argument(
+        "--si-sdr-loss-weight",
+        type=float,
+        default=0.05,
+        help="Maximum SI-SDR loss weight for recon_pretrain. Other stages keep it disabled.",
+    )
+    parser.add_argument(
+        "--si-sdr-loss-warmup-steps",
+        type=int,
+        default=10_000,
+        help="Linearly ramp SI-SDR loss weight over this many recon_pretrain steps.",
+    )
+    parser.add_argument(
+        "--stream-context-frames",
+        type=int,
+        default=0,
+        help="Deprecated compatibility option; streaming now uses per-layer activation state.",
+    )
+    parser.add_argument(
+        "--boundary-loss-weight",
+        type=float,
+        default=0.1,
+    )
+    parser.add_argument(
+        "--boundary-loss-radius",
+        type=int,
+        default=8,
+    )
+    parser.add_argument(
+        "--valid-frac",
+        type=float,
+        default=0.05,
+    )
+    parser.add_argument(
+        "--test-frac",
+        type=float,
+        default=0.05,
+    )
+    parser.add_argument(
+        "--test-eval-batches",
+        type=int,
+        default=None,
+        help="Limit final held-out test files. Defaults to the full test split.",
+    )
+    parser.add_argument(
+        "--test-block-seconds",
+        type=float,
+        default=5.0,
+        help="Block length used for deterministic full-file test evaluation.",
+    )
+    parser.add_argument(
+        "--test-context-ms",
+        type=float,
+        default=60.0,
+        help="Previous-audio context for non-streaming checkpoints; stateful streaming tests carry state continuously.",
+    )
+    parser.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+
+    return parser.parse_args()
+
+
+def checkpoint_step(path: Path) -> int:
+    match = re.fullmatch(
+        r"soundstream\.(\d+)\.pt",
+        path.name,
+    )
+    return int(match.group(1)) if match else -1
+
+
+def latest_checkpoint(results_dir: Path) -> Path | None:
+    if not results_dir.exists():
+        return None
+
+    latest = results_dir / "latest.pt"
+    if latest.exists():
+        return latest
+
+    checkpoints = [
+        path
+        for path in results_dir.glob("soundstream.*.pt")
+        if checkpoint_step(path) >= 0
+    ]
+
+    return max(
+        checkpoints,
+        key=checkpoint_step,
+        default=None,
+    )
+
+
+def calculate_bitrate(
+    sample_rate: int,
+    strides: tuple[int, ...],
+    codebook_size: int,
+    num_quantizers: int,
+) -> float:
+    downsample_factor = math.prod(strides)
+    frame_rate = sample_rate / downsample_factor
+    bits_per_token = math.log2(codebook_size)
+
+    return frame_rate * num_quantizers * bits_per_token
+
+
+def load_model_weights_only(
+    model: torch.nn.Module,
+    checkpoint: Path,
+) -> None:
+    pkg = torch.load(str(checkpoint), map_location="cpu")
+    state_dict = pkg["model"] if "model" in pkg else pkg
+    model.load_state_dict(state_dict, strict=True)
+
+
+def build_model(
+    stage: str,
+    *,
+    sample_rate: int,
+    strides: tuple[int, ...],
+    stream_frame_size: int,
+    stream_context_frames: int,
+    boundary_loss_weight: float,
+    boundary_loss_radius: int,
+    codebook_size: int,
+    num_quantizers: int,
+    si_sdr_loss_weight: float,
+    sync_codebook: bool | None = None,
+) -> SoundStream:
+    if sync_codebook is None:
+        sync_codebook = int(os.environ.get("WORLD_SIZE", "1")) > 1
+
+    model_kwargs = dict(
+        channels=16,
+        channel_mults=(2, 4, 8, 16),
+        codebook_dim=64,
+        codebook_size=codebook_size,
+        rq_num_quantizers=num_quantizers,
+        rq_groups=1,
+        use_lookup_free_quantizer=False,
+        use_finite_scalar_quantizer=False,
+        use_local_attn=False,
+        target_sample_hz=sample_rate,
+        strides=strides,
+        recon_loss_weight=(
+            10.
+            if stage in ("overfit", "recon_pretrain")
+            else 1.
+        ),
+        multi_spectral_recon_loss_weight=1.,
+        si_sdr_loss_weight=si_sdr_loss_weight,
+        correlation_loss_weight=(
+            0.5
+            if stage == "recon_pretrain"
+            else 0.
+        ),
+        energy_loss_weight=0.1,
+        commitment_loss_weight=0.1,
+        adversarial_loss_weight=(
+            0.001
+            if stage in ("gan_pretrain", "stream_finetune", "stream_finetune_long")
+            else 0.
+        ),
+        feature_loss_weight=(
+            5.
+            if stage in ("gan_pretrain", "stream_finetune", "stream_finetune_long")
+            else 0.
+        ),
+        rq_quantize_dropout=(stage == "recon_pretrain"),
+        rq_threshold_ema_dead_code=(
+            10
+            if stage == "recon_pretrain"
+            else 2
+        ),
+        rq_kwargs=dict(sync_codebook=sync_codebook),
+        attn_window_size=64,
+        attn_dim_head=32,
+        attn_heads=4,
+        attn_depth=1,
+        pad_mode="constant",
+    )
+
+    if stage not in ("stream_finetune", "stream_finetune_long"):
+        return SoundStream(**model_kwargs)
+
+    return FrameStreamingSoundStream(
+        stream_frame_size=stream_frame_size,
+        stream_context_frames=stream_context_frames,
+        boundary_loss_weight=boundary_loss_weight,
+        boundary_loss_radius=boundary_loss_radius,
+        **model_kwargs,
+    )
+
+
+def main() -> None:
+    args = parse_args()
+    stage_defaults = STAGE_DEFAULTS[args.stage]
+
+    if args.seed < 0:
+        raise ValueError("--seed must be non-negative.")
+    if args.si_sdr_loss_weight < 0:
+        raise ValueError("--si-sdr-loss-weight cannot be negative.")
+    if args.si_sdr_loss_warmup_steps < 0:
+        raise ValueError("--si-sdr-loss-warmup-steps cannot be negative.")
+    if args.dl_num_workers < 0:
+        raise ValueError("--dl-num-workers cannot be negative.")
+    seed_everything(args.seed)
+
+    audio_dir = args.audio_dir.resolve()
+    default_results_dir = STAGE_RESULTS_DIRS[args.stage]
+    results_dir = (args.results_dir or default_results_dir).resolve()
+    save_model_every = args.save_model_every or stage_defaults["save_every"]
+    best_eval_every = args.best_eval_every or stage_defaults["eval_every"]
+    num_train_steps = args.num_train_steps or stage_defaults["steps"]
+    batch_size = args.batch_size or stage_defaults["batch_size"]
+    segment_seconds = (
+        args.segment_seconds
+        if args.segment_seconds is not None
+        else stage_defaults["segment_seconds"]
+    )
+    if batch_size <= 0:
+        raise ValueError("--batch-size must be greater than zero.")
+    if num_train_steps <= 0:
+        raise ValueError("--num-train-steps must be greater than zero.")
+    early_stopping_patience = (
+        args.early_stopping_patience
+        if args.early_stopping_patience is not None
+        else stage_defaults["patience"]
+    )
+    early_stopping_min_steps = (
+        args.early_stopping_min_steps
+        if args.early_stopping_min_steps is not None
+        else stage_defaults["min_steps"]
+    )
+    if early_stopping_min_steps < 0:
+        raise ValueError("--early-stopping-min-steps cannot be negative.")
+    if early_stopping_min_steps > num_train_steps:
+        raise ValueError(
+            "--early-stopping-min-steps cannot exceed --num-train-steps."
+        )
+
+    audio_files = [
+        path
+        for path in audio_dir.rglob("*")
+        if path.is_file()
+        and path.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS
+    ]
+
+    if not audio_files:
+        raise FileNotFoundError(
+            f"No supported audio files found under: {audio_dir}"
+        )
+
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA is unavailable. "
+            "Select E:\\lyra\\.venv\\Scripts\\python.exe in PyCharm."
+        )
+
+    torch.set_float32_matmul_precision("high")
+
+    sample_rate = 16_000
+    strides = (2, 4, 5, 8)
+    stream_frame_size = math.prod(strides)
+    stream_context_frames = args.stream_context_frames
+    # Lyra V2-style maximum bitrate:
+    # 50 frames/s * 23 quantizers * 8 bits/index = 9.2 kbps.
+    codebook_size = 256
+    num_quantizers = 23
+    si_sdr_loss_weight = (
+        args.si_sdr_loss_weight
+        if args.stage == "recon_pretrain"
+        else 0.0
+    )
+
+    bitrate = calculate_bitrate(
+        sample_rate=sample_rate,
+        strides=strides,
+        codebook_size=codebook_size,
+        num_quantizers=num_quantizers,
+    )
+
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"Training stage: {args.stage}")
+    print(f"Audio directory: {audio_dir}")
+    print(f"Audio files: {len(audio_files)}")
+    print(f"Results directory: {results_dir}")
+    print(f"Save model every: {save_model_every} steps")
+    print(f"Best eval every: {best_eval_every} steps")
+    print(f"Maximum training steps: {num_train_steps}")
+    print(f"Generator learning rate: {stage_defaults['lr']}")
+    if args.stage == "recon_pretrain":
+        print(
+            "Stage-1 LR schedule: "
+            "2.000e-04 for steps [0, 30000), "
+            "5.000e-05 for [30000, 50000), "
+            "1.000e-05 from step 50000"
+        )
+    print(f"Random seed: {args.seed}")
+    print(
+        "SI-SDR loss: "
+        f"max_weight={si_sdr_loss_weight}, "
+        f"warmup_steps={args.si_sdr_loss_warmup_steps if si_sdr_loss_weight > 0 else 0}"
+    )
+    print(
+        "Signed correlation loss weight: "
+        f"{0.5 if args.stage == 'recon_pretrain' else 0.0}"
+    )
+    print(f"Discriminator learning rate: {stage_defaults['discr_lr']}")
+    use_ema = stage_defaults.get("use_ema", True)
+    print(f"EMA enabled: {use_ema}")
+    if use_ema:
+        print(f"EMA beta: {stage_defaults['ema_beta']}")
+        print(
+            "EMA schedule: "
+            f"after_step={stage_defaults['ema_update_after_step']}, "
+            f"every={stage_defaults['ema_update_every']}"
+        )
+    print(
+        "GAN schedule: "
+        f"start={stage_defaults['gan_start']}, "
+        f"ramp={stage_defaults['gan_ramp']}, "
+        "adversarial_max=0.001, feature_max=5.0"
+    )
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    effective_global_batch = (
+        batch_size * world_size * args.grad_accum_every
+    )
+    print(f"Per-GPU batch size: {batch_size}")
+    print(f"Distributed world size: {world_size}")
+    print(f"Effective global batch size: {effective_global_batch}")
+    print(f"DataLoader workers per GPU: {args.dl_num_workers}")
+    print(
+        "Early stopping: "
+        f"patience={early_stopping_patience} validation checks, "
+        f"min_delta={args.early_stopping_min_delta}, "
+        f"min_steps={early_stopping_min_steps}"
+    )
+    print(f"Fixed validation batches: {args.best_eval_batches}")
+    print(f"Dataset split: train {1 - args.valid_frac - args.test_frac:.2%}, valid {args.valid_frac:.2%}, test {args.test_frac:.2%}")
+    print(f"Target sample rate: {sample_rate} Hz")
+    print(f"Training segment: {segment_seconds:.3f} s")
+    if args.stage in ("stream_finetune", "stream_finetune_long"):
+        print(f"Internal streaming frame: {stream_frame_size} samples")
+        print("Streaming context: per-layer causal state (no previous PCM frames)")
+        print(f"Boundary loss weight: {args.boundary_loss_weight}")
+        print(f"Boundary loss radius: {args.boundary_loss_radius} samples")
+    print(f"Codebook size: {codebook_size}")
+    print(f"RVQ quantizers: {num_quantizers}")
+    print(f"RVQ quantize dropout: {args.stage == 'recon_pretrain'}")
+    print(
+        "RVQ dead-code threshold: "
+        f"{10 if args.stage == 'recon_pretrain' else 2}"
+    )
+    print(f"RVQ codebook synchronization: {world_size > 1}")
+    print(
+        "RVQ codebook training: "
+        f"{'frozen' if args.stage in ('stream_finetune', 'stream_finetune_long') else 'enabled'}"
+    )
+    print(f"Theoretical bitrate: {bitrate / 1000:.1f} kbps")
+    if args.stage in ("stream_finetune", "stream_finetune_long"):
+        print(
+            f"Final test: continuous stateful full-file streaming, "
+            f"{args.test_block_seconds:.1f} s metric blocks"
+        )
+    else:
+        print(
+            f"Final test: full files in {args.test_block_seconds:.1f} s blocks, "
+            f"{args.test_context_ms:.1f} ms previous context discarded from output"
+        )
+
+    # Lyra V2-style scalable bitrate configuration:
+    # 16000 / 320 = 50 frames/s
+    # log2(256) = 8 bits/token
+    # 8 / 15 / 23 quantizers = 3.2 / 6.0 / 9.2 kbps
+    soundstream = build_model(
+        args.stage,
+        sample_rate=sample_rate,
+        strides=strides,
+        stream_frame_size=stream_frame_size,
+        stream_context_frames=stream_context_frames,
+        boundary_loss_weight=args.boundary_loss_weight,
+        boundary_loss_radius=args.boundary_loss_radius,
+        codebook_size=codebook_size,
+        num_quantizers=num_quantizers,
+        si_sdr_loss_weight=si_sdr_loss_weight,
+        sync_codebook=(world_size > 1),
+    )
+
+    warmup_steps = min(
+        1_000,
+        max(1, num_train_steps // 10),
+    )
+    scheduler = LambdaLR if args.stage == "recon_pretrain" else None
+    scheduler_kwargs = (
+        {"lr_lambda": recon_pretrain_lr_multiplier}
+        if args.stage == "recon_pretrain"
+        else {}
+    )
+
+    trainer = SoundStreamTrainer(
+        soundstream,
+        folder=str(audio_dir),
+        batch_size=batch_size,
+        grad_accum_every=args.grad_accum_every,
+        data_max_length_seconds=segment_seconds,
+        dataset_max_files=(args.overfit_files if args.stage == "overfit" else None),
+        dataset_fixed_crop=(args.stage == "overfit"),
+        dataset_min_rms_db=-45.,
+        num_train_steps=num_train_steps,
+        lr=stage_defaults["lr"],
+        discr_lr=stage_defaults["discr_lr"],
+        discr_max_grad_norm=0.5,
+        warmup_steps=warmup_steps,
+        scheduler=scheduler,
+        scheduler_kwargs=scheduler_kwargs,
+        save_results_every=args.save_results_every,
+        save_model_every=save_model_every,
+        best_eval_every=best_eval_every,
+        best_eval_batches=args.best_eval_batches,
+        si_sdr_loss_warmup_steps=(
+            args.si_sdr_loss_warmup_steps
+            if si_sdr_loss_weight > 0
+            else 0
+        ),
+        early_stopping_patience=early_stopping_patience,
+        early_stopping_min_delta=args.early_stopping_min_delta,
+        early_stopping_min_steps=early_stopping_min_steps,
+        enable_gan=args.stage in (
+            "gan_pretrain",
+            "stream_finetune",
+            "stream_finetune_long",
+        ),
+        gan_start_step=stage_defaults["gan_start"],
+        gan_ramp_steps=stage_defaults["gan_ramp"],
+        gan_adversarial_max=0.001,
+        gan_feature_max=5.,
+        freeze_codebook_during_training=args.stage in (
+            "stream_finetune",
+            "stream_finetune_long",
+        ),
+        use_ema=use_ema,
+        ema_beta=stage_defaults["ema_beta"],
+        ema_update_after_step=stage_defaults["ema_update_after_step"],
+        ema_update_every=stage_defaults["ema_update_every"],
+        results_folder=str(results_dir),
+        valid_frac=(0. if args.stage == "overfit" else args.valid_frac),
+        test_frac=(0. if args.stage == "overfit" else args.test_frac),
+        split_by_speaker=(args.stage != "overfit"),
+        random_split_seed=args.seed,
+        dataloader_seed=args.seed,
+        best_checkpoint_metric=args.stage,
+        dl_num_workers=args.dl_num_workers,
+        init_process_group_timeout_seconds=7_200,
+        force_clear_prev_results=False,
+    )
+
+    checkpoint = latest_checkpoint(results_dir) if args.resume else None
+
+    if checkpoint is not None:
+        print(f"Resuming from checkpoint: {checkpoint}")
+        trainer.load(str(checkpoint))
+    else:
+        predecessor_stage = {
+            "gan_pretrain": "recon_pretrain",
+            "stream_finetune": "gan_pretrain",
+            "stream_finetune_long": "stream_finetune",
+        }.get(args.stage)
+        init_checkpoint = args.init_checkpoint
+
+        if init_checkpoint is None and predecessor_stage is not None:
+            predecessor_dir = (
+                args.predecessor_results_dir
+                if args.predecessor_results_dir is not None
+                else STAGE_RESULTS_DIRS[predecessor_stage]
+            )
+            predecessor_best = predecessor_dir / "best_selected.pt"
+            if predecessor_best.exists():
+                init_checkpoint = predecessor_best
+
+        if predecessor_stage is not None and init_checkpoint is None:
+            expected_predecessor_dir = (
+                args.predecessor_results_dir
+                if args.predecessor_results_dir is not None
+                else STAGE_RESULTS_DIRS[predecessor_stage]
+            )
+            raise FileNotFoundError(
+                f"{args.stage} requires --init-checkpoint or "
+                f"{expected_predecessor_dir / 'best_selected.pt'}"
+            )
+
+        if init_checkpoint is not None:
+            print(f"Initializing {args.stage} from checkpoint: {init_checkpoint}")
+            load_model_weights_only(trainer.unwrapped_soundstream, init_checkpoint)
+            if trainer.use_ema:
+                trainer.copy_online_to_ema()
+                print("Synchronized EMA from initialized online weights.")
+
+        print("Starting a new training run.")
+
+    trainer.train()
+    trainer.accelerator.wait_for_everyone()
+    is_main = trainer.is_main
+    test_model = trainer.unwrapped_soundstream
+
+    if is_main:
+        # trainer.steps points to the next step, while checkpoint filenames
+        # represent the last completed step.
+        next_step = int(trainer.steps.item())
+        last_completed_step = next_step - 1
+        final_checkpoint = None
+
+        if last_completed_step >= 0:
+            final_checkpoint = (
+                results_dir
+                / f"soundstream.{last_completed_step}.pt"
+            )
+            trainer.save(str(final_checkpoint))
+            shutil.copyfile(
+                final_checkpoint,
+                results_dir / "latest.pt",
+            )
+
+        print("Training complete.")
+        print(f"Parameters saved to: {final_checkpoint}")
+
+    trainer.accelerator.wait_for_everyone()
+    best_by_aligned_si_sdr = results_dir / "best_by_aligned_si_sdr.pt"
+    best_selected = results_dir / "best_selected.pt"
+    best_checkpoint = (
+        best_by_aligned_si_sdr
+        if best_by_aligned_si_sdr.exists()
+        else best_selected
+    )
+
+    if best_checkpoint.exists() and trainer.test_files:
+        print(f"Final test checkpoint: {best_checkpoint}")
+        selected_test_files = list(trainer.test_files)
+        if args.test_eval_batches is not None:
+            selected_test_files = selected_test_files[:args.test_eval_batches]
+
+        rank = trainer.accelerator.process_index
+        world_size = trainer.accelerator.num_processes
+        rank_test_files = selected_test_files[rank::world_size]
+
+        if is_main:
+            print(
+                f"Evaluating {len(selected_test_files)} held-out test files with "
+                f"validation-selected checkpoint on {world_size} process(es): "
+                f"{best_checkpoint}"
+            )
+
+        load_model_weights_only(test_model, best_checkpoint)
+        local_metrics = trainer.evaluate_full_audio_files(
+            rank_test_files,
+            model=test_model,
+            block_seconds=args.test_block_seconds,
+            context_ms=args.test_context_ms,
+        )
+
+        metric_names = (
+            'score',
+            'multi_spectral_recon_loss',
+            'recon_loss',
+            'wave_mse',
+            'boundary_loss',
+            'commitment_loss',
+            'energy_loss',
+            'rms_ratio',
+            'correlation',
+            'si_sdr',
+        )
+        local_num_samples = (
+            float(local_metrics['num_samples'])
+            if local_metrics is not None
+            else 0.
+        )
+        packed_metrics = torch.tensor(
+            [
+                (
+                    local_metrics[name] * local_num_samples
+                    if local_metrics is not None
+                    else 0.
+                )
+                for name in metric_names
+            ] + [local_num_samples],
+            dtype=torch.float64,
+            device=trainer.device,
+        )
+        packed_metrics = trainer.accelerator.reduce(
+            packed_metrics,
+            reduction='sum',
+        )
+        local_code_counts = (
+            local_metrics['code_counts']
+            if local_metrics is not None
+            else torch.zeros(
+                num_quantizers,
+                codebook_size,
+                dtype=torch.float64
+            )
+        ).to(trainer.device)
+        global_code_counts = trainer.accelerator.reduce(
+            local_code_counts,
+            reduction='sum',
+        )
+
+        if is_main and packed_metrics[-1].item() > 0:
+            total_samples = packed_metrics[-1]
+            test_metrics = {
+                name: (packed_metrics[index] / total_samples).item()
+                for index, name in enumerate(metric_names)
+            }
+            test_metrics.update(
+                trainer.codebook_metrics_from_counts(global_code_counts)
+            )
+            print(
+                "Test report: "
+                f"score={test_metrics['score']:.6f}, "
+                f"mel={test_metrics['multi_spectral_recon_loss']:.6f}, "
+                f"recon={test_metrics['recon_loss']:.6f}, "
+                f"mse={test_metrics['wave_mse']:.6f}, "
+                f"boundary={test_metrics['boundary_loss']:.6f}, "
+                f"commitment={test_metrics['commitment_loss']:.6f}, "
+                f"energy={test_metrics['energy_loss']:.6f}, "
+                f"rms_ratio={test_metrics['rms_ratio']:.6f}, "
+                f"corr={test_metrics['correlation']:.6f}, "
+                f"si_sdr={test_metrics['si_sdr']:.6f}, "
+                f"active_codes={test_metrics['active_code_ratio']:.6f}, "
+                f"perplexity={test_metrics['codebook_perplexity']:.6f}"
+            )
+
+    trainer.accelerator.wait_for_everyone()
+    trainer.accelerator.end_training()
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
