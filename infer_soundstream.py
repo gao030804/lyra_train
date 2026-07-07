@@ -34,7 +34,7 @@ DEFAULT_RESULTS_DIRS = (
     PROJECT_DIR / "results" / "stream-finetune-long-64d-23q",
     PROJECT_DIR / "results" / "stream-finetune-64d-23q",
     PROJECT_DIR / "results" / "gan-pretrain-64d-23q",
-    PROJECT_DIR / "results" / "recon-pretrain-sisdr-seed42-6gpu",
+    PROJECT_DIR / "results" / "recon-pretrain-saturday-baseline-6gpu",
     PROJECT_DIR / "results" / "recon-pretrain-64d-23q",
     PROJECT_DIR / "results" / "overfit-64d-23q",
     PROJECT_DIR / "results" / "soundstream-3k2-finetune",

@@ -19,6 +19,11 @@ from audiolm_pytorch.utils import curtail_to_multiple
 
 from einops import rearrange, reduce
 
+try:
+    import soundfile as sf
+except ImportError:  # pragma: no cover - optional runtime fallback
+    sf = None
+
 # helper functions
 
 def exists(val):
@@ -29,6 +34,28 @@ def cast_tuple(val, length = 1):
 
 def is_unique(arr):
     return len(set(arr)) == len(arr)
+
+def load_audio_file(file):
+    path = Path(file)
+    if sf is not None and path.suffix.lower() in {'.flac', '.wav', '.ogg'}:
+        audio, sample_hz = sf.read(str(path), dtype = 'float32', always_2d = True)
+        return torch.from_numpy(audio.T).contiguous(), sample_hz
+
+    return torchaudio.load(str(path))
+
+def save_audio_file(file, wave, sample_hz):
+    path = Path(file)
+    path.parent.mkdir(parents = True, exist_ok = True)
+
+    if sf is not None and path.suffix.lower() in {'.flac', '.wav', '.ogg'}:
+        sf.write(
+            str(path),
+            wave.detach().cpu().squeeze(0).numpy(),
+            sample_hz
+        )
+        return
+
+    torchaudio.save(str(path), wave.detach().cpu(), sample_hz)
 
 # dataset functions
 
@@ -80,7 +107,7 @@ class SoundDataset(Dataset):
     def __getitem__(self, idx):
         file = self.files[idx]
 
-        data, sample_hz = torchaudio.load(file)
+        data, sample_hz = load_audio_file(file)
 
         assert data.numel() > 0, f'one of your audio file ({file}) is empty. please remove it from your folder'
 

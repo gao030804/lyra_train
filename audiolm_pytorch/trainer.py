@@ -50,7 +50,12 @@ from audiolm_pytorch.audiolm_pytorch import (
     HubertWithKmeans
 )
 
-from audiolm_pytorch.data import SoundDataset, get_dataloader
+from audiolm_pytorch.data import (
+    SoundDataset,
+    get_dataloader,
+    load_audio_file,
+    save_audio_file
+)
 from audiolm_pytorch.utils import AudioConditionerBase
 
 from audiolm_pytorch.version import __version__
@@ -744,6 +749,7 @@ class SoundStreamTrainer(nn.Module):
     def codebook_metrics_from_counts(self, counts):
         active_ratios = []
         perplexities = []
+        collapsed_quantizers = 0
         metrics = {}
 
         for quantizer_index, quantizer_counts in enumerate(counts):
@@ -769,6 +775,11 @@ class SoundStreamTrainer(nn.Module):
 
             active_ratios.append(active_ratio)
             perplexities.append(perplexity)
+            active_ratio_value = float(active_ratio.detach().cpu())
+            perplexity_value = float(perplexity.detach().cpu())
+            collapsed_quantizers += int(
+                active_ratio_value < 0.10 or perplexity_value < 16.
+            )
             prefix = f'codebook_q{quantizer_index:02d}'
             metrics[f'{prefix}_active_codes'] = active_codes
             metrics[f'codebook_q{quantizer_index:02d}_active_ratio'] = float(
@@ -801,7 +812,8 @@ class SoundStreamTrainer(nn.Module):
                 torch.stack(perplexities).mean().detach().cpu()
                 if perplexities
                 else 0.
-            )
+            ),
+            codebook_collapsed_quantizers = collapsed_quantizers
         )
         return metrics
 
@@ -1154,7 +1166,9 @@ class SoundStreamTrainer(nn.Module):
         model = None,
         block_seconds = 5.,
         context_ms = 60.,
-        max_files = None
+        max_files = None,
+        save_recon_dir = None,
+        metrics_path = None
     ):
         if not files:
             return None
@@ -1187,13 +1201,16 @@ class SoundStreamTrainer(nn.Module):
             device=self.device
         )
         selected_files = list(files)
+        save_recon_dir = Path(save_recon_dir) if exists(save_recon_dir) else None
+        metrics_path = Path(metrics_path) if exists(metrics_path) else None
+        file_metric_rows = []
 
         if exists(max_files):
             selected_files = selected_files[:max_files]
 
         with torch.inference_mode():
             for file_index, file in enumerate(selected_files):
-                wave, source_sample_rate = torchaudio.load(str(file))
+                wave, source_sample_rate = load_audio_file(file)
 
                 if wave.shape[0] > 1:
                     wave = wave.mean(dim = 0, keepdim = True)
@@ -1208,6 +1225,9 @@ class SoundStreamTrainer(nn.Module):
                 wave = wave.to(self.device)
                 encoder_state = None
                 decoder_state = None
+                file_totals = Counter()
+                file_samples = 0
+                reconstructed_blocks = []
 
                 for start in range(0, wave.shape[-1], block_samples):
                     current = wave[..., start:(start + block_samples)]
@@ -1284,16 +1304,85 @@ class SoundStreamTrainer(nn.Module):
                         commitment_loss.sum().detach().cpu()
                     )
                     total_code_counts += self.codebook_counts(model, indices)
+                    block_reconstructed = reconstructed.detach().cpu()
+                    while (
+                        block_reconstructed.ndim > 2 and
+                        block_reconstructed.shape[0] == 1
+                    ):
+                        block_reconstructed = block_reconstructed.squeeze(0)
+                    if block_reconstructed.ndim == 1:
+                        block_reconstructed = block_reconstructed.unsqueeze(0)
+                    reconstructed_blocks.append(
+                        block_reconstructed[..., :valid_samples]
+                    )
 
                     for key, value in metrics.items():
                         totals[key] += value * valid_samples
+                        file_totals[key] += value * valid_samples
 
                     total_samples += valid_samples
+                    file_samples += valid_samples
+
+                reconstructed_path = None
+                if exists(save_recon_dir) and reconstructed_blocks:
+                    file_path = Path(file)
+                    file_id = "__".join(file_path.with_suffix('').parts[-3:])
+                    file_id = re.sub(r'[^A-Za-z0-9_.-]+', '_', file_id)
+                    reconstructed_path = (
+                        save_recon_dir /
+                        f"rank{self.accelerator.process_index:02d}_"
+                        f"{file_index:05d}_{file_id}.flac"
+                    )
+                    reconstructed_wave = torch.cat(
+                        reconstructed_blocks,
+                        dim = -1
+                    ).clamp(-1., 1.)
+                    save_audio_file(
+                        reconstructed_path,
+                        reconstructed_wave,
+                        sample_rate
+                    )
+
+                if file_samples > 0:
+                    file_metrics = {
+                        key: value / file_samples
+                        for key, value in file_totals.items()
+                    }
+                    file_metric_rows.append((
+                        str(file),
+                        str(reconstructed_path) if exists(reconstructed_path) else "",
+                        file_samples,
+                        file_metrics
+                    ))
 
                 if (file_index + 1) % 50 == 0:
                     self.print(
                         f'tested {file_index + 1}/{len(selected_files)} full audio files'
                     )
+
+        if exists(metrics_path):
+            metrics_path.parent.mkdir(parents = True, exist_ok = True)
+            metric_names = sorted({
+                key
+                for *_, file_metrics in file_metric_rows
+                for key in file_metrics
+            })
+            with metrics_path.open('w', encoding = 'utf-8') as f:
+                f.write(
+                    "source_file\treconstructed_file\tnum_samples\t" +
+                    "\t".join(metric_names) +
+                    "\n"
+                )
+                for source_file, reconstructed_file, file_samples, file_metrics in file_metric_rows:
+                    values = [
+                        source_file,
+                        reconstructed_file,
+                        str(file_samples),
+                    ] + [
+                        f"{file_metrics.get(name, float('nan')):.9f}"
+                        for name in metric_names
+                    ]
+                    f.write("\t".join(values) + "\n")
 
         if total_samples == 0:
             return None
@@ -1368,12 +1457,18 @@ class SoundStreamTrainer(nn.Module):
             averaged_metrics.get('codebook_q00_active_ratio', 0.) >= 0.30 and
             averaged_metrics.get('codebook_q00_perplexity', 0.) >= 16.
         )
+        rvq_eligible = (
+            averaged_metrics.get('active_code_ratio', 0.) >= 0.25 and
+            averaged_metrics.get('codebook_perplexity', 0.) >= 20. and
+            averaged_metrics.get('codebook_collapsed_quantizers', 0) <= 2
+        )
         averaged_metrics['q00_validation_eligible'] = float(q00_eligible)
+        averaged_metrics['rvq_validation_eligible'] = float(rvq_eligible)
         if self.best_checkpoint_metric == 'recon_pretrain':
-            # Stage-1 depends heavily on the first RVQ quantizer. Avoid
-            # selecting checkpoints whose aggregate score improves only after
-            # q00 has collapsed.
-            eligible = eligible and q00_eligible
+            # Stage-1 depends on a healthy full RVQ stack. Avoid selecting
+            # checkpoints whose aggregate score improves after q00 or later
+            # residual quantizers have collapsed.
+            eligible = eligible and q00_eligible and rvq_eligible
         if self.best_checkpoint_metric in (
             'stream_finetune',
             'stream_finetune_long'
@@ -1841,7 +1936,9 @@ class SoundStreamTrainer(nn.Module):
                 f"ema_aligned_corr={ema_score['aligned_correlation']:.3f}, "
                 f"ema_aligned_si_sdr={ema_score['aligned_si_sdr']:.3f}, "
                 f"ema_active_codes={ema_score['active_code_ratio']:.3f}, "
-                f"ema_perplexity={ema_score['codebook_perplexity']:.1f}"
+                f"ema_perplexity={ema_score['codebook_perplexity']:.1f}, "
+                f"ema_rvq_ok={ema_score.get('rvq_validation_eligible', 0.):.0f}, "
+                f"ema_collapsed_q={int(ema_score.get('codebook_collapsed_quantizers', 0))}"
                 if self.use_ema
                 else "ema=disabled"
             )
@@ -1856,7 +1953,9 @@ class SoundStreamTrainer(nn.Module):
                 f"online_aligned_si_sdr={online_score['aligned_si_sdr']:.3f}, "
                 f"online_active_codes={online_score['active_code_ratio']:.3f}, "
                 f"online_perplexity={online_score['codebook_perplexity']:.1f}, "
-                f"online_q00_ok={online_score.get('q00_validation_eligible', 0.):.0f} | "
+                f"online_q00_ok={online_score.get('q00_validation_eligible', 0.):.0f}, "
+                f"online_rvq_ok={online_score.get('rvq_validation_eligible', 0.):.0f}, "
+                f"online_collapsed_q={int(online_score.get('codebook_collapsed_quantizers', 0))} | "
                 f"best_aligned_si_sdr={self.best_aligned_si_sdr:.3f}, "
                 f"si_sdr_selected={si_sdr_selected_name}"
             )

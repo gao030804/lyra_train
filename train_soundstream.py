@@ -11,7 +11,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.optim.lr_scheduler import LambdaLR
 
 PROJECT_DIR = Path(__file__).resolve().parent
 RUNTIME_TMP_DIR = PROJECT_DIR / ".runtime-tmp"
@@ -49,11 +48,11 @@ STAGE_DEFAULTS = {
         gan_start=0, gan_ramp=0,
     ),
     "recon_pretrain": dict(
-        steps=60_000, batch_size=6, segment_seconds=2.,
+        steps=50_000, batch_size=6, segment_seconds=2.,
         save_every=2_000, eval_every=250, min_steps=10_000, patience=40,
         lr=2e-4, discr_lr=None, ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
-        use_ema=False,
+        use_ema=True,
         gan_start=0, gan_ramp=0,
     ),
     "gan_pretrain": dict(
@@ -78,15 +77,6 @@ STAGE_DEFAULTS = {
         gan_start=1_000, gan_ramp=2_000,
     ),
 }
-
-
-def recon_pretrain_lr_multiplier(step: int) -> float:
-    """Stage-1 LR: 2e-4 -> 5e-5 at 30k -> 1e-5 at 50k."""
-    if step < 30_000:
-        return 1.0
-    if step < 50_000:
-        return 0.25
-    return 0.05
 
 
 def seed_everything(seed: int) -> None:
@@ -224,13 +214,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--si-sdr-loss-weight",
         type=float,
-        default=0.05,
-        help="Maximum SI-SDR loss weight for recon_pretrain. Other stages keep it disabled.",
+        default=0.005,
+        help=(
+            "Maximum SI-SDR loss weight for recon_pretrain. "
+            "Use 0 for the pure Saturday baseline; other stages keep it disabled."
+        ),
     )
     parser.add_argument(
         "--si-sdr-loss-warmup-steps",
         type=int,
-        default=10_000,
+        default=20_000,
         help="Linearly ramp SI-SDR loss weight over this many recon_pretrain steps.",
     )
     parser.add_argument(
@@ -276,6 +269,24 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=60.0,
         help="Previous-audio context for non-streaming checkpoints; stateful streaming tests carry state continuously.",
+    )
+    parser.add_argument(
+        "--save-test-reconstructions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save held-out test reconstructions after recon_pretrain finishes.",
+    )
+    parser.add_argument(
+        "--test-recon-dir",
+        type=Path,
+        default=None,
+        help="Directory for saved held-out test reconstructions. Defaults to results/stage1_test_reconstructions.",
+    )
+    parser.add_argument(
+        "--test-report-file",
+        type=Path,
+        default=None,
+        help="Text file for final held-out test summary. Defaults to results/stage1_test_report.txt.",
     )
     parser.add_argument(
         "--resume",
@@ -373,11 +384,7 @@ def build_model(
         ),
         multi_spectral_recon_loss_weight=1.,
         si_sdr_loss_weight=si_sdr_loss_weight,
-        correlation_loss_weight=(
-            0.5
-            if stage == "recon_pretrain"
-            else 0.
-        ),
+        correlation_loss_weight=0.,
         energy_loss_weight=0.1,
         commitment_loss_weight=0.1,
         adversarial_loss_weight=(
@@ -390,12 +397,8 @@ def build_model(
             if stage in ("gan_pretrain", "stream_finetune", "stream_finetune_long")
             else 0.
         ),
-        rq_quantize_dropout=(stage == "recon_pretrain"),
-        rq_threshold_ema_dead_code=(
-            10
-            if stage == "recon_pretrain"
-            else 2
-        ),
+        rq_quantize_dropout=False,
+        rq_threshold_ema_dead_code=2,
         rq_kwargs=dict(sync_codebook=sync_codebook),
         attn_window_size=64,
         attn_dim_head=32,
@@ -516,9 +519,7 @@ def main() -> None:
     if args.stage == "recon_pretrain":
         print(
             "Stage-1 LR schedule: "
-            "2.000e-04 for steps [0, 30000), "
-            "5.000e-05 for [30000, 50000), "
-            "1.000e-05 from step 50000"
+            "constant 2.000e-04"
         )
     print(f"Random seed: {args.seed}")
     print(
@@ -528,7 +529,7 @@ def main() -> None:
     )
     print(
         "Signed correlation loss weight: "
-        f"{0.5 if args.stage == 'recon_pretrain' else 0.0}"
+        "0.0"
     )
     print(f"Discriminator learning rate: {stage_defaults['discr_lr']}")
     use_ema = stage_defaults.get("use_ema", True)
@@ -571,11 +572,8 @@ def main() -> None:
         print(f"Boundary loss radius: {args.boundary_loss_radius} samples")
     print(f"Codebook size: {codebook_size}")
     print(f"RVQ quantizers: {num_quantizers}")
-    print(f"RVQ quantize dropout: {args.stage == 'recon_pretrain'}")
-    print(
-        "RVQ dead-code threshold: "
-        f"{10 if args.stage == 'recon_pretrain' else 2}"
-    )
+    print("RVQ quantize dropout: False")
+    print("RVQ dead-code threshold: 2")
     print(f"RVQ codebook synchronization: {world_size > 1}")
     print(
         "RVQ codebook training: "
@@ -615,12 +613,8 @@ def main() -> None:
         1_000,
         max(1, num_train_steps // 10),
     )
-    scheduler = LambdaLR if args.stage == "recon_pretrain" else None
-    scheduler_kwargs = (
-        {"lr_lambda": recon_pretrain_lr_multiplier}
-        if args.stage == "recon_pretrain"
-        else {}
-    )
+    scheduler = None
+    scheduler_kwargs = {}
 
     trainer = SoundStreamTrainer(
         soundstream,
@@ -766,6 +760,26 @@ def main() -> None:
         rank = trainer.accelerator.process_index
         world_size = trainer.accelerator.num_processes
         rank_test_files = selected_test_files[rank::world_size]
+        save_test_reconstructions = (
+            args.stage == "recon_pretrain" and
+            args.save_test_reconstructions and
+            len(selected_test_files) > 0
+        )
+        test_recon_dir = (
+            (args.test_recon_dir or (results_dir / "stage1_test_reconstructions")).resolve()
+            if save_test_reconstructions
+            else None
+        )
+        rank_metrics_path = (
+            test_recon_dir / f"test_metrics_rank{rank:02d}.tsv"
+            if save_test_reconstructions
+            else None
+        )
+        test_report_file = (
+            (args.test_report_file or (results_dir / "stage1_test_report.txt")).resolve()
+            if args.stage == "recon_pretrain"
+            else None
+        )
 
         if is_main:
             print(
@@ -773,6 +787,9 @@ def main() -> None:
                 f"validation-selected checkpoint on {world_size} process(es): "
                 f"{best_checkpoint}"
             )
+            if save_test_reconstructions:
+                print(f"Saving stage-1 test reconstructions to: {test_recon_dir}")
+                print(f"Writing stage-1 test report to: {test_report_file}")
 
         load_model_weights_only(test_model, best_checkpoint)
         local_metrics = trainer.evaluate_full_audio_files(
@@ -780,6 +797,8 @@ def main() -> None:
             model=test_model,
             block_seconds=args.test_block_seconds,
             context_ms=args.test_context_ms,
+            save_recon_dir=test_recon_dir,
+            metrics_path=rank_metrics_path,
         )
 
         metric_names = (
@@ -793,6 +812,8 @@ def main() -> None:
             'rms_ratio',
             'correlation',
             'si_sdr',
+            'aligned_correlation',
+            'aligned_si_sdr',
         )
         local_num_samples = (
             float(local_metrics['num_samples'])
@@ -850,9 +871,42 @@ def main() -> None:
                 f"rms_ratio={test_metrics['rms_ratio']:.6f}, "
                 f"corr={test_metrics['correlation']:.6f}, "
                 f"si_sdr={test_metrics['si_sdr']:.6f}, "
+                f"aligned_corr={test_metrics['aligned_correlation']:.6f}, "
+                f"aligned_si_sdr={test_metrics['aligned_si_sdr']:.6f}, "
                 f"active_codes={test_metrics['active_code_ratio']:.6f}, "
                 f"perplexity={test_metrics['codebook_perplexity']:.6f}"
             )
+            if test_report_file is not None:
+                test_report_file.parent.mkdir(parents=True, exist_ok=True)
+                with test_report_file.open("w", encoding="utf-8") as f:
+                    f.write("Stage-1 held-out test report\n")
+                    f.write(f"checkpoint\t{best_checkpoint}\n")
+                    f.write(f"results_dir\t{results_dir}\n")
+                    f.write(f"num_test_files\t{len(selected_test_files)}\n")
+                    f.write(f"num_processes\t{world_size}\n")
+                    f.write(f"sample_rate\t{sample_rate}\n")
+                    f.write(f"block_seconds\t{args.test_block_seconds}\n")
+                    f.write(f"context_ms\t{args.test_context_ms}\n")
+                    if test_recon_dir is not None:
+                        f.write(f"reconstruction_dir\t{test_recon_dir}\n")
+                        f.write("per_rank_metrics\t")
+                        f.write(
+                            ",".join(
+                                str(test_recon_dir / f"test_metrics_rank{rank_index:02d}.tsv")
+                                for rank_index in range(world_size)
+                            )
+                        )
+                        f.write("\n")
+                    f.write("\nmetric\tvalue\n")
+                    for name in (
+                        *metric_names,
+                        'active_code_ratio',
+                        'codebook_perplexity',
+                        'codebook_collapsed_quantizers',
+                    ):
+                        if name in test_metrics:
+                            f.write(f"{name}\t{test_metrics[name]}\n")
+                print(f"Test report saved to: {test_report_file}")
 
     trainer.accelerator.wait_for_everyone()
     trainer.accelerator.end_training()
