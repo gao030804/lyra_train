@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch.optim.lr_scheduler import LambdaLR
 
 PROJECT_DIR = Path(__file__).resolve().parent
 RUNTIME_TMP_DIR = PROJECT_DIR / ".runtime-tmp"
@@ -48,7 +49,7 @@ STAGE_DEFAULTS = {
         gan_start=0, gan_ramp=0,
     ),
     "recon_pretrain": dict(
-        steps=50_000, batch_size=6, segment_seconds=2.,
+        steps=50_000, batch_size=4, segment_seconds=4.,
         save_every=2_000, eval_every=250, min_steps=10_000, patience=40,
         lr=2e-4, discr_lr=None, ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
@@ -77,6 +78,23 @@ STAGE_DEFAULTS = {
         gan_start=1_000, gan_ramp=2_000,
     ),
 }
+
+
+def stage1_lr_lambda(step: int) -> float:
+    """Piecewise LR multiplier for recon_pretrain after linear warmup.
+
+    The trainer applies warmup separately. With the recon_pretrain base LR of
+    2e-4 and warmup_steps=1000, this gives:
+      0 - 1000: linear warmup to 2e-4
+      1000 - 20000: 2e-4
+      20000 - 35000: 1e-4
+      35000+: 5e-5
+    """
+    if step < 20_000:
+        return 1.0
+    if step < 35_000:
+        return 0.5
+    return 0.25
 
 
 def seed_everything(seed: int) -> None:
@@ -214,7 +232,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--si-sdr-loss-weight",
         type=float,
-        default=0.005,
+        default=0.02,
         help=(
             "Maximum SI-SDR loss weight for recon_pretrain. "
             "Use 0 for the pure Saturday baseline; other stages keep it disabled."
@@ -223,7 +241,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--si-sdr-loss-warmup-steps",
         type=int,
-        default=20_000,
+        default=10_000,
         help="Linearly ramp SI-SDR loss weight over this many recon_pretrain steps.",
     )
     parser.add_argument(
@@ -519,7 +537,10 @@ def main() -> None:
     if args.stage == "recon_pretrain":
         print(
             "Stage-1 LR schedule: "
-            "constant 2.000e-04"
+            "linear warmup for steps [0, 1000), "
+            "2.000e-04 for [1000, 20000), "
+            "1.000e-04 for [20000, 35000), "
+            "5.000e-05 from step 35000"
         )
     print(f"Random seed: {args.seed}")
     print(
@@ -615,6 +636,9 @@ def main() -> None:
     )
     scheduler = None
     scheduler_kwargs = {}
+    if args.stage == "recon_pretrain":
+        scheduler = LambdaLR
+        scheduler_kwargs = dict(lr_lambda=stage1_lr_lambda)
 
     trainer = SoundStreamTrainer(
         soundstream,

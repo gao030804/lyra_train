@@ -712,6 +712,58 @@ class SoundStreamTrainer(nn.Module):
 
         torch.save(pkg, str(path))
 
+    def saved_model_only_score(self, path):
+        path = Path(path)
+        if not path.exists():
+            return None
+
+        try:
+            pkg = torch.load(str(path), map_location = 'cpu')
+        except Exception as exc:
+            self.print(
+                f"warning: could not read checkpoint score from {path}: {exc}"
+            )
+            return None
+
+        if not isinstance(pkg, dict) or 'best_score' not in pkg:
+            return None
+
+        score = pkg['best_score']
+        if isinstance(score, torch.Tensor):
+            score = score.detach().cpu().item()
+
+        try:
+            score = float(score)
+        except (TypeError, ValueError):
+            return None
+
+        return score if isfinite(score) else None
+
+    def sync_best_scores_from_disk(self):
+        """Use existing best checkpoint metadata as the source of truth.
+
+        This prevents a restarted run, or a run launched with --no-resume into a
+        non-empty results directory, from overwriting a better checkpoint only
+        because the in-memory best score was reset.
+        """
+        best_selected_score = self.saved_model_only_score(
+            self.results_folder / 'best_selected.pt'
+        )
+        if exists(best_selected_score):
+            self.best_valid_score = min(
+                self.best_valid_score,
+                best_selected_score
+            )
+
+        best_aligned_si_sdr = self.saved_model_only_score(
+            self.results_folder / 'best_by_aligned_si_sdr.pt'
+        )
+        if exists(best_aligned_si_sdr):
+            self.best_aligned_si_sdr = max(
+                self.best_aligned_si_sdr,
+                best_aligned_si_sdr
+            )
+
     def codebook_metrics(self, model, indices):
         counts = self.codebook_counts(model, indices)
         return self.codebook_metrics_from_counts(counts)
@@ -1927,6 +1979,8 @@ class SoundStreamTrainer(nn.Module):
                 si_sdr_selected_name = 'none'
                 si_sdr_selected_model = None
                 si_sdr_selected_metrics = None
+
+            self.sync_best_scores_from_disk()
 
             ema_summary = (
                 f"ema={ema_score['score']:.6f}, "
