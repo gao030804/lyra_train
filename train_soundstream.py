@@ -48,6 +48,7 @@ STAGE_DEFAULTS = {
         ema_update_after_step=0, ema_update_every=1,
         click_loss_weight=0., jump_loss_weight=0.,
         transient_loss_warmup_steps=0,
+        stft_recon_loss_weight=0.,
         gan_start=0, gan_ramp=0,
     ),
     "recon_pretrain": dict(
@@ -58,6 +59,7 @@ STAGE_DEFAULTS = {
         use_ema=False,
         click_loss_weight=0., jump_loss_weight=0.,
         transient_loss_warmup_steps=0,
+        stft_recon_loss_weight=0.5,
         gan_start=0, gan_ramp=0,
     ),
     "gan_pretrain": dict(
@@ -67,6 +69,7 @@ STAGE_DEFAULTS = {
         ema_update_after_step=0, ema_update_every=1,
         click_loss_weight=0., jump_loss_weight=0.,
         transient_loss_warmup_steps=0,
+        stft_recon_loss_weight=0.,
         gan_start=5_000, gan_ramp=15_000,
     ),
     "stream_finetune": dict(
@@ -76,6 +79,7 @@ STAGE_DEFAULTS = {
         ema_update_after_step=0, ema_update_every=1,
         click_loss_weight=0., jump_loss_weight=0.,
         transient_loss_warmup_steps=0,
+        stft_recon_loss_weight=0.,
         gan_start=5_000, gan_ramp=10_000,
     ),
     "stream_finetune_long": dict(
@@ -85,6 +89,7 @@ STAGE_DEFAULTS = {
         ema_update_after_step=0, ema_update_every=1,
         click_loss_weight=0., jump_loss_weight=0.,
         transient_loss_warmup_steps=0,
+        stft_recon_loss_weight=0.,
         gan_start=1_000, gan_ramp=2_000,
     ),
 }
@@ -486,6 +491,7 @@ def build_model(
     si_sdr_loss_weight: float,
     click_loss_weight: float,
     jump_loss_weight: float,
+    stft_recon_loss_weight: float,
     sync_codebook: bool | None = None,
 ) -> SoundStream:
     if sync_codebook is None:
@@ -509,7 +515,7 @@ def build_model(
             else 1.
         ),
         multi_spectral_recon_loss_weight=0.7,
-        stft_recon_loss_weight=0.5,
+        stft_recon_loss_weight=stft_recon_loss_weight,
         si_sdr_loss_weight=si_sdr_loss_weight,
         correlation_loss_weight=0.,
         energy_loss_weight=0.1,
@@ -669,6 +675,7 @@ def main() -> None:
         if args.transient_loss_warmup_steps is not None
         else stage_defaults["transient_loss_warmup_steps"]
     )
+    stft_recon_loss_weight = stage_defaults["stft_recon_loss_weight"]
 
     bitrate = calculate_bitrate(
         sample_rate=sample_rate,
@@ -722,6 +729,10 @@ def main() -> None:
     print(
         "Signed correlation loss weight: "
         "0.0"
+    )
+    print(
+        "STFT reconstruction loss weight: "
+        f"{stft_recon_loss_weight}"
     )
     print(f"Discriminator learning rate: {stage_defaults['discr_lr']}")
     use_ema = stage_defaults.get("use_ema", True)
@@ -800,6 +811,7 @@ def main() -> None:
         si_sdr_loss_weight=si_sdr_loss_weight,
         click_loss_weight=click_loss_weight,
         jump_loss_weight=jump_loss_weight,
+        stft_recon_loss_weight=stft_recon_loss_weight,
         sync_codebook=(world_size > 1),
     )
 

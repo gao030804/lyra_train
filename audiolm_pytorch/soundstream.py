@@ -833,56 +833,65 @@ class SoundStream(Module):
             else self.zero
         )
 
-        stft_losses = []
-        for n_fft, win_length, hop_length in self.stft_recon_settings:
-            min_samples = n_fft
+        stft_loss = self.zero
+        if self.stft_recon_loss_weight > 0:
+            stft_losses = []
             target_for_stft = target.float()
             recon_for_stft = recon.float()
-            if target_for_stft.shape[-1] < min_samples:
-                padding = min_samples - target_for_stft.shape[-1]
-                target_for_stft = F.pad(target_for_stft, (0, padding))
-                recon_for_stft = F.pad(recon_for_stft, (0, padding))
+            if target_for_stft.ndim == 2:
+                target_for_stft = rearrange(target_for_stft, 'b n -> b 1 n')
+            if recon_for_stft.ndim == 2:
+                recon_for_stft = rearrange(recon_for_stft, 'b n -> b 1 n')
 
-            target_rows = rearrange(target_for_stft, 'b c n -> (b c) n')
-            recon_rows = rearrange(recon_for_stft, 'b c n -> (b c) n')
-            window = torch.hann_window(
-                win_length,
-                device = target_rows.device,
-                dtype = torch.float32
-            )
-            target_stft = torch.stft(
-                target_rows,
-                n_fft,
-                hop_length = hop_length,
-                win_length = win_length,
-                window = window,
-                return_complex = True
-            )
-            recon_stft = torch.stft(
-                recon_rows,
-                n_fft,
-                hop_length = hop_length,
-                win_length = win_length,
-                window = window,
-                return_complex = True
-            )
-            target_mag = target_stft.abs()
-            recon_mag = recon_stft.abs()
-            spectral_convergence = (
-                torch.linalg.norm(target_mag - recon_mag) /
-                torch.linalg.norm(target_mag).clamp_min(1e-8)
-            )
-            log_mag_loss = F.l1_loss(
-                log(recon_mag, eps = 1e-5),
-                log(target_mag, eps = 1e-5)
-            )
-            stft_losses.append(spectral_convergence + log_mag_loss)
+            for n_fft, win_length, hop_length in self.stft_recon_settings:
+                min_samples = n_fft
+                target_padded = target_for_stft
+                recon_padded = recon_for_stft
+                if target_padded.shape[-1] < min_samples:
+                    padding = min_samples - target_padded.shape[-1]
+                    target_padded = F.pad(target_padded, (0, padding))
+                    recon_padded = F.pad(recon_padded, (0, padding))
 
-        stft_loss = (
-            torch.stack(stft_losses).mean()
-            if stft_losses
-            else self.zero
-        )
+                target_rows = rearrange(target_padded, 'b c n -> (b c) n')
+                recon_rows = rearrange(recon_padded, 'b c n -> (b c) n')
+                window = torch.hann_window(
+                    win_length,
+                    device = target_rows.device,
+                    dtype = torch.float32
+                )
+                target_stft = torch.stft(
+                    target_rows,
+                    n_fft,
+                    hop_length = hop_length,
+                    win_length = win_length,
+                    window = window,
+                    return_complex = True
+                )
+                recon_stft = torch.stft(
+                    recon_rows,
+                    n_fft,
+                    hop_length = hop_length,
+                    win_length = win_length,
+                    window = window,
+                    return_complex = True
+                )
+                target_mag = target_stft.abs()
+                recon_mag = recon_stft.abs()
+                spectral_convergence = (
+                    torch.linalg.norm(target_mag - recon_mag) /
+                    torch.linalg.norm(target_mag).clamp_min(1e-8)
+                )
+                log_mag_loss = F.l1_loss(
+                    log(recon_mag, eps = 1e-5),
+                    log(target_mag, eps = 1e-5)
+                )
+                stft_losses.append(spectral_convergence + log_mag_loss)
+
+            stft_loss = (
+                torch.stack(stft_losses).mean()
+                if stft_losses
+                else self.zero
+            )
 
         return wave_loss, spectral_loss, stft_loss
 
