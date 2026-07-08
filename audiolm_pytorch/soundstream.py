@@ -723,6 +723,7 @@ class SoundStream(Module):
         self.mel_spec_transforms = ModuleList([])
         self.mel_spec_recon_alphas = []
         self.stft_recon_settings = []
+        self.stft_recon_alphas = []
 
         num_transforms = len(multi_spectral_window_powers_of_two)
         multi_spectral_n_ffts = cast_tuple(multi_spectral_n_ffts, num_transforms)
@@ -735,10 +736,19 @@ class SoundStream(Module):
             1024: 1.00,
             2048: 0.75
         }
+        stft_weight_by_win_length = {
+            64: 0.25,
+            128: 0.50,
+            256: 1.00,
+            512: 1.00,
+            1024: 1.00,
+            2048: 0.75
+        }
 
         for powers, n_fft, n_mels in zip_longest(multi_spectral_window_powers_of_two, multi_spectral_n_ffts, multi_spectral_n_mels):
             win_length = 2 ** powers
             alpha = mel_weight_by_win_length.get(win_length, 1.)
+            stft_alpha = stft_weight_by_win_length.get(win_length, 1.)
 
             calculated_n_fft = default(max(n_fft, win_length), win_length)  # @AndreyBocharnikov said this is usually win length, but overridable
 
@@ -760,6 +770,7 @@ class SoundStream(Module):
                 win_length,
                 win_length // 4
             ))
+            self.stft_recon_alphas.append(stft_alpha)
 
         # loss weights
 
@@ -836,6 +847,7 @@ class SoundStream(Module):
         stft_loss = self.zero
         if self.stft_recon_loss_weight > 0:
             stft_losses = []
+            stft_weights = []
             target_for_stft = target.float()
             recon_for_stft = recon.float()
             if target_for_stft.ndim == 2:
@@ -843,7 +855,10 @@ class SoundStream(Module):
             if recon_for_stft.ndim == 2:
                 recon_for_stft = rearrange(recon_for_stft, 'b n -> b 1 n')
 
-            for n_fft, win_length, hop_length in self.stft_recon_settings:
+            for (n_fft, win_length, hop_length), alpha in zip(
+                self.stft_recon_settings,
+                self.stft_recon_alphas
+            ):
                 min_samples = n_fft
                 target_padded = target_for_stft
                 recon_padded = recon_for_stft
@@ -877,18 +892,29 @@ class SoundStream(Module):
                 )
                 target_mag = target_stft.abs()
                 recon_mag = recon_stft.abs()
-                spectral_convergence = (
-                    torch.linalg.norm(target_mag - recon_mag) /
-                    torch.linalg.norm(target_mag).clamp_min(1e-8)
+                diff_norm = torch.linalg.norm(
+                    target_mag - recon_mag,
+                    dim = (-2, -1)
                 )
+                target_norm = torch.linalg.norm(
+                    target_mag,
+                    dim = (-2, -1)
+                ).clamp_min(1e-8)
+                spectral_convergence = (diff_norm / target_norm).mean()
                 log_mag_loss = F.l1_loss(
                     log(recon_mag, eps = 1e-5),
                     log(target_mag, eps = 1e-5)
                 )
-                stft_losses.append(spectral_convergence + log_mag_loss)
+                one_stft_loss = (
+                    0.5 * spectral_convergence +
+                    1.0 * log_mag_loss
+                )
+                stft_losses.append(alpha * one_stft_loss)
+                stft_weights.append(alpha)
 
             stft_loss = (
-                torch.stack(stft_losses).mean()
+                torch.stack(stft_losses).sum() /
+                max(sum(stft_weights), 1e-8)
                 if stft_losses
                 else self.zero
             )
@@ -921,10 +947,27 @@ class SoundStream(Module):
         target_delta = target.diff(dim = -1)
         recon_delta = recon.diff(dim = -1)
 
-        # Smooth, local click proxy. This discourages isolated sample-to-sample
-        # discontinuities without directly optimizing a hard max jump, which is
-        # too brittle and can damage natural speech transients.
-        click_loss = F.l1_loss(recon_delta, target_delta)
+        # Smooth, local click proxy. This keeps the reconstructed local slope
+        # close to the source slope without over-penalizing natural speech
+        # transients.
+        diff_l1 = F.l1_loss(recon_delta, target_delta)
+
+        # Clean-gate-aligned click proxy. The validation gate is driven by a
+        # normalized reconstructed jump score (recon jump / recon RMS), so this
+        # adds a differentiable top-k excess penalty against the same failure
+        # mode instead of only optimizing the average first-difference error.
+        recon_abs_delta = recon_delta.abs()
+        recon_rms = recon.square().mean(dim = -1, keepdim = True).clamp_min(1e-8).sqrt()
+        norm_recon_delta = recon_abs_delta / recon_rms.clamp_min(1e-8)
+        flat_norm_delta = rearrange(
+            norm_recon_delta.float(),
+            'b c n -> b (c n)'
+        )
+        topk_count = max(1, int(flat_norm_delta.shape[-1] * 0.001))
+        topk_click = flat_norm_delta.topk(topk_count, dim = -1).values.mean(dim = -1)
+        gate_click_loss = F.relu(topk_click - 5.5).square().mean()
+
+        click_loss = diff_l1 + 0.5 * gate_click_loss
 
         # Soft excess-jump proxy. Allow reconstructed slopes to follow real
         # speech transients, but penalize slopes that exceed the local target
@@ -932,7 +975,6 @@ class SoundStream(Module):
         # margin. This keeps the penalty small unless the model creates spikes
         # that are not present in the source.
         target_abs_delta = target_delta.detach().abs()
-        recon_abs_delta = recon_delta.abs()
         flat_target_delta = rearrange(
             target_abs_delta.float(),
             'b c n -> b (c n)'

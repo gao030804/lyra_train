@@ -57,8 +57,8 @@ STAGE_DEFAULTS = {
         lr=2e-4, discr_lr=None, ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
         use_ema=False,
-        click_loss_weight=0., jump_loss_weight=0.,
-        transient_loss_warmup_steps=0,
+        click_loss_weight=0.02, jump_loss_weight=0.003,
+        transient_loss_warmup_steps=15_000,
         stft_recon_loss_weight=0.5,
         gan_start=0, gan_ramp=0,
     ),
@@ -247,7 +247,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--si-sdr-loss-weight",
         type=float,
-        default=0.015,
+        default=0.03,
         help=(
             "Maximum SI-SDR loss weight for recon_pretrain. "
             "Use 0 for the pure Saturday baseline; other stages keep it disabled."

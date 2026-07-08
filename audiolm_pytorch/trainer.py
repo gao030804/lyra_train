@@ -1780,6 +1780,39 @@ class SoundStreamTrainer(nn.Module):
             metrics.get('p999_jump_ratio', float('inf')) <= self.clean_gate_max_p999_jump_ratio
         )
 
+    def clean_gate_failure_reasons(self, metrics):
+        if not self.clean_gate:
+            return []
+
+        reasons = []
+
+        if metrics.get('aligned_si_sdr', float('-inf')) < self.clean_gate_min_aligned_si_sdr:
+            reasons.append('aligned_si_sdr')
+
+        if metrics.get('aligned_correlation', float('-inf')) < self.clean_gate_min_aligned_corr:
+            reasons.append('aligned_corr')
+
+        rms_ratio = metrics.get('rms_ratio', float('inf'))
+        if not self.clean_gate_min_rms_ratio <= rms_ratio <= self.clean_gate_max_rms_ratio:
+            reasons.append('rms_ratio')
+
+        if metrics.get('recon_peak', float('inf')) > self.clean_gate_max_recon_peak:
+            reasons.append('peak')
+
+        if metrics.get('recon_clip_fraction', float('inf')) > self.clean_gate_max_recon_clip_fraction:
+            reasons.append('clip')
+
+        if metrics.get('click_score', float('inf')) > self.clean_gate_max_click_score:
+            reasons.append('click')
+
+        if metrics.get('jump_ratio', float('inf')) > self.clean_gate_max_jump_ratio:
+            reasons.append('jump')
+
+        if metrics.get('p999_jump_ratio', float('inf')) > self.clean_gate_max_p999_jump_ratio:
+            reasons.append('p999_jump')
+
+        return reasons
+
     def evaluate_fixed_validation_score(self, model):
         totals = Counter()
         total_code_counts = None
@@ -2380,6 +2413,17 @@ class SoundStreamTrainer(nn.Module):
 
             self.sync_best_scores_from_disk()
 
+            online_clean_fail = (
+                ",".join(self.clean_gate_failure_reasons(online_score)) or
+                "none"
+            )
+            ema_clean_fail = (
+                ",".join(self.clean_gate_failure_reasons(ema_score)) or
+                "none"
+                if self.use_ema
+                else "disabled"
+            )
+
             ema_summary = (
                 f"ema={ema_score['score']:.6f}, "
                 f"ema_rms={ema_score['rms_ratio']:.3f}, "
@@ -2392,6 +2436,7 @@ class SoundStreamTrainer(nn.Module):
                 f"ema_jump_ratio={ema_score.get('jump_ratio', 0.):.2f}, "
                 f"ema_click={ema_score.get('click_score', 0.):.1f}, "
                 f"ema_clean_ok={ema_score.get('clean_validation_eligible', 0.):.0f}, "
+                f"ema_clean_fail={ema_clean_fail}, "
                 f"ema_active_codes={ema_score['active_code_ratio']:.3f}, "
                 f"ema_perplexity={ema_score['codebook_perplexity']:.1f}, "
                 f"ema_rvq_ok={ema_score.get('rvq_validation_eligible', 0.):.0f}, "
@@ -2413,6 +2458,7 @@ class SoundStreamTrainer(nn.Module):
                 f"online_jump_ratio={online_score.get('jump_ratio', 0.):.2f}, "
                 f"online_click={online_score.get('click_score', 0.):.1f}, "
                 f"online_clean_ok={online_score.get('clean_validation_eligible', 0.):.0f}, "
+                f"online_clean_fail={online_clean_fail}, "
                 f"online_active_codes={online_score['active_code_ratio']:.3f}, "
                 f"online_perplexity={online_score['codebook_perplexity']:.1f}, "
                 f"online_q00_ok={online_score.get('q00_validation_eligible', 0.):.0f}, "
