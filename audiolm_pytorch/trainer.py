@@ -259,7 +259,19 @@ class SoundStreamTrainer(nn.Module):
         save_model_every: int = 1000,
         best_eval_every: int | None = None,
         best_eval_batches: int = 8,
+        si_sdr_loss_start_steps: int = 0,
         si_sdr_loss_warmup_steps: int = 0,
+        transient_loss_warmup_steps: int = 0,
+        clean_gate: bool = True,
+        clean_gate_min_aligned_si_sdr: float = 0.,
+        clean_gate_min_aligned_corr: float = 0.65,
+        clean_gate_min_rms_ratio: float = 0.4,
+        clean_gate_max_rms_ratio: float = 2.5,
+        clean_gate_max_recon_peak: float = 1.2,
+        clean_gate_max_recon_clip_fraction: float = 1e-3,
+        clean_gate_max_click_score: float = 6.,
+        clean_gate_max_jump_ratio: float = 2.,
+        clean_gate_max_p999_jump_ratio: float = 1.75,
         early_stopping_patience: int | None = None,
         early_stopping_min_delta: float = 0.,
         early_stopping_min_steps: int = 0,
@@ -337,7 +349,25 @@ class SoundStreamTrainer(nn.Module):
         self.si_sdr_loss_max_weight = float(
             getattr(soundstream, 'si_sdr_loss_weight', 0.)
         )
+        self.si_sdr_loss_start_steps = si_sdr_loss_start_steps
         self.si_sdr_loss_warmup_steps = si_sdr_loss_warmup_steps
+        self.click_loss_max_weight = float(
+            getattr(soundstream, 'click_loss_weight', 0.)
+        )
+        self.jump_loss_max_weight = float(
+            getattr(soundstream, 'jump_loss_weight', 0.)
+        )
+        self.transient_loss_warmup_steps = transient_loss_warmup_steps
+        self.clean_gate = clean_gate
+        self.clean_gate_min_aligned_si_sdr = clean_gate_min_aligned_si_sdr
+        self.clean_gate_min_aligned_corr = clean_gate_min_aligned_corr
+        self.clean_gate_min_rms_ratio = clean_gate_min_rms_ratio
+        self.clean_gate_max_rms_ratio = clean_gate_max_rms_ratio
+        self.clean_gate_max_recon_peak = clean_gate_max_recon_peak
+        self.clean_gate_max_recon_clip_fraction = clean_gate_max_recon_clip_fraction
+        self.clean_gate_max_click_score = clean_gate_max_click_score
+        self.clean_gate_max_jump_ratio = clean_gate_max_jump_ratio
+        self.clean_gate_max_p999_jump_ratio = clean_gate_max_p999_jump_ratio
 
         hyperparameters = {
             "num_train_steps": num_train_steps,
@@ -1082,7 +1112,7 @@ class SoundStreamTrainer(nn.Module):
             target = F.pad(target, (0, padding))
             recon = F.pad(recon, (0, padding))
 
-        _, multi_spectral_recon_loss = model.reconstruction_losses(target, recon)
+        _, multi_spectral_recon_loss, stft_recon_loss = model.reconstruction_losses(target, recon)
 
         target_centered = target - target.mean(dim = -1, keepdim = True)
         recon_centered = recon - recon.mean(dim = -1, keepdim = True)
@@ -1117,7 +1147,7 @@ class SoundStreamTrainer(nn.Module):
 
         wave_loss = (
             wave_l1 +
-            0.5 * wave_mse +
+            0.3 * wave_mse +
             model.energy_loss_weight * energy_loss +
             (
                 model.correlation_loss_weight /
@@ -1127,6 +1157,8 @@ class SoundStreamTrainer(nn.Module):
         score = (
             multi_spectral_recon_loss *
             model.multi_spectral_recon_loss_weight +
+            stft_recon_loss *
+            getattr(model, 'stft_recon_loss_weight', 0.) +
             wave_loss * model.recon_loss_weight
         )
         if self.best_checkpoint_metric in (
@@ -1171,6 +1203,7 @@ class SoundStreamTrainer(nn.Module):
             recon_loss = float(wave_l1.detach().cpu()),
             wave_mse = float(wave_mse.detach().cpu()),
             multi_spectral_recon_loss = float(multi_spectral_recon_loss.detach().cpu()),
+            stft_recon_loss = float(stft_recon_loss.detach().cpu()),
             commitment_loss = 0.,
             boundary_loss = float(boundary_loss.detach().cpu()),
             energy_loss = float(energy_loss.detach().cpu()),
@@ -1732,6 +1765,21 @@ class SoundStreamTrainer(nn.Module):
         self.fixed_best_valid_waves = waves
         return waves
 
+    def clean_gate_passes(self, metrics):
+        if not self.clean_gate:
+            return True
+
+        return (
+            metrics.get('aligned_si_sdr', float('-inf')) >= self.clean_gate_min_aligned_si_sdr and
+            metrics.get('aligned_correlation', float('-inf')) >= self.clean_gate_min_aligned_corr and
+            self.clean_gate_min_rms_ratio <= metrics.get('rms_ratio', float('inf')) <= self.clean_gate_max_rms_ratio and
+            metrics.get('recon_peak', float('inf')) <= self.clean_gate_max_recon_peak and
+            metrics.get('recon_clip_fraction', float('inf')) <= self.clean_gate_max_recon_clip_fraction and
+            metrics.get('click_score', float('inf')) <= self.clean_gate_max_click_score and
+            metrics.get('jump_ratio', float('inf')) <= self.clean_gate_max_jump_ratio and
+            metrics.get('p999_jump_ratio', float('inf')) <= self.clean_gate_max_p999_jump_ratio
+        )
+
     def evaluate_fixed_validation_score(self, model):
         totals = Counter()
         total_code_counts = None
@@ -1774,11 +1822,14 @@ class SoundStreamTrainer(nn.Module):
         )
         averaged_metrics['q00_validation_eligible'] = float(q00_eligible)
         averaged_metrics['rvq_validation_eligible'] = float(rvq_eligible)
-        if self.best_checkpoint_metric == 'recon_pretrain':
+        clean_eligible = self.clean_gate_passes(averaged_metrics)
+        averaged_metrics['clean_validation_eligible'] = float(clean_eligible)
+        if self.best_checkpoint_metric in ('recon_pretrain', 'gan_pretrain'):
             # Stage-1 depends on a healthy full RVQ stack. Avoid selecting
             # checkpoints whose aggregate score improves after q00 or later
-            # residual quantizers have collapsed.
-            eligible = eligible and q00_eligible and rvq_eligible
+            # residual quantizers have collapsed. Stage-2 starts from that
+            # codec and can otherwise select GAN-polished but noisy weights.
+            eligible = eligible and q00_eligible and rvq_eligible and clean_eligible
         if self.best_checkpoint_metric in (
             'stream_finetune',
             'stream_finetune_long'
@@ -1788,7 +1839,8 @@ class SoundStreamTrainer(nn.Module):
             eligible = (
                 eligible and
                 averaged_metrics['active_code_ratio'] >= 0.15 and
-                averaged_metrics['codebook_perplexity'] >= 24.
+                averaged_metrics['codebook_perplexity'] >= 24. and
+                clean_eligible
             )
         averaged_metrics['validation_eligible'] = float(eligible)
         return averaged_metrics
@@ -1925,15 +1977,45 @@ class SoundStreamTrainer(nn.Module):
             model.si_sdr_loss_weight = 0.
             return 0.
 
+        if steps < self.si_sdr_loss_start_steps:
+            model.si_sdr_loss_weight = 0.
+            return 0.
+
         if self.si_sdr_loss_warmup_steps <= 0:
             progress = 1.
         else:
             progress = min(
                 1.,
-                max(0., steps / self.si_sdr_loss_warmup_steps)
+                max(
+                    0.,
+                    (steps - self.si_sdr_loss_start_steps) /
+                    self.si_sdr_loss_warmup_steps
+                )
             )
 
         model.si_sdr_loss_weight = self.si_sdr_loss_max_weight * progress
+        return progress
+
+    def update_transient_loss_weights(self, steps):
+        model = self.unwrapped_soundstream
+        if (
+            self.click_loss_max_weight <= 0 and
+            self.jump_loss_max_weight <= 0
+        ):
+            model.click_loss_weight = 0.
+            model.jump_loss_weight = 0.
+            return 0.
+
+        if self.transient_loss_warmup_steps <= 0:
+            progress = 1.
+        else:
+            progress = min(
+                1.,
+                max(0., steps / self.transient_loss_warmup_steps)
+            )
+
+        model.click_loss_weight = self.click_loss_max_weight * progress
+        model.jump_loss_weight = self.jump_loss_max_weight * progress
         return progress
 
     def update_discriminators(self, device, steps, logs):
@@ -2023,6 +2105,7 @@ class SoundStreamTrainer(nn.Module):
         log_losses = self.log_losses_every > 0 and not (steps % self.log_losses_every)
         gan_progress = self.update_gan_weights(steps)
         si_sdr_loss_progress = self.update_si_sdr_loss_weight(steps)
+        transient_loss_progress = self.update_transient_loss_weights(steps)
 
         self.soundstream.train()
 
@@ -2052,10 +2135,13 @@ class SoundStreamTrainer(nn.Module):
                 loss, (
                     recon_loss,
                     multi_spectral_recon_loss,
+                    stft_recon_loss,
                     adversarial_loss,
                     feature_loss,
                     all_commitment_loss,
                     si_sdr_loss,
+                    click_loss,
+                    jump_loss,
                     boundary_loss
                 ) = self.soundstream(
                     wave,
@@ -2072,10 +2158,13 @@ class SoundStreamTrainer(nn.Module):
 
             accum_log(logs, dict(
                 multi_spectral_recon_loss = multi_spectral_recon_loss.item() / self.grad_accum_every,
+                stft_recon_loss = stft_recon_loss.item() / self.grad_accum_every,
                 adversarial_loss = adversarial_loss.item() / self.grad_accum_every,
                 feature_loss = feature_loss.item() / self.grad_accum_every,
                 all_commitment_loss = all_commitment_loss.item() / self.grad_accum_every,
                 si_sdr_loss = si_sdr_loss.item() / self.grad_accum_every,
+                click_loss = click_loss.item() / self.grad_accum_every,
+                jump_loss = jump_loss.item() / self.grad_accum_every,
                 boundary_loss = boundary_loss.item() / self.grad_accum_every,
             ))
 
@@ -2098,8 +2187,13 @@ class SoundStreamTrainer(nn.Module):
             f"g_total={logs['loss']:.6f} | "
             f"wave={logs['recon_loss']:.6f} | "
             f"mel={logs['multi_spectral_recon_loss']:.6f} | "
+            f"stft={logs['stft_recon_loss']:.6f} | "
             f"si_sdr_loss={logs['si_sdr_loss']:.6f}"
             f"(w={model.si_sdr_loss_weight:.4g},ramp={si_sdr_loss_progress:.4f}) | "
+            f"click_loss={logs['click_loss']:.6f}"
+            f"(w={model.click_loss_weight:.4g},ramp={transient_loss_progress:.4f}) | "
+            f"jump_loss={logs['jump_loss']:.6f}"
+            f"(w={model.jump_loss_weight:.4g},ramp={transient_loss_progress:.4f}) | "
             f"commit={logs['all_commitment_loss']:.6f}"
         )
 
@@ -2219,7 +2313,11 @@ class SoundStreamTrainer(nn.Module):
                             recon_wave = recon.cpu().detach()
                             if recon_wave.ndim == 1:
                                 recon_wave = recon_wave.unsqueeze(0)
-                            torchaudio.save(filename, recon_wave, self.unwrapped_soundstream.target_sample_hz)
+                            save_audio_file(
+                                filename,
+                                recon_wave,
+                                self.unwrapped_soundstream.target_sample_hz
+                            )
 
             self.print(f'{steps}: saving to {str(self.results_folder)}')
 
@@ -2293,6 +2391,7 @@ class SoundStreamTrainer(nn.Module):
                 f"ema_clip={ema_score.get('recon_clip_fraction', 0.) * 100:.3f}%, "
                 f"ema_jump_ratio={ema_score.get('jump_ratio', 0.):.2f}, "
                 f"ema_click={ema_score.get('click_score', 0.):.1f}, "
+                f"ema_clean_ok={ema_score.get('clean_validation_eligible', 0.):.0f}, "
                 f"ema_active_codes={ema_score['active_code_ratio']:.3f}, "
                 f"ema_perplexity={ema_score['codebook_perplexity']:.1f}, "
                 f"ema_rvq_ok={ema_score.get('rvq_validation_eligible', 0.):.0f}, "
@@ -2313,6 +2412,7 @@ class SoundStreamTrainer(nn.Module):
                 f"online_clip={online_score.get('recon_clip_fraction', 0.) * 100:.3f}%, "
                 f"online_jump_ratio={online_score.get('jump_ratio', 0.):.2f}, "
                 f"online_click={online_score.get('click_score', 0.):.1f}, "
+                f"online_clean_ok={online_score.get('clean_validation_eligible', 0.):.0f}, "
                 f"online_active_codes={online_score['active_code_ratio']:.3f}, "
                 f"online_perplexity={online_score['codebook_perplexity']:.1f}, "
                 f"online_q00_ok={online_score.get('q00_validation_eligible', 0.):.0f}, "

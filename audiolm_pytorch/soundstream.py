@@ -547,9 +547,12 @@ class SoundStream(Module):
         multi_spectral_n_mels = 64,
         recon_loss_weight = 1.,
         multi_spectral_recon_loss_weight = 1.,
+        stft_recon_loss_weight = 0.,
         si_sdr_loss_weight = 0.,
         correlation_loss_weight = 0.,
         energy_loss_weight = 0.1,
+        click_loss_weight = 0.,
+        jump_loss_weight = 0.,
         commitment_loss_weight = 0.1,
         adversarial_loss_weight = 1.,
         feature_loss_weight = 100,
@@ -719,14 +722,23 @@ class SoundStream(Module):
 
         self.mel_spec_transforms = ModuleList([])
         self.mel_spec_recon_alphas = []
+        self.stft_recon_settings = []
 
         num_transforms = len(multi_spectral_window_powers_of_two)
         multi_spectral_n_ffts = cast_tuple(multi_spectral_n_ffts, num_transforms)
         multi_spectral_n_mels = cast_tuple(multi_spectral_n_mels, num_transforms)
+        mel_weight_by_win_length = {
+            64: 0.25,
+            128: 0.50,
+            256: 1.00,
+            512: 1.00,
+            1024: 1.00,
+            2048: 0.75
+        }
 
         for powers, n_fft, n_mels in zip_longest(multi_spectral_window_powers_of_two, multi_spectral_n_ffts, multi_spectral_n_mels):
             win_length = 2 ** powers
-            alpha = (win_length / 2) ** 0.5
+            alpha = mel_weight_by_win_length.get(win_length, 1.)
 
             calculated_n_fft = default(max(n_fft, win_length), win_length)  # @AndreyBocharnikov said this is usually win length, but overridable
 
@@ -743,14 +755,22 @@ class SoundStream(Module):
 
             self.mel_spec_transforms.append(melspec_transform)
             self.mel_spec_recon_alphas.append(alpha)
+            self.stft_recon_settings.append((
+                calculated_n_fft,
+                win_length,
+                win_length // 4
+            ))
 
         # loss weights
 
         self.recon_loss_weight = recon_loss_weight
         self.multi_spectral_recon_loss_weight = multi_spectral_recon_loss_weight
+        self.stft_recon_loss_weight = stft_recon_loss_weight
         self.si_sdr_loss_weight = si_sdr_loss_weight
         self.correlation_loss_weight = correlation_loss_weight
         self.energy_loss_weight = energy_loss_weight
+        self.click_loss_weight = click_loss_weight
+        self.jump_loss_weight = jump_loss_weight
         self.commitment_loss_weight = commitment_loss_weight
         self.adversarial_loss_weight = adversarial_loss_weight
         self.feature_loss_weight = feature_loss_weight
@@ -783,7 +803,7 @@ class SoundStream(Module):
         correlation_loss = (1. - signed_correlation).mean()
         wave_loss = (
             wave_l1 +
-            0.5 * wave_mse +
+            0.3 * wave_mse +
             self.energy_loss_weight * energy_loss +
             (
                 self.correlation_loss_weight /
@@ -792,21 +812,79 @@ class SoundStream(Module):
         )
 
         spectral_losses = []
-        for mel_transform in self.mel_spec_transforms:
+        spectral_weights = []
+        for mel_transform, alpha in zip(
+            self.mel_spec_transforms,
+            self.mel_spec_recon_alphas
+        ):
             target_mel, recon_mel = map(mel_transform, (target, recon))
             linear_loss = F.l1_loss(recon_mel, target_mel)
             log_loss = F.l1_loss(
                 log(recon_mel, eps = 1e-5),
                 log(target_mel, eps = 1e-5)
             )
-            spectral_losses.append(linear_loss + log_loss)
+            spectral_losses.append(alpha * (0.8 * linear_loss + log_loss))
+            spectral_weights.append(alpha)
 
         spectral_loss = (
-            torch.stack(spectral_losses).mean()
+            torch.stack(spectral_losses).sum() /
+            max(sum(spectral_weights), 1e-8)
             if spectral_losses
             else self.zero
         )
-        return wave_loss, spectral_loss
+
+        stft_losses = []
+        for n_fft, win_length, hop_length in self.stft_recon_settings:
+            min_samples = n_fft
+            target_for_stft = target.float()
+            recon_for_stft = recon.float()
+            if target_for_stft.shape[-1] < min_samples:
+                padding = min_samples - target_for_stft.shape[-1]
+                target_for_stft = F.pad(target_for_stft, (0, padding))
+                recon_for_stft = F.pad(recon_for_stft, (0, padding))
+
+            target_rows = rearrange(target_for_stft, 'b c n -> (b c) n')
+            recon_rows = rearrange(recon_for_stft, 'b c n -> (b c) n')
+            window = torch.hann_window(
+                win_length,
+                device = target_rows.device,
+                dtype = torch.float32
+            )
+            target_stft = torch.stft(
+                target_rows,
+                n_fft,
+                hop_length = hop_length,
+                win_length = win_length,
+                window = window,
+                return_complex = True
+            )
+            recon_stft = torch.stft(
+                recon_rows,
+                n_fft,
+                hop_length = hop_length,
+                win_length = win_length,
+                window = window,
+                return_complex = True
+            )
+            target_mag = target_stft.abs()
+            recon_mag = recon_stft.abs()
+            spectral_convergence = (
+                torch.linalg.norm(target_mag - recon_mag) /
+                torch.linalg.norm(target_mag).clamp_min(1e-8)
+            )
+            log_mag_loss = F.l1_loss(
+                log(recon_mag, eps = 1e-5),
+                log(target_mag, eps = 1e-5)
+            )
+            stft_losses.append(spectral_convergence + log_mag_loss)
+
+        stft_loss = (
+            torch.stack(stft_losses).mean()
+            if stft_losses
+            else self.zero
+        )
+
+        return wave_loss, spectral_loss, stft_loss
 
     def si_sdr_loss(self, target, recon):
         projection_scale = (
@@ -820,6 +898,54 @@ class SoundStream(Module):
             residual.square().sum(dim = -1).clamp_min(1e-8)
         )
         return -si_sdr.mean()
+
+    def transient_noise_losses(self, target, recon):
+        if (
+            self.click_loss_weight <= 0 and
+            self.jump_loss_weight <= 0
+        ):
+            return self.zero, self.zero
+
+        if target.shape[-1] < 2 or recon.shape[-1] < 2:
+            return self.zero, self.zero
+
+        target_delta = target.diff(dim = -1)
+        recon_delta = recon.diff(dim = -1)
+
+        # Smooth, local click proxy. This discourages isolated sample-to-sample
+        # discontinuities without directly optimizing a hard max jump, which is
+        # too brittle and can damage natural speech transients.
+        click_loss = F.l1_loss(recon_delta, target_delta)
+
+        # Soft excess-jump proxy. Allow reconstructed slopes to follow real
+        # speech transients, but penalize slopes that exceed the local target
+        # slope envelope plus a detached robust per-example high-percentile
+        # margin. This keeps the penalty small unless the model creates spikes
+        # that are not present in the source.
+        target_abs_delta = target_delta.detach().abs()
+        recon_abs_delta = recon_delta.abs()
+        flat_target_delta = rearrange(
+            target_abs_delta.float(),
+            'b c n -> b (c n)'
+        )
+        target_p999 = torch.quantile(
+            flat_target_delta,
+            0.999,
+            dim = -1,
+            keepdim = True
+        ).to(dtype = recon_abs_delta.dtype)
+        while target_p999.ndim < recon_abs_delta.ndim:
+            target_p999 = target_p999.unsqueeze(-1)
+
+        allowed_delta = (
+            1.5 * target_abs_delta +
+            0.5 * target_p999 +
+            1e-4
+        )
+        jump_excess = F.relu(recon_abs_delta - allowed_delta)
+        jump_loss = jump_excess.square().mean().clamp_min(1e-12).sqrt()
+
+        return click_loss, jump_loss
 
     def generator_perceptual_losses(self, real, fake):
         if self.adversarial_loss_weight <= 0 and self.feature_loss_weight <= 0:
@@ -1115,7 +1241,7 @@ class SoundStream(Module):
 
         target = default(target, orig_x)  # target can also be passed in, in the case of denoising
 
-        recon_loss, multi_spectral_recon_loss = self.reconstruction_losses(
+        recon_loss, multi_spectral_recon_loss, stft_recon_loss = self.reconstruction_losses(
             target,
             recon_x
         )
@@ -1124,6 +1250,7 @@ class SoundStream(Module):
             if self.si_sdr_loss_weight > 0
             else self.zero
         )
+        click_loss, jump_loss = self.transient_noise_losses(target, recon_x)
         adversarial_loss, feature_loss = self.generator_perceptual_losses(
             orig_x,
             recon_x
@@ -1136,7 +1263,10 @@ class SoundStream(Module):
         total_loss = (
             recon_loss * self.recon_loss_weight +
             multi_spectral_recon_loss * self.multi_spectral_recon_loss_weight +
+            stft_recon_loss * self.stft_recon_loss_weight +
             si_sdr_loss * self.si_sdr_loss_weight +
+            click_loss * self.click_loss_weight +
+            jump_loss * self.jump_loss_weight +
             adversarial_loss * self.adversarial_loss_weight +
             feature_loss * self.feature_loss_weight +
             all_commitment_loss * self.commitment_loss_weight
@@ -1146,10 +1276,13 @@ class SoundStream(Module):
             return total_loss, (
                 recon_loss,
                 multi_spectral_recon_loss,
+                stft_recon_loss,
                 adversarial_loss,
                 feature_loss,
                 all_commitment_loss,
                 si_sdr_loss,
+                click_loss,
+                jump_loss,
                 self.zero
             )
 
@@ -1486,7 +1619,7 @@ class FrameStreamingSoundStream(SoundStream):
 
         target = default(target, orig_x)
 
-        recon_loss, multi_spectral_recon_loss = self.reconstruction_losses(
+        recon_loss, multi_spectral_recon_loss, stft_recon_loss = self.reconstruction_losses(
             target,
             recon_x
         )
@@ -1495,6 +1628,7 @@ class FrameStreamingSoundStream(SoundStream):
             if self.si_sdr_loss_weight > 0
             else self.zero
         )
+        click_loss, jump_loss = self.transient_noise_losses(target, recon_x)
         adversarial_loss, feature_loss = self.generator_perceptual_losses(
             orig_x,
             recon_x
@@ -1505,7 +1639,10 @@ class FrameStreamingSoundStream(SoundStream):
         total_loss = (
             recon_loss * self.recon_loss_weight +
             multi_spectral_recon_loss * self.multi_spectral_recon_loss_weight +
+            stft_recon_loss * self.stft_recon_loss_weight +
             si_sdr_loss * self.si_sdr_loss_weight +
+            click_loss * self.click_loss_weight +
+            jump_loss * self.jump_loss_weight +
             adversarial_loss * self.adversarial_loss_weight +
             feature_loss * self.feature_loss_weight +
             all_commitment_loss * self.commitment_loss_weight +
@@ -1516,10 +1653,13 @@ class FrameStreamingSoundStream(SoundStream):
             return total_loss, (
                 recon_loss,
                 multi_spectral_recon_loss,
+                stft_recon_loss,
                 adversarial_loss,
                 feature_loss,
                 all_commitment_loss,
                 si_sdr_loss,
+                click_loss,
+                jump_loss,
                 boundary_loss
             )
 

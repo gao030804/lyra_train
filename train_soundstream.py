@@ -46,28 +46,36 @@ STAGE_DEFAULTS = {
         save_every=500, eval_every=100, min_steps=0, patience=30,
         lr=3e-4, discr_lr=None, ema_beta=0.95,
         ema_update_after_step=0, ema_update_every=1,
+        click_loss_weight=0., jump_loss_weight=0.,
+        transient_loss_warmup_steps=0,
         gan_start=0, gan_ramp=0,
     ),
     "recon_pretrain": dict(
-        steps=50_000, batch_size=4, segment_seconds=4.,
+        steps=50_000, batch_size=5, segment_seconds=3.,
         save_every=2_000, eval_every=250, min_steps=10_000, patience=40,
         lr=2e-4, discr_lr=None, ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
         use_ema=False,
+        click_loss_weight=0., jump_loss_weight=0.,
+        transient_loss_warmup_steps=0,
         gan_start=0, gan_ramp=0,
     ),
     "gan_pretrain": dict(
-        steps=30_000, batch_size=4, segment_seconds=2.,
+        steps=30_000, batch_size=5, segment_seconds=3.,
         save_every=2_000, eval_every=250, min_steps=5_000, patience=30,
         lr=5e-5, discr_lr=5e-5, ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
-        gan_start=0, gan_ramp=10_000,
+        click_loss_weight=0., jump_loss_weight=0.,
+        transient_loss_warmup_steps=0,
+        gan_start=5_000, gan_ramp=15_000,
     ),
     "stream_finetune": dict(
         steps=20_000, batch_size=4, segment_seconds=2.,
         save_every=1_000, eval_every=250, min_steps=5_000, patience=30,
         lr=3e-5, discr_lr=5e-5, ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
+        click_loss_weight=0., jump_loss_weight=0.,
+        transient_loss_warmup_steps=0,
         gan_start=5_000, gan_ramp=10_000,
     ),
     "stream_finetune_long": dict(
@@ -75,6 +83,8 @@ STAGE_DEFAULTS = {
         save_every=1_000, eval_every=250, min_steps=1_000, patience=15,
         lr=1e-5, discr_lr=2e-5, ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
+        click_loss_weight=0., jump_loss_weight=0.,
+        transient_loss_warmup_steps=0,
         gan_start=1_000, gan_ramp=2_000,
     ),
 }
@@ -232,17 +242,113 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--si-sdr-loss-weight",
         type=float,
-        default=0.01,
+        default=0.015,
         help=(
             "Maximum SI-SDR loss weight for recon_pretrain. "
             "Use 0 for the pure Saturday baseline; other stages keep it disabled."
         ),
     )
     parser.add_argument(
+        "--si-sdr-loss-start-steps",
+        type=int,
+        default=5_000,
+        help="Keep SI-SDR loss weight at zero for this many recon_pretrain steps.",
+    )
+    parser.add_argument(
         "--si-sdr-loss-warmup-steps",
         type=int,
-        default=15_000,
-        help="Linearly ramp SI-SDR loss weight over this many recon_pretrain steps.",
+        default=10_000,
+        help="After --si-sdr-loss-start-steps, linearly ramp SI-SDR loss over this many recon_pretrain steps.",
+    )
+    parser.add_argument(
+        "--click-loss-weight",
+        type=float,
+        default=None,
+        help=(
+            "Auxiliary first-difference loss weight for reducing click/electric "
+            "artifacts. Defaults are stage-specific and intentionally small."
+        ),
+    )
+    parser.add_argument(
+        "--jump-loss-weight",
+        type=float,
+        default=None,
+        help=(
+            "Auxiliary soft excess-jump loss weight for reducing isolated spikes. "
+            "Defaults are stage-specific and intentionally small."
+        ),
+    )
+    parser.add_argument(
+        "--transient-loss-warmup-steps",
+        type=int,
+        default=None,
+        help=(
+            "Linearly ramp click/jump loss over this many steps. Defaults are "
+            "stage-specific so transient penalties do not dominate early training."
+        ),
+    )
+    parser.add_argument(
+        "--disable-clean-gate",
+        action="store_true",
+        help=(
+            "Disable artifact-aware checkpoint eligibility. By default, best "
+            "checkpoint selection rejects validation checkpoints with poor "
+            "aligned SI-SDR/correlation or abnormal peak/click/jump metrics."
+        ),
+    )
+    parser.add_argument(
+        "--clean-gate-min-aligned-si-sdr",
+        type=float,
+        default=0.0,
+        help="Minimum aligned SI-SDR required for best checkpoint eligibility.",
+    )
+    parser.add_argument(
+        "--clean-gate-min-aligned-corr",
+        type=float,
+        default=0.65,
+        help="Minimum aligned correlation required for best checkpoint eligibility.",
+    )
+    parser.add_argument(
+        "--clean-gate-min-rms-ratio",
+        type=float,
+        default=0.4,
+        help="Minimum recon/input RMS ratio required for best checkpoint eligibility.",
+    )
+    parser.add_argument(
+        "--clean-gate-max-rms-ratio",
+        type=float,
+        default=2.5,
+        help="Maximum recon/input RMS ratio required for best checkpoint eligibility.",
+    )
+    parser.add_argument(
+        "--clean-gate-max-recon-peak",
+        type=float,
+        default=1.2,
+        help="Maximum reconstructed absolute peak for best checkpoint eligibility.",
+    )
+    parser.add_argument(
+        "--clean-gate-max-recon-clip-fraction",
+        type=float,
+        default=1e-3,
+        help="Maximum reconstructed clipping fraction for best checkpoint eligibility.",
+    )
+    parser.add_argument(
+        "--clean-gate-max-click-score",
+        type=float,
+        default=6.0,
+        help="Maximum click score for best checkpoint eligibility.",
+    )
+    parser.add_argument(
+        "--clean-gate-max-jump-ratio",
+        type=float,
+        default=2.0,
+        help="Maximum max-jump ratio for best checkpoint eligibility.",
+    )
+    parser.add_argument(
+        "--clean-gate-max-p999-jump-ratio",
+        type=float,
+        default=1.75,
+        help="Maximum p99.9 jump ratio for best checkpoint eligibility.",
     )
     parser.add_argument(
         "--stream-context-frames",
@@ -378,6 +484,8 @@ def build_model(
     codebook_size: int,
     num_quantizers: int,
     si_sdr_loss_weight: float,
+    click_loss_weight: float,
+    jump_loss_weight: float,
     sync_codebook: bool | None = None,
 ) -> SoundStream:
     if sync_codebook is None:
@@ -400,10 +508,13 @@ def build_model(
             if stage in ("overfit", "recon_pretrain")
             else 1.
         ),
-        multi_spectral_recon_loss_weight=1.,
+        multi_spectral_recon_loss_weight=0.7,
+        stft_recon_loss_weight=0.5,
         si_sdr_loss_weight=si_sdr_loss_weight,
         correlation_loss_weight=0.,
         energy_loss_weight=0.1,
+        click_loss_weight=click_loss_weight,
+        jump_loss_weight=jump_loss_weight,
         commitment_loss_weight=0.1,
         adversarial_loss_weight=(
             0.001
@@ -445,8 +556,34 @@ def main() -> None:
         raise ValueError("--seed must be non-negative.")
     if args.si_sdr_loss_weight < 0:
         raise ValueError("--si-sdr-loss-weight cannot be negative.")
+    if args.si_sdr_loss_start_steps < 0:
+        raise ValueError("--si-sdr-loss-start-steps cannot be negative.")
     if args.si_sdr_loss_warmup_steps < 0:
         raise ValueError("--si-sdr-loss-warmup-steps cannot be negative.")
+    if args.click_loss_weight is not None and args.click_loss_weight < 0:
+        raise ValueError("--click-loss-weight cannot be negative.")
+    if args.jump_loss_weight is not None and args.jump_loss_weight < 0:
+        raise ValueError("--jump-loss-weight cannot be negative.")
+    if (
+        args.transient_loss_warmup_steps is not None and
+        args.transient_loss_warmup_steps < 0
+    ):
+        raise ValueError("--transient-loss-warmup-steps cannot be negative.")
+    if not -1. <= args.clean_gate_min_aligned_corr <= 1.:
+        raise ValueError("--clean-gate-min-aligned-corr must be between -1 and 1.")
+    if args.clean_gate_min_rms_ratio <= 0:
+        raise ValueError("--clean-gate-min-rms-ratio must be positive.")
+    if args.clean_gate_max_rms_ratio < args.clean_gate_min_rms_ratio:
+        raise ValueError("--clean-gate-max-rms-ratio must be >= --clean-gate-min-rms-ratio.")
+    for name in (
+        "clean_gate_max_recon_peak",
+        "clean_gate_max_recon_clip_fraction",
+        "clean_gate_max_click_score",
+        "clean_gate_max_jump_ratio",
+        "clean_gate_max_p999_jump_ratio",
+    ):
+        if getattr(args, name) < 0:
+            raise ValueError(f"--{name.replace('_', '-')} cannot be negative.")
     if args.dl_num_workers < 0:
         raise ValueError("--dl-num-workers cannot be negative.")
     seed_everything(args.seed)
@@ -517,6 +654,21 @@ def main() -> None:
         if args.stage == "recon_pretrain"
         else 0.0
     )
+    click_loss_weight = (
+        args.click_loss_weight
+        if args.click_loss_weight is not None
+        else stage_defaults["click_loss_weight"]
+    )
+    jump_loss_weight = (
+        args.jump_loss_weight
+        if args.jump_loss_weight is not None
+        else stage_defaults["jump_loss_weight"]
+    )
+    transient_loss_warmup_steps = (
+        args.transient_loss_warmup_steps
+        if args.transient_loss_warmup_steps is not None
+        else stage_defaults["transient_loss_warmup_steps"]
+    )
 
     bitrate = calculate_bitrate(
         sample_rate=sample_rate,
@@ -546,7 +698,26 @@ def main() -> None:
     print(
         "SI-SDR loss: "
         f"max_weight={si_sdr_loss_weight}, "
+        f"start_steps={args.si_sdr_loss_start_steps if si_sdr_loss_weight > 0 else 0}, "
         f"warmup_steps={args.si_sdr_loss_warmup_steps if si_sdr_loss_weight > 0 else 0}"
+    )
+    print(
+        "Transient noise loss: "
+        f"click_weight={click_loss_weight}, "
+        f"jump_weight={jump_loss_weight}, "
+        f"warmup_steps={transient_loss_warmup_steps}"
+    )
+    print(
+        "Clean checkpoint gate: "
+        f"enabled={not args.disable_clean_gate}, "
+        f"aligned_si_sdr>={args.clean_gate_min_aligned_si_sdr}, "
+        f"aligned_corr>={args.clean_gate_min_aligned_corr}, "
+        f"rms_ratio=[{args.clean_gate_min_rms_ratio}, {args.clean_gate_max_rms_ratio}], "
+        f"peak<={args.clean_gate_max_recon_peak}, "
+        f"clip<={args.clean_gate_max_recon_clip_fraction}, "
+        f"click<={args.clean_gate_max_click_score}, "
+        f"jump<={args.clean_gate_max_jump_ratio}, "
+        f"p999_jump<={args.clean_gate_max_p999_jump_ratio}"
     )
     print(
         "Signed correlation loss weight: "
@@ -627,6 +798,8 @@ def main() -> None:
         codebook_size=codebook_size,
         num_quantizers=num_quantizers,
         si_sdr_loss_weight=si_sdr_loss_weight,
+        click_loss_weight=click_loss_weight,
+        jump_loss_weight=jump_loss_weight,
         sync_codebook=(world_size > 1),
     )
 
@@ -660,11 +833,27 @@ def main() -> None:
         save_model_every=save_model_every,
         best_eval_every=best_eval_every,
         best_eval_batches=args.best_eval_batches,
+        si_sdr_loss_start_steps=(
+            args.si_sdr_loss_start_steps
+            if si_sdr_loss_weight > 0
+            else 0
+        ),
         si_sdr_loss_warmup_steps=(
             args.si_sdr_loss_warmup_steps
             if si_sdr_loss_weight > 0
             else 0
         ),
+        transient_loss_warmup_steps=transient_loss_warmup_steps,
+        clean_gate=not args.disable_clean_gate,
+        clean_gate_min_aligned_si_sdr=args.clean_gate_min_aligned_si_sdr,
+        clean_gate_min_aligned_corr=args.clean_gate_min_aligned_corr,
+        clean_gate_min_rms_ratio=args.clean_gate_min_rms_ratio,
+        clean_gate_max_rms_ratio=args.clean_gate_max_rms_ratio,
+        clean_gate_max_recon_peak=args.clean_gate_max_recon_peak,
+        clean_gate_max_recon_clip_fraction=args.clean_gate_max_recon_clip_fraction,
+        clean_gate_max_click_score=args.clean_gate_max_click_score,
+        clean_gate_max_jump_ratio=args.clean_gate_max_jump_ratio,
+        clean_gate_max_p999_jump_ratio=args.clean_gate_max_p999_jump_ratio,
         early_stopping_patience=early_stopping_patience,
         early_stopping_min_delta=args.early_stopping_min_delta,
         early_stopping_min_steps=early_stopping_min_steps,
@@ -828,6 +1017,7 @@ def main() -> None:
         metric_names = (
             'score',
             'multi_spectral_recon_loss',
+            'stft_recon_loss',
             'recon_loss',
             'wave_mse',
             'boundary_loss',
@@ -838,6 +1028,17 @@ def main() -> None:
             'si_sdr',
             'aligned_correlation',
             'aligned_si_sdr',
+            'target_peak',
+            'recon_peak',
+            'target_clip_fraction',
+            'recon_clip_fraction',
+            'target_max_jump',
+            'recon_max_jump',
+            'target_p999_jump',
+            'recon_p999_jump',
+            'jump_ratio',
+            'p999_jump_ratio',
+            'click_score',
         )
         local_num_samples = (
             float(local_metrics['num_samples'])
@@ -887,6 +1088,7 @@ def main() -> None:
                 "Test report: "
                 f"score={test_metrics['score']:.6f}, "
                 f"mel={test_metrics['multi_spectral_recon_loss']:.6f}, "
+                f"stft={test_metrics['stft_recon_loss']:.6f}, "
                 f"recon={test_metrics['recon_loss']:.6f}, "
                 f"mse={test_metrics['wave_mse']:.6f}, "
                 f"boundary={test_metrics['boundary_loss']:.6f}, "
