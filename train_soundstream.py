@@ -52,14 +52,14 @@ STAGE_DEFAULTS = {
         gan_start=0, gan_ramp=0,
     ),
     "recon_pretrain": dict(
-        steps=50_000, batch_size=5, segment_seconds=3.,
+        steps=150_000, batch_size=4, segment_seconds=4.,
         save_every=2_000, eval_every=250, min_steps=10_000, patience=40,
         lr=2e-4, discr_lr=None, ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
         use_ema=False,
         click_loss_weight=0.02, jump_loss_weight=0.003,
         transient_loss_warmup_steps=15_000,
-        stft_recon_loss_weight=0.5,
+        stft_recon_loss_weight=1.0,
         gan_start=0, gan_ramp=0,
     ),
     "gan_pretrain": dict(
@@ -497,6 +497,13 @@ def build_model(
     if sync_codebook is None:
         sync_codebook = int(os.environ.get("WORLD_SIZE", "1")) > 1
 
+    if stage == "recon_pretrain":
+        recon_loss_weight = 1.
+        multi_spectral_recon_loss_weight = 10.
+    else:
+        recon_loss_weight = 10. if stage == "overfit" else 1.
+        multi_spectral_recon_loss_weight = 0.7
+
     model_kwargs = dict(
         channels=16,
         channel_mults=(2, 4, 8, 16),
@@ -509,12 +516,8 @@ def build_model(
         use_local_attn=False,
         target_sample_hz=sample_rate,
         strides=strides,
-        recon_loss_weight=(
-            10.
-            if stage in ("overfit", "recon_pretrain")
-            else 1.
-        ),
-        multi_spectral_recon_loss_weight=0.7,
+        recon_loss_weight=recon_loss_weight,
+        multi_spectral_recon_loss_weight=multi_spectral_recon_loss_weight,
         stft_recon_loss_weight=stft_recon_loss_weight,
         si_sdr_loss_weight=si_sdr_loss_weight,
         correlation_loss_weight=0.,
