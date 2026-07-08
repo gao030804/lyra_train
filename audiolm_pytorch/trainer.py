@@ -25,7 +25,7 @@ import torchaudio
 from torch import nn
 import torch.nn.functional as F
 from torch.optim import Optimizer
-from torch.optim.lr_scheduler import LambdaLR, LRScheduler
+from torch.optim.lr_scheduler import LRScheduler, ReduceLROnPlateau
 from torch.utils.data import Dataset, DataLoader, Subset, random_split
 
 import pytorch_warmup as warmup
@@ -68,8 +68,6 @@ from accelerate.tracking import WandBTracker
 # constants
 
 DEFAULT_SAMPLE_RATE = 16000
-
-ConstantLRScheduler = partial(LambdaLR, lr_lambda = lambda step: 1.)
 
 # make sure only one trainer is instantiated
 
@@ -188,7 +186,7 @@ class OptimizerWithWarmupSchedule(nn.Module):
         if exists(scheduler):
             self.scheduler = scheduler(optimizer, **scheduler_kwargs)
         else:
-            self.scheduler = ConstantLRScheduler(optimizer)
+            self.scheduler = None
 
         # The LR scheduler must capture the undampened base LR before warmup
         # modifies the optimizer's current LR.
@@ -198,19 +196,23 @@ class OptimizerWithWarmupSchedule(nn.Module):
         )
         self.optimizer = optimizer
 
-        self.optimizer, self.scheduler = accelerator.prepare(self.optimizer, self.scheduler)
+        if exists(self.scheduler):
+            self.optimizer, self.scheduler = accelerator.prepare(self.optimizer, self.scheduler)
+        else:
+            self.optimizer = accelerator.prepare(self.optimizer)
         self.accelerator = accelerator
 
     def state_dict(self):
         return dict(
             optimizer = self.optimizer.state_dict(),
-            scheduler = self.scheduler.state_dict(),
+            scheduler = self.scheduler.state_dict() if exists(self.scheduler) else None,
             warmup = self.warmup.state_dict()
         )
 
     def load_state_dict(self, pkg):
         self.optimizer.load_state_dict(pkg['optimizer'])
-        self.scheduler.load_state_dict(pkg['scheduler'])
+        if exists(self.scheduler) and exists(pkg.get('scheduler')):
+            self.scheduler.load_state_dict(pkg['scheduler'])
         self.warmup.load_state_dict(pkg['warmup'])
 
     def zero_grad(self):
@@ -221,7 +223,8 @@ class OptimizerWithWarmupSchedule(nn.Module):
 
         if not self.accelerator.optimizer_step_was_skipped:
             with self.warmup.dampening():
-                self.scheduler.step()
+                if exists(self.scheduler):
+                    self.scheduler.step()
 
 # main trainer class
 
@@ -250,6 +253,14 @@ class SoundStreamTrainer(nn.Module):
         warmup_steps: int = 1000,
         scheduler: Type[LRScheduler] | None = None,
         scheduler_kwargs: dict = dict(),
+        plateau_lr_enabled: bool = False,
+        plateau_lr_start_steps: int = 20_000,
+        plateau_lr_factor: float = 0.5,
+        plateau_lr_patience: int = 12,
+        plateau_lr_threshold: float = 0.05,
+        plateau_lr_cooldown: int = 2,
+        plateau_lr_min_lr: float = 2e-5,
+        plateau_lr_unclean_grace_checks: int = 8,
         discr_warmup_steps: int | None = None,
         discr_scheduler: Type[LRScheduler] | None = None,
         discr_scheduler_kwargs: dict = dict(),
@@ -386,6 +397,37 @@ class SoundStreamTrainer(nn.Module):
             scheduler = scheduler,
             scheduler_kwargs = scheduler_kwargs,
             warmup_steps = warmup_steps
+        )
+
+        assert plateau_lr_start_steps >= 0
+        assert 0. < plateau_lr_factor < 1.
+        assert plateau_lr_patience > 0
+        assert plateau_lr_threshold >= 0.
+        assert plateau_lr_cooldown >= 0
+        assert plateau_lr_min_lr >= 0.
+        assert plateau_lr_unclean_grace_checks >= 0
+        self.plateau_lr_enabled = plateau_lr_enabled
+        self.plateau_lr_start_steps = plateau_lr_start_steps
+        self.plateau_lr_factor = plateau_lr_factor
+        self.plateau_lr_patience = plateau_lr_patience
+        self.plateau_lr_threshold = plateau_lr_threshold
+        self.plateau_lr_cooldown = plateau_lr_cooldown
+        self.plateau_lr_min_lr = plateau_lr_min_lr
+        self.plateau_lr_unclean_grace_checks = plateau_lr_unclean_grace_checks
+        self.plateau_lr_unclean_checks = 0
+        self.plateau_scheduler = (
+            ReduceLROnPlateau(
+                self.optim.optimizer,
+                mode = 'max',
+                factor = plateau_lr_factor,
+                patience = plateau_lr_patience,
+                threshold = plateau_lr_threshold,
+                threshold_mode = 'abs',
+                cooldown = plateau_lr_cooldown,
+                min_lr = plateau_lr_min_lr
+            )
+            if plateau_lr_enabled
+            else None
         )
 
         discr_lr = default(discr_lr, lr)
@@ -703,6 +745,8 @@ class SoundStreamTrainer(nn.Module):
         pkg = dict(
             model = self.accelerator.get_state_dict(self.soundstream),
             optim = self.optim.state_dict(),
+            plateau_scheduler = self.plateau_scheduler.state_dict() if exists(self.plateau_scheduler) else None,
+            plateau_lr_unclean_checks = self.plateau_lr_unclean_checks,
             config = self.unwrapped_soundstream._configs,
             discr_optim = self.discr_optim.state_dict(),
             best_valid_score = self.best_valid_score,
@@ -1112,7 +1156,7 @@ class SoundStreamTrainer(nn.Module):
             target = F.pad(target, (0, padding))
             recon = F.pad(recon, (0, padding))
 
-        _, multi_spectral_recon_loss, stft_recon_loss = model.reconstruction_losses(target, recon)
+        _, multi_spectral_recon_loss, stft_recon_loss, _ = model.reconstruction_losses(target, recon)
 
         target_centered = target - target.mean(dim = -1, keepdim = True)
         recon_centered = recon - recon.mean(dim = -1, keepdim = True)
@@ -1910,6 +1954,9 @@ class SoundStreamTrainer(nn.Module):
             self.ema_soundstream.load_state_dict(pkg['ema_model'])
 
         self.optim.load_state_dict(pkg['optim'])
+        if exists(self.plateau_scheduler) and exists(pkg.get('plateau_scheduler')):
+            self.plateau_scheduler.load_state_dict(pkg['plateau_scheduler'])
+        self.plateau_lr_unclean_checks = pkg.get('plateau_lr_unclean_checks', 0)
         self.discr_optim.load_state_dict(pkg['discr_optim'])
         self.best_valid_score = pkg.get('best_valid_score', float('inf'))
         self.best_aligned_si_sdr = pkg.get('best_aligned_si_sdr', float('-inf'))
@@ -2173,6 +2220,7 @@ class SoundStreamTrainer(nn.Module):
                     feature_loss,
                     all_commitment_loss,
                     si_sdr_loss,
+                    correlation_loss,
                     click_loss,
                     jump_loss,
                     boundary_loss
@@ -2196,6 +2244,7 @@ class SoundStreamTrainer(nn.Module):
                 feature_loss = feature_loss.item() / self.grad_accum_every,
                 all_commitment_loss = all_commitment_loss.item() / self.grad_accum_every,
                 si_sdr_loss = si_sdr_loss.item() / self.grad_accum_every,
+                correlation_loss = correlation_loss.item() / self.grad_accum_every,
                 click_loss = click_loss.item() / self.grad_accum_every,
                 jump_loss = jump_loss.item() / self.grad_accum_every,
                 boundary_loss = boundary_loss.item() / self.grad_accum_every,
@@ -2218,9 +2267,13 @@ class SoundStreamTrainer(nn.Module):
         losses_str = (
             f"{steps}: "
             f"g_total={logs['loss']:.6f} | "
-            f"wave={logs['recon_loss']:.6f} | "
-            f"mel={logs['multi_spectral_recon_loss']:.6f} | "
-            f"stft={logs['stft_recon_loss']:.6f} | "
+            f"wave={logs['recon_loss']:.6f}(w={model.recon_loss_weight:.4g}) | "
+            f"mel={logs['multi_spectral_recon_loss']:.6f}"
+            f"(w={model.multi_spectral_recon_loss_weight:.4g}) | "
+            f"stft={logs['stft_recon_loss']:.6f}"
+            f"(w={model.stft_recon_loss_weight:.4g}) | "
+            f"corr_loss={logs['correlation_loss']:.6f}"
+            f"(w={model.correlation_loss_weight:.4g}) | "
             f"si_sdr_loss={logs['si_sdr_loss']:.6f}"
             f"(w={model.si_sdr_loss_weight:.4g},ramp={si_sdr_loss_progress:.4f}) | "
             f"click_loss={logs['click_loss']:.6f}"
@@ -2370,6 +2423,9 @@ class SoundStreamTrainer(nn.Module):
             exists(self.best_eval_every) and
             not (steps % self.best_eval_every)
         )
+        plateau_metric_tensor = None
+        if should_eval_best and exists(self.plateau_scheduler):
+            plateau_metric_tensor = torch.zeros(3, device = device)
 
         if self.is_main and should_eval_best:
             online_model = self.unwrapped_soundstream
@@ -2477,6 +2533,37 @@ class SoundStreamTrainer(nn.Module):
                     f"{self.format_codebook_diagnostics(ema_score)}"
                 )
 
+            if exists(self.plateau_scheduler):
+                plateau_metric = float(
+                    online_score.get('aligned_si_sdr', float('-inf'))
+                )
+                plateau_clean_ready = (
+                    online_score.get('clean_validation_eligible', 0.) >= 0.5
+                )
+                plateau_after_start = steps >= self.plateau_lr_start_steps
+                plateau_unclean_fallback = False
+                if plateau_after_start and isfinite(plateau_metric):
+                    if plateau_clean_ready:
+                        self.plateau_lr_unclean_checks = 0
+                    else:
+                        self.plateau_lr_unclean_checks += 1
+                        plateau_unclean_fallback = (
+                            self.plateau_lr_unclean_checks >=
+                            self.plateau_lr_unclean_grace_checks
+                        )
+                plateau_ready = (
+                    plateau_after_start and
+                    isfinite(plateau_metric) and
+                    (
+                        plateau_clean_ready or
+                        plateau_unclean_fallback
+                    )
+                )
+                if plateau_ready:
+                    plateau_metric_tensor[0] = plateau_metric
+                    plateau_metric_tensor[1] = 1.
+                    plateau_metric_tensor[2] = float(plateau_unclean_fallback)
+
             improved = (
                 exists(selected_model) and
                 selection_score < (
@@ -2560,6 +2647,71 @@ class SoundStreamTrainer(nn.Module):
                 self.print(
                     f"{steps}: early stopping is inactive until "
                     f"step {self.early_stopping_min_steps}"
+                )
+
+        if should_eval_best and exists(self.plateau_scheduler):
+            if (
+                self.is_distributed and
+                torch.distributed.is_available() and
+                torch.distributed.is_initialized()
+            ):
+                torch.distributed.broadcast(plateau_metric_tensor, src = 0)
+
+            plateau_metric = float(plateau_metric_tensor[0].item())
+            plateau_ready = plateau_metric_tensor[1].item() >= 0.5
+            plateau_unclean_fallback = plateau_metric_tensor[2].item() >= 0.5
+            if plateau_ready:
+                old_lrs = [
+                    group['lr']
+                    for group in self.optim.optimizer.param_groups
+                ]
+                self.plateau_scheduler.step(plateau_metric)
+                new_lrs = [
+                    group['lr']
+                    for group in self.optim.optimizer.param_groups
+                ]
+                if self.is_main:
+                    old_lr = old_lrs[0]
+                    new_lr = new_lrs[0]
+                    lr_changed = any(
+                        abs(old_lr_i - new_lr_i) > 1e-12
+                        for old_lr_i, new_lr_i in zip(old_lrs, new_lrs)
+                    )
+                    if lr_changed:
+                        self.print(
+                            f"{steps}: ReduceLROnPlateau lowered generator LR "
+                            f"from {old_lr:.3e} to {new_lr:.3e} "
+                            f"(online_aligned_si_sdr={plateau_metric:.3f}, "
+                            f"source={'unclean_fallback' if plateau_unclean_fallback else 'clean'})"
+                        )
+                    else:
+                        self.print(
+                            f"{steps}: ReduceLROnPlateau observed "
+                            f"online_aligned_si_sdr={plateau_metric:.3f}; "
+                            f"generator_lr={new_lr:.3e}; "
+                            f"source={'unclean_fallback' if plateau_unclean_fallback else 'clean'}"
+                        )
+            elif self.is_main:
+                inactive_reasons = []
+                if steps < self.plateau_lr_start_steps:
+                    inactive_reasons.append(
+                        f"before_start_step_{self.plateau_lr_start_steps}"
+                    )
+                if not isfinite(plateau_metric):
+                    inactive_reasons.append("invalid_online_aligned_si_sdr")
+                if (
+                    'online_score' in locals() and
+                    online_score.get('clean_validation_eligible', 0.) < 0.5
+                ):
+                    inactive_reasons.append(
+                        "online_clean_ok_0:"
+                        f"{self.plateau_lr_unclean_checks}/"
+                        f"{self.plateau_lr_unclean_grace_checks}"
+                    )
+                reason = ",".join(inactive_reasons) or "not_ready"
+                self.print(
+                    f"{steps}: ReduceLROnPlateau inactive "
+                    f"({reason})"
                 )
 
         self.accelerator.wait_for_everyone()

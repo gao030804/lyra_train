@@ -815,11 +815,7 @@ class SoundStream(Module):
         wave_loss = (
             wave_l1 +
             0.3 * wave_mse +
-            self.energy_loss_weight * energy_loss +
-            (
-                self.correlation_loss_weight /
-                max(float(self.recon_loss_weight), 1e-8)
-            ) * correlation_loss
+            self.energy_loss_weight * energy_loss
         )
 
         spectral_losses = []
@@ -919,7 +915,7 @@ class SoundStream(Module):
                 else self.zero
             )
 
-        return wave_loss, spectral_loss, stft_loss
+        return wave_loss, spectral_loss, stft_loss, correlation_loss
 
     def si_sdr_loss(self, target, recon):
         projection_scale = (
@@ -1292,7 +1288,12 @@ class SoundStream(Module):
 
         target = default(target, orig_x)  # target can also be passed in, in the case of denoising
 
-        recon_loss, multi_spectral_recon_loss, stft_recon_loss = self.reconstruction_losses(
+        (
+            recon_loss,
+            multi_spectral_recon_loss,
+            stft_recon_loss,
+            correlation_loss
+        ) = self.reconstruction_losses(
             target,
             recon_x
         )
@@ -1316,6 +1317,7 @@ class SoundStream(Module):
             multi_spectral_recon_loss * self.multi_spectral_recon_loss_weight +
             stft_recon_loss * self.stft_recon_loss_weight +
             si_sdr_loss * self.si_sdr_loss_weight +
+            correlation_loss * self.correlation_loss_weight +
             click_loss * self.click_loss_weight +
             jump_loss * self.jump_loss_weight +
             adversarial_loss * self.adversarial_loss_weight +
@@ -1332,6 +1334,7 @@ class SoundStream(Module):
                 feature_loss,
                 all_commitment_loss,
                 si_sdr_loss,
+                correlation_loss,
                 click_loss,
                 jump_loss,
                 self.zero
@@ -1670,7 +1673,12 @@ class FrameStreamingSoundStream(SoundStream):
 
         target = default(target, orig_x)
 
-        recon_loss, multi_spectral_recon_loss, stft_recon_loss = self.reconstruction_losses(
+        (
+            recon_loss,
+            multi_spectral_recon_loss,
+            stft_recon_loss,
+            correlation_loss
+        ) = self.reconstruction_losses(
             target,
             recon_x
         )
@@ -1692,6 +1700,7 @@ class FrameStreamingSoundStream(SoundStream):
             multi_spectral_recon_loss * self.multi_spectral_recon_loss_weight +
             stft_recon_loss * self.stft_recon_loss_weight +
             si_sdr_loss * self.si_sdr_loss_weight +
+            correlation_loss * self.correlation_loss_weight +
             click_loss * self.click_loss_weight +
             jump_loss * self.jump_loss_weight +
             adversarial_loss * self.adversarial_loss_weight +
@@ -1709,6 +1718,7 @@ class FrameStreamingSoundStream(SoundStream):
                 feature_loss,
                 all_commitment_loss,
                 si_sdr_loss,
+                correlation_loss,
                 click_loss,
                 jump_loss,
                 boundary_loss

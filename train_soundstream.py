@@ -57,7 +57,7 @@ STAGE_DEFAULTS = {
         lr=2e-4, discr_lr=None, ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
         use_ema=False,
-        click_loss_weight=0.02, jump_loss_weight=0.003,
+        click_loss_weight=0.03, jump_loss_weight=0.005,
         transient_loss_warmup_steps=15_000,
         stft_recon_loss_weight=1.0,
         gan_start=0, gan_ramp=0,
@@ -96,10 +96,12 @@ STAGE_DEFAULTS = {
 
 
 def stage1_lr_lambda(step: int) -> float:
-    """Piecewise LR multiplier for recon_pretrain after linear warmup.
+    """Fallback piecewise LR multiplier for recon_pretrain after linear warmup.
 
-    The trainer applies warmup separately. With the recon_pretrain base LR of
-    2e-4 and warmup_steps=1000, this gives:
+    ReduceLROnPlateau is the default for stage 1. This fallback is used only
+    when --no-stage1-plateau-lr is passed. The trainer applies warmup
+    separately. With the recon_pretrain base LR of 2e-4 and warmup_steps=1000,
+    this gives:
       0 - 1000: linear warmup to 2e-4
       1000 - 20000: 2e-4
       20000 - 35000: 1e-4
@@ -247,7 +249,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--si-sdr-loss-weight",
         type=float,
-        default=0.03,
+        default=0.05,
         help=(
             "Maximum SI-SDR loss weight for recon_pretrain. "
             "Use 0 for the pure Saturday baseline; other stages keep it disabled."
@@ -262,8 +264,68 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--si-sdr-loss-warmup-steps",
         type=int,
-        default=10_000,
+        default=15_000,
         help="After --si-sdr-loss-start-steps, linearly ramp SI-SDR loss over this many recon_pretrain steps.",
+    )
+    parser.add_argument(
+        "--stage1-plateau-lr",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "For recon_pretrain, keep the step scheduler constant after warmup "
+            "and let ReduceLROnPlateau lower LR from validation "
+            "online_aligned_si_sdr."
+        ),
+    )
+    parser.add_argument(
+        "--plateau-start-steps",
+        type=int,
+        default=20_000,
+        help=(
+            "Do not apply stage-1 ReduceLROnPlateau before this completed step. "
+            "The early 10k-15k reconstruction-entry region is intentionally ignored."
+        ),
+    )
+    parser.add_argument(
+        "--plateau-factor",
+        type=float,
+        default=0.5,
+        help="LR multiplier used by stage-1 ReduceLROnPlateau.",
+    )
+    parser.add_argument(
+        "--plateau-patience",
+        type=int,
+        default=12,
+        help="Validation checks without sufficient online_aligned_si_sdr improvement before lowering LR.",
+    )
+    parser.add_argument(
+        "--plateau-threshold",
+        type=float,
+        default=0.05,
+        help="Minimum absolute online_aligned_si_sdr improvement counted by ReduceLROnPlateau.",
+    )
+    parser.add_argument(
+        "--plateau-cooldown",
+        type=int,
+        default=2,
+        help="Validation checks to wait after a plateau LR drop.",
+    )
+    parser.add_argument(
+        "--plateau-min-lr",
+        type=float,
+        default=2e-5,
+        help="Lower bound for stage-1 ReduceLROnPlateau generator LR.",
+    )
+    parser.add_argument(
+        "--plateau-unclean-grace-checks",
+        type=int,
+        default=8,
+        help=(
+            "After plateau start, allow ReduceLROnPlateau to observe "
+            "online_aligned_si_sdr if validation remains clean_ok=0 for this "
+            "many consecutive validation checks. This does not relax best "
+            "checkpoint clean-gate eligibility."
+        ),
     )
     parser.add_argument(
         "--click-loss-weight",
@@ -498,11 +560,13 @@ def build_model(
         sync_codebook = int(os.environ.get("WORLD_SIZE", "1")) > 1
 
     if stage == "recon_pretrain":
-        recon_loss_weight = 1.
+        recon_loss_weight = 10.
         multi_spectral_recon_loss_weight = 10.
+        correlation_loss_weight = 0.02
     else:
         recon_loss_weight = 10. if stage == "overfit" else 1.
         multi_spectral_recon_loss_weight = 0.7
+        correlation_loss_weight = 0.
 
     model_kwargs = dict(
         channels=16,
@@ -520,7 +584,7 @@ def build_model(
         multi_spectral_recon_loss_weight=multi_spectral_recon_loss_weight,
         stft_recon_loss_weight=stft_recon_loss_weight,
         si_sdr_loss_weight=si_sdr_loss_weight,
-        correlation_loss_weight=0.,
+        correlation_loss_weight=correlation_loss_weight,
         energy_loss_weight=0.1,
         click_loss_weight=click_loss_weight,
         jump_loss_weight=jump_loss_weight,
@@ -569,6 +633,20 @@ def main() -> None:
         raise ValueError("--si-sdr-loss-start-steps cannot be negative.")
     if args.si_sdr_loss_warmup_steps < 0:
         raise ValueError("--si-sdr-loss-warmup-steps cannot be negative.")
+    if args.plateau_start_steps < 0:
+        raise ValueError("--plateau-start-steps cannot be negative.")
+    if not 0. < args.plateau_factor < 1.:
+        raise ValueError("--plateau-factor must be between 0 and 1.")
+    if args.plateau_patience <= 0:
+        raise ValueError("--plateau-patience must be greater than zero.")
+    if args.plateau_threshold < 0:
+        raise ValueError("--plateau-threshold cannot be negative.")
+    if args.plateau_cooldown < 0:
+        raise ValueError("--plateau-cooldown cannot be negative.")
+    if args.plateau_min_lr < 0:
+        raise ValueError("--plateau-min-lr cannot be negative.")
+    if args.plateau_unclean_grace_checks < 0:
+        raise ValueError("--plateau-unclean-grace-checks cannot be negative.")
     if args.click_loss_weight is not None and args.click_loss_weight < 0:
         raise ValueError("--click-loss-weight cannot be negative.")
     if args.jump_loss_weight is not None and args.jump_loss_weight < 0:
@@ -679,6 +757,20 @@ def main() -> None:
         else stage_defaults["transient_loss_warmup_steps"]
     )
     stft_recon_loss_weight = stage_defaults["stft_recon_loss_weight"]
+    waveform_recon_loss_weight = (
+        10.0
+        if args.stage in ("overfit", "recon_pretrain")
+        else 1.0
+    )
+    correlation_loss_weight = (
+        0.02
+        if args.stage == "recon_pretrain"
+        else 0.0
+    )
+    stage1_plateau_lr_enabled = (
+        args.stage == "recon_pretrain" and
+        args.stage1_plateau_lr
+    )
 
     bitrate = calculate_bitrate(
         sample_rate=sample_rate,
@@ -697,13 +789,28 @@ def main() -> None:
     print(f"Maximum training steps: {num_train_steps}")
     print(f"Generator learning rate: {stage_defaults['lr']}")
     if args.stage == "recon_pretrain":
-        print(
-            "Stage-1 LR schedule: "
-            "linear warmup for steps [0, 1000), "
-            "2.000e-04 for [1000, 20000), "
-            "1.000e-04 for [20000, 35000), "
-            "5.000e-05 from step 35000"
-        )
+        if stage1_plateau_lr_enabled:
+            print(
+                "Stage-1 LR schedule: "
+                "linear warmup for steps [0, 1000), "
+                "then ReduceLROnPlateau on validation "
+                "online_aligned_si_sdr "
+                f"from step {args.plateau_start_steps} "
+                f"(factor={args.plateau_factor}, "
+                f"patience={args.plateau_patience}, "
+                f"threshold={args.plateau_threshold}, "
+                f"cooldown={args.plateau_cooldown}, "
+                f"min_lr={args.plateau_min_lr}, "
+                f"unclean_grace_checks={args.plateau_unclean_grace_checks})"
+            )
+        else:
+            print(
+                "Stage-1 LR schedule: "
+                "linear warmup for steps [0, 1000), "
+                "2.000e-04 for [1000, 20000), "
+                "1.000e-04 for [20000, 35000), "
+                "5.000e-05 from step 35000"
+            )
     print(f"Random seed: {args.seed}")
     print(
         "SI-SDR loss: "
@@ -731,7 +838,11 @@ def main() -> None:
     )
     print(
         "Signed correlation loss weight: "
-        "0.0"
+        f"{correlation_loss_weight}"
+    )
+    print(
+        "Waveform reconstruction loss weight: "
+        f"{waveform_recon_loss_weight}"
     )
     print(
         "STFT reconstruction loss weight: "
@@ -824,7 +935,7 @@ def main() -> None:
     )
     scheduler = None
     scheduler_kwargs = {}
-    if args.stage == "recon_pretrain":
+    if args.stage == "recon_pretrain" and not stage1_plateau_lr_enabled:
         scheduler = LambdaLR
         scheduler_kwargs = dict(lr_lambda=stage1_lr_lambda)
 
@@ -844,6 +955,14 @@ def main() -> None:
         warmup_steps=warmup_steps,
         scheduler=scheduler,
         scheduler_kwargs=scheduler_kwargs,
+        plateau_lr_enabled=stage1_plateau_lr_enabled,
+        plateau_lr_start_steps=args.plateau_start_steps,
+        plateau_lr_factor=args.plateau_factor,
+        plateau_lr_patience=args.plateau_patience,
+        plateau_lr_threshold=args.plateau_threshold,
+        plateau_lr_cooldown=args.plateau_cooldown,
+        plateau_lr_min_lr=args.plateau_min_lr,
+        plateau_lr_unclean_grace_checks=args.plateau_unclean_grace_checks,
         save_results_every=args.save_results_every,
         save_model_every=save_model_every,
         best_eval_every=best_eval_every,
