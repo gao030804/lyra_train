@@ -405,6 +405,52 @@ class CausalConvTranspose1d(Module):
 
         return out, next_state
 
+class CausalLinearUpsampleConv1d(Module):
+    def __init__(self, chan_in, chan_out, kernel_size, stride, pad_mode = 'reflect', **kwargs):
+        super().__init__()
+        self.upsample_factor = stride
+        self.conv = CausalConv1d(chan_in, chan_out, kernel_size, pad_mode = pad_mode, **kwargs)
+
+    def _upsample(self, x, prev = None):
+        factor = self.upsample_factor
+
+        if factor == 1:
+            return x
+
+        if not exists(prev):
+            prev = x[..., :1]
+
+        start = torch.cat((prev, x[..., :-1]), dim = -1)
+        end = x
+        weights = torch.linspace(
+            1. / factor,
+            1.,
+            steps = factor,
+            device = x.device,
+            dtype = x.dtype
+        )
+        weights = rearrange(weights, 's -> 1 1 1 s')
+
+        out = start[..., None] * (1. - weights) + end[..., None] * weights
+        return rearrange(out, 'b c n s -> b c (n s)')
+
+    def forward(self, x):
+        x = self._upsample(x)
+        return self.conv(x)
+
+    def forward_stream(self, x, state = None):
+        prev = None
+        conv_state = None
+
+        if exists(state):
+            prev, conv_state = state
+
+        upsampled = self._upsample(x, prev = prev)
+        out, next_conv_state = self.conv.forward_stream(upsampled, conv_state)
+        next_prev = x[..., -1:]
+
+        return out, (next_prev, next_conv_state)
+
 def ResidualUnit(chan_in, chan_out, dilation, kernel_size = 7, squeeze_excite = False, pad_mode = 'reflect'):
     return Residual(Sequential(
         CausalConv1d(chan_in, chan_out, kernel_size, dilation = dilation, pad_mode = pad_mode),
@@ -425,23 +471,38 @@ def EncoderBlock(chan_in, chan_out, stride, cycle_dilations = (1, 3, 9), squeeze
         CausalConv1d(chan_in, chan_out, 2 * stride, stride = stride, pad_mode = pad_mode)
     )
 
-def DecoderBlock(chan_in, chan_out, stride, cycle_dilations = (1, 3, 9), squeeze_excite = False, pad_mode = 'reflect'):
+def DecoderBlock(
+    chan_in,
+    chan_out,
+    stride,
+    cycle_dilations = (1, 3, 9),
+    squeeze_excite = False,
+    pad_mode = 'reflect',
+    upsample_mode = 'convtranspose'
+):
     even_stride = (stride % 2 == 0)
     padding = (stride + (0 if even_stride else 1)) // 2
     output_padding = 0 if even_stride else 1
 
     residual_unit = partial(ResidualUnit, squeeze_excite = squeeze_excite, pad_mode = pad_mode)
 
+    if upsample_mode == 'convtranspose':
+        upsample = CausalConvTranspose1d(chan_in, chan_out, 2 * stride, stride = stride)
+    elif upsample_mode == 'linear':
+        upsample = CausalLinearUpsampleConv1d(chan_in, chan_out, 2 * stride, stride = stride, pad_mode = pad_mode)
+    else:
+        raise ValueError(f'unknown decoder upsample mode: {upsample_mode}')
+
     it = cycle(cycle_dilations)
     return nn.Sequential(
-        CausalConvTranspose1d(chan_in, chan_out, 2 * stride, stride = stride),
+        upsample,
         residual_unit(chan_out, chan_out, next(it)),
         residual_unit(chan_out, chan_out, next(it)),
         residual_unit(chan_out, chan_out, next(it)),
     )
 
 def stream_module(module, x, state = None):
-    if isinstance(module, (CausalConv1d, CausalConvTranspose1d)):
+    if isinstance(module, (CausalConv1d, CausalConvTranspose1d, CausalLinearUpsampleConv1d)):
         return module.forward_stream(x, state)
 
     if isinstance(module, Residual):
@@ -542,6 +603,7 @@ class SoundStream(Module):
         stft_normalized = False,
         enc_cycle_dilations = (1, 3, 9),
         dec_cycle_dilations = (1, 3, 9),
+        decoder_upsample_mode = 'convtranspose',
         multi_spectral_window_powers_of_two = tuple(range(6, 12)),
         multi_spectral_n_ffts = 512,
         multi_spectral_n_mels = 64,
@@ -587,6 +649,9 @@ class SoundStream(Module):
 
         self.single_channel = input_channels == 1
         self.strides = strides
+        if decoder_upsample_mode not in ('convtranspose', 'linear'):
+            raise ValueError(f'unknown decoder upsample mode: {decoder_upsample_mode}')
+        self.decoder_upsample_mode = decoder_upsample_mode
 
         layer_channels = tuple(map(lambda t: t * channels, channel_mults))
         layer_channels = (channels, *layer_channels)
@@ -691,7 +756,15 @@ class SoundStream(Module):
         decoder_blocks = []
 
         for ((chan_in, chan_out), layer_stride) in zip(reversed(chan_in_out_pairs), reversed(strides)):
-            decoder_blocks.append(DecoderBlock(chan_out, chan_in, layer_stride, dec_cycle_dilations, squeeze_excite, pad_mode))
+            decoder_blocks.append(DecoderBlock(
+                chan_out,
+                chan_in,
+                layer_stride,
+                dec_cycle_dilations,
+                squeeze_excite,
+                pad_mode,
+                upsample_mode = decoder_upsample_mode
+            ))
 
             if use_gate_loop_layers:
                 decoder_blocks.append(Residual(ChannelTranspose(GateLoop(chan_in))))

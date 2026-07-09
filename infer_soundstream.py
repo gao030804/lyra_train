@@ -406,6 +406,10 @@ def main() -> None:
     )
     print(f"Checkpoint: {checkpoint}")
     print(f"Weights: {weight_name}")
+    print(
+        "Decoder upsample mode: "
+        f"{getattr(model, 'decoder_upsample_mode', 'unknown')}"
+    )
     print(f"Input: {args.input_audio}")
     print(f"Output: {args.output}")
     print(f"Sample rate: {sample_rate} Hz")

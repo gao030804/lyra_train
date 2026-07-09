@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import pickle
 import random
 import re
 import shutil
@@ -59,7 +60,7 @@ STAGE_DEFAULTS = {
         use_ema=False,
         click_loss_weight=0.03, jump_loss_weight=0.005,
         transient_loss_warmup_steps=15_000,
-        stft_recon_loss_weight=1.0,
+        stft_recon_loss_weight=0.9,
         gan_start=0, gan_ramp=0,
     ),
     "gan_pretrain": dict(
@@ -424,6 +425,15 @@ def parse_args() -> argparse.Namespace:
         help="Deprecated compatibility option; streaming now uses per-layer activation state.",
     )
     parser.add_argument(
+        "--decoder-upsample-mode",
+        choices=("convtranspose", "linear"),
+        default="linear",
+        help=(
+            "Decoder upsampling block. 'linear' uses causal linear upsample + "
+            "CausalConv1d and is stored in the checkpoint config."
+        ),
+    )
+    parser.add_argument(
         "--boundary-loss-weight",
         type=float,
         default=0.1,
@@ -535,6 +545,20 @@ def load_model_weights_only(
     checkpoint: Path,
 ) -> None:
     pkg = torch.load(str(checkpoint), map_location="cpu")
+    if "config" in pkg:
+        checkpoint_config = pickle.loads(pkg["config"])
+        checkpoint_upsample = checkpoint_config.get(
+            "decoder_upsample_mode",
+            "convtranspose",
+        )
+        model_upsample = getattr(model, "decoder_upsample_mode", None)
+        if model_upsample is not None and checkpoint_upsample != model_upsample:
+            raise ValueError(
+                "Checkpoint decoder upsample mode mismatch: "
+                f"checkpoint={checkpoint_upsample}, current_model={model_upsample}. "
+                "Use a checkpoint trained with the same decoder structure, or "
+                "rerun with --decoder-upsample-mode matching the checkpoint."
+            )
     state_dict = pkg["model"] if "model" in pkg else pkg
     model.load_state_dict(state_dict, strict=True)
 
@@ -554,6 +578,7 @@ def build_model(
     click_loss_weight: float,
     jump_loss_weight: float,
     stft_recon_loss_weight: float,
+    decoder_upsample_mode: str,
     sync_codebook: bool | None = None,
 ) -> SoundStream:
     if sync_codebook is None:
@@ -561,7 +586,7 @@ def build_model(
 
     if stage == "recon_pretrain":
         recon_loss_weight = 10.
-        multi_spectral_recon_loss_weight = 5.
+        multi_spectral_recon_loss_weight = 2.
         correlation_loss_weight = 0.02
     else:
         recon_loss_weight = 10. if stage == "overfit" else 1.
@@ -600,12 +625,13 @@ def build_model(
             else 0.
         ),
         rq_quantize_dropout=False,
-        rq_threshold_ema_dead_code=2,
+        rq_threshold_ema_dead_code=5,
         rq_kwargs=dict(sync_codebook=sync_codebook),
         attn_window_size=64,
         attn_dim_head=32,
         attn_heads=4,
         attn_depth=1,
+        decoder_upsample_mode=decoder_upsample_mode,
         pad_mode="constant",
     )
 
@@ -763,7 +789,7 @@ def main() -> None:
         else 1.0
     )
     multi_spectral_recon_loss_weight = (
-        5.0
+        2.0
         if args.stage == "recon_pretrain"
         else 0.7
     )
@@ -857,6 +883,7 @@ def main() -> None:
         "STFT reconstruction loss weight: "
         f"{stft_recon_loss_weight}"
     )
+    print(f"Decoder upsample mode: {args.decoder_upsample_mode}")
     print(f"Discriminator learning rate: {stage_defaults['discr_lr']}")
     use_ema = stage_defaults.get("use_ema", True)
     print(f"EMA enabled: {use_ema}")
@@ -899,7 +926,7 @@ def main() -> None:
     print(f"Codebook size: {codebook_size}")
     print(f"RVQ quantizers: {num_quantizers}")
     print("RVQ quantize dropout: False")
-    print("RVQ dead-code threshold: 2")
+    print("RVQ dead-code threshold: 5")
     print(f"RVQ codebook synchronization: {world_size > 1}")
     print(
         "RVQ codebook training: "
@@ -935,6 +962,7 @@ def main() -> None:
         click_loss_weight=click_loss_weight,
         jump_loss_weight=jump_loss_weight,
         stft_recon_loss_weight=stft_recon_loss_weight,
+        decoder_upsample_mode=args.decoder_upsample_mode,
         sync_codebook=(world_size > 1),
     )
 
