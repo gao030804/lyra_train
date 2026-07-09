@@ -59,7 +59,7 @@ STAGE_DEFAULTS = {
         use_ema=False,
         click_loss_weight=0.03, jump_loss_weight=0.005,
         transient_loss_warmup_steps=15_000,
-        stft_recon_loss_weight=0.5,
+        stft_recon_loss_weight=1.0,
         gan_start=0, gan_ramp=0,
     ),
     "gan_pretrain": dict(
@@ -561,8 +561,8 @@ def build_model(
 
     if stage == "recon_pretrain":
         recon_loss_weight = 10.
-        multi_spectral_recon_loss_weight = 10.
-        correlation_loss_weight = 0.04
+        multi_spectral_recon_loss_weight = 5.
+        correlation_loss_weight = 0.02
     else:
         recon_loss_weight = 10. if stage == "overfit" else 1.
         multi_spectral_recon_loss_weight = 0.7
@@ -762,8 +762,13 @@ def main() -> None:
         if args.stage in ("overfit", "recon_pretrain")
         else 1.0
     )
+    multi_spectral_recon_loss_weight = (
+        5.0
+        if args.stage == "recon_pretrain"
+        else 0.7
+    )
     correlation_loss_weight = (
-        0.04
+        0.02
         if args.stage == "recon_pretrain"
         else 0.0
     )
@@ -843,6 +848,10 @@ def main() -> None:
     print(
         "Waveform reconstruction loss weight: "
         f"{waveform_recon_loss_weight}"
+    )
+    print(
+        "Mel reconstruction loss weight: "
+        f"{multi_spectral_recon_loss_weight}"
     )
     print(
         "STFT reconstruction loss weight: "

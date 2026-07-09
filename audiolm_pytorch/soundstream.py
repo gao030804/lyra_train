@@ -729,16 +729,16 @@ class SoundStream(Module):
         multi_spectral_n_ffts = cast_tuple(multi_spectral_n_ffts, num_transforms)
         multi_spectral_n_mels = cast_tuple(multi_spectral_n_mels, num_transforms)
         mel_weight_by_win_length = {
-            64: 0.25,
-            128: 0.50,
+            64: 0.50,
+            128: 0.75,
             256: 1.00,
             512: 1.00,
             1024: 1.00,
             2048: 0.75
         }
         stft_weight_by_win_length = {
-            64: 0.25,
-            128: 0.50,
+            64: 0.40,
+            128: 0.70,
             256: 1.00,
             512: 1.00,
             1024: 1.00,
