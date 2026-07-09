@@ -215,6 +215,24 @@ class OptimizerWithWarmupSchedule(nn.Module):
             self.scheduler.load_state_dict(pkg['scheduler'])
         self.warmup.load_state_dict(pkg['warmup'])
 
+    def bind_schedulers_to_current_optimizer(self):
+        # `accelerator.prepare()` may replace the optimizer object held by this
+        # wrapper. Keep warmup / scheduler references pointed at the optimizer
+        # that is actually stepped and logged during training.
+        self.warmup.optimizer = self.optimizer
+        if exists(self.scheduler) and hasattr(self.scheduler, 'optimizer'):
+            self.scheduler.optimizer = self.optimizer
+
+    def sync_warmup_lrs_from_optimizer(self):
+        # pytorch_warmup restores `warmup.lrs` at the start of every dampening
+        # context.  External schedulers such as ReduceLROnPlateau step outside
+        # that context, so copy the current optimizer LR back into warmup state
+        # after any external LR change.
+        self.warmup.lrs = [
+            group['lr']
+            for group in self.optimizer.param_groups
+        ]
+
     def zero_grad(self):
         self.optimizer.zero_grad()
 
@@ -415,20 +433,10 @@ class SoundStreamTrainer(nn.Module):
         self.plateau_lr_min_lr = plateau_lr_min_lr
         self.plateau_lr_unclean_grace_checks = plateau_lr_unclean_grace_checks
         self.plateau_lr_unclean_checks = 0
-        self.plateau_scheduler = (
-            ReduceLROnPlateau(
-                self.optim.optimizer,
-                mode = 'max',
-                factor = plateau_lr_factor,
-                patience = plateau_lr_patience,
-                threshold = plateau_lr_threshold,
-                threshold_mode = 'abs',
-                cooldown = plateau_lr_cooldown,
-                min_lr = plateau_lr_min_lr
-            )
-            if plateau_lr_enabled
-            else None
-        )
+        # Build this after the trainer modules are passed through
+        # accelerator.prepare().  Otherwise the scheduler can hold a reference
+        # to the pre-prepare optimizer while training uses the prepared one.
+        self.plateau_scheduler = None
 
         discr_lr = default(discr_lr, lr)
         discr_warmup_steps = default(discr_warmup_steps, warmup_steps)
@@ -642,6 +650,10 @@ class SoundStreamTrainer(nn.Module):
             self.dl
         )
 
+        self.optim.bind_schedulers_to_current_optimizer()
+        self.discr_optim.bind_schedulers_to_current_optimizer()
+        self.plateau_scheduler = self.create_plateau_scheduler()
+
         # Build EMA after Accelerator has placed and wrapped the online model.
         # Creating it before prepare leaves EMA's source model on CPU under DDP,
         # which fails on the first moving-average update against the CUDA copy.
@@ -670,6 +682,7 @@ class SoundStreamTrainer(nn.Module):
         for name, _ in self.multiscale_discriminator_iter():
             optimizer = getattr(self, name)
             optimizer = self.accelerator.prepare(optimizer)
+            optimizer.bind_schedulers_to_current_optimizer()
             setattr(self, name, optimizer)
 
         # dataloader iterators
@@ -1926,6 +1939,34 @@ class SoundStreamTrainer(nn.Module):
     def unwrapped_soundstream(self):
         return self.accelerator.unwrap_model(self.soundstream)
 
+    def create_plateau_scheduler(self):
+        if not self.plateau_lr_enabled:
+            return None
+
+        return ReduceLROnPlateau(
+            self.optim.optimizer,
+            mode = 'max',
+            factor = self.plateau_lr_factor,
+            patience = self.plateau_lr_patience,
+            threshold = self.plateau_lr_threshold,
+            threshold_mode = 'abs',
+            cooldown = self.plateau_lr_cooldown,
+            min_lr = self.plateau_lr_min_lr
+        )
+
+    def sync_optimizer_lrs_from_plateau_scheduler(self):
+        if not exists(self.plateau_scheduler):
+            return
+
+        last_lrs = getattr(self.plateau_scheduler, '_last_lr', None)
+        if not last_lrs:
+            return
+
+        for group, lr in zip(self.optim.optimizer.param_groups, last_lrs):
+            group['lr'] = float(lr)
+
+        self.optim.sync_warmup_lrs_from_optimizer()
+
     def load(self, path):
         path = Path(path)
         assert path.exists()
@@ -1956,6 +1997,7 @@ class SoundStreamTrainer(nn.Module):
         self.optim.load_state_dict(pkg['optim'])
         if exists(self.plateau_scheduler) and exists(pkg.get('plateau_scheduler')):
             self.plateau_scheduler.load_state_dict(pkg['plateau_scheduler'])
+            self.sync_optimizer_lrs_from_plateau_scheduler()
         self.plateau_lr_unclean_checks = pkg.get('plateau_lr_unclean_checks', 0)
         self.discr_optim.load_state_dict(pkg['discr_optim'])
         self.best_valid_score = pkg.get('best_valid_score', float('inf'))
@@ -2666,6 +2708,7 @@ class SoundStreamTrainer(nn.Module):
                     for group in self.optim.optimizer.param_groups
                 ]
                 self.plateau_scheduler.step(plateau_metric)
+                self.optim.sync_warmup_lrs_from_optimizer()
                 new_lrs = [
                     group['lr']
                     for group in self.optim.optimizer.param_groups

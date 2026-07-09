@@ -59,7 +59,7 @@ STAGE_DEFAULTS = {
         use_ema=False,
         click_loss_weight=0.03, jump_loss_weight=0.005,
         transient_loss_warmup_steps=15_000,
-        stft_recon_loss_weight=1.0,
+        stft_recon_loss_weight=0.5,
         gan_start=0, gan_ramp=0,
     ),
     "gan_pretrain": dict(
@@ -280,7 +280,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--plateau-start-steps",
         type=int,
-        default=20_000,
+        default=60_000,
         help=(
             "Do not apply stage-1 ReduceLROnPlateau before this completed step. "
             "The early 10k-15k reconstruction-entry region is intentionally ignored."
@@ -295,13 +295,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--plateau-patience",
         type=int,
-        default=12,
+        default=16,
         help="Validation checks without sufficient online_aligned_si_sdr improvement before lowering LR.",
     )
     parser.add_argument(
         "--plateau-threshold",
         type=float,
-        default=0.05,
+        default=0.03,
         help="Minimum absolute online_aligned_si_sdr improvement counted by ReduceLROnPlateau.",
     )
     parser.add_argument(
@@ -562,7 +562,7 @@ def build_model(
     if stage == "recon_pretrain":
         recon_loss_weight = 10.
         multi_spectral_recon_loss_weight = 10.
-        correlation_loss_weight = 0.02
+        correlation_loss_weight = 0.04
     else:
         recon_loss_weight = 10. if stage == "overfit" else 1.
         multi_spectral_recon_loss_weight = 0.7
@@ -763,7 +763,7 @@ def main() -> None:
         else 1.0
     )
     correlation_loss_weight = (
-        0.02
+        0.04
         if args.stage == "recon_pretrain"
         else 0.0
     )
