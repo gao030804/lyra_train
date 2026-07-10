@@ -49,6 +49,7 @@ STAGE_DEFAULTS = {
         ema_update_after_step=0, ema_update_every=1,
         click_loss_weight=0., jump_loss_weight=0.,
         transient_loss_warmup_steps=0,
+        spectral_envelope_loss_weight=0.,
         stft_recon_loss_weight=0.,
         gan_start=0, gan_ramp=0,
     ),
@@ -57,21 +58,30 @@ STAGE_DEFAULTS = {
         save_every=2_000, eval_every=250, min_steps=10_000, patience=40,
         lr=2e-4, discr_lr=None, ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
-        use_ema=False,
-        click_loss_weight=0.03, jump_loss_weight=0.005,
+        use_ema=True,
+        click_loss_weight=0., jump_loss_weight=0.,
+        preemph_loss_weight=0., noise_floor_loss_weight=0.05,
         transient_loss_warmup_steps=15_000,
-        stft_recon_loss_weight=0.9,
+        spectral_envelope_loss_weight=0.05,
+        spectral_envelope_loss_start_steps=5_000,
+        spectral_envelope_loss_warmup_steps=10_000,
+        stft_recon_loss_weight=0.,
         gan_start=0, gan_ramp=0,
     ),
     "gan_pretrain": dict(
-        steps=30_000, batch_size=5, segment_seconds=3.,
-        save_every=2_000, eval_every=250, min_steps=5_000, patience=30,
+        steps=100_000, batch_size=4, segment_seconds=4.,
+        save_every=5_000, eval_every=500, min_steps=30_000, patience=30,
         lr=5e-5, discr_lr=5e-5, ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
         click_loss_weight=0., jump_loss_weight=0.,
+        preemph_loss_weight=0., noise_floor_loss_weight=0.02,
         transient_loss_warmup_steps=0,
+        spectral_envelope_loss_weight=0.01,
+        spectral_envelope_loss_start_steps=0,
+        spectral_envelope_loss_warmup_steps=5_000,
         stft_recon_loss_weight=0.,
         gan_start=5_000, gan_ramp=15_000,
+        freeze_codebook_after_step=30_000,
     ),
     "stream_finetune": dict(
         steps=20_000, batch_size=4, segment_seconds=2.,
@@ -79,7 +89,9 @@ STAGE_DEFAULTS = {
         lr=3e-5, discr_lr=5e-5, ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
         click_loss_weight=0., jump_loss_weight=0.,
+        preemph_loss_weight=0., noise_floor_loss_weight=0.,
         transient_loss_warmup_steps=0,
+        spectral_envelope_loss_weight=0.,
         stft_recon_loss_weight=0.,
         gan_start=5_000, gan_ramp=10_000,
     ),
@@ -89,7 +101,9 @@ STAGE_DEFAULTS = {
         lr=1e-5, discr_lr=2e-5, ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
         click_loss_weight=0., jump_loss_weight=0.,
+        preemph_loss_weight=0., noise_floor_loss_weight=0.,
         transient_loss_warmup_steps=0,
+        spectral_envelope_loss_weight=0.,
         stft_recon_loss_weight=0.,
         gan_start=1_000, gan_ramp=2_000,
     ),
@@ -269,6 +283,31 @@ def parse_args() -> argparse.Namespace:
         help="After --si-sdr-loss-start-steps, linearly ramp SI-SDR loss over this many recon_pretrain steps.",
     )
     parser.add_argument(
+        "--spectral-envelope-loss-weight",
+        type=float,
+        default=None,
+        help=(
+            "Maximum voiced spectral-envelope loss weight. Defaults to 0.05 "
+            "for recon_pretrain, 0.01 for gan_pretrain, and zero otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--spectral-envelope-loss-start-steps",
+        type=int,
+        default=None,
+        help="Initial disabled steps; defaults depend on --stage.",
+    )
+    parser.add_argument(
+        "--spectral-envelope-loss-warmup-steps",
+        type=int,
+        default=None,
+        help=(
+            "After its start step, linearly ramp the voiced spectral-envelope "
+            "loss to its maximum weight; defaults depend on --stage."
+        ),
+    )
+
+    parser.add_argument(
         "--stage1-plateau-lr",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -344,6 +383,25 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Auxiliary soft excess-jump loss weight for reducing isolated spikes. "
             "Defaults are stage-specific and intentionally small."
+        ),
+    )
+    parser.add_argument(
+        "--preemph-loss-weight",
+        type=float,
+        default=None,
+        help=(
+            "Pre-emphasis waveform loss weight. Defaults to zero; use an "
+            "explicit positive value only for a targeted experiment."
+        ),
+    )
+    parser.add_argument(
+        "--noise-floor-loss-weight",
+        type=float,
+        default=None,
+        help=(
+            "Low-energy-frame excess high-frequency noise loss weight. "
+            "Defaults to 0.05 for recon_pretrain, 0.02 for gan_pretrain, "
+            "and zero for later stages."
         ),
     )
     parser.add_argument(
@@ -561,6 +619,26 @@ def latest_checkpoint(results_dir: Path) -> Path | None:
     )
 
 
+def stage2_lr_lambda(step: int) -> float:
+    """Piecewise stage-2 multiplier for both generator and discriminator.
+
+    Stage 2 keeps the conservative 5e-5 base LR while GAN losses ramp in,
+    then reduces it for refinement over the longer 100k-step run.
+    """
+    if step < 50_000:
+        return 1.0
+    if step < 75_000:
+        return 0.5
+
+    return 0.2
+
+
+def stage2_discr_lr_lambda(step: int) -> float:
+    # Discriminator steps begin after gan_start=5000. Offset local scheduler
+    # steps so its LR milestones remain aligned to the global training step.
+    return stage2_lr_lambda(step + 5_000)
+
+
 def calculate_bitrate(
     sample_rate: int,
     strides: tuple[int, ...],
@@ -629,8 +707,11 @@ def build_model(
     codebook_size: int,
     num_quantizers: int,
     si_sdr_loss_weight: float,
+    spectral_envelope_loss_weight: float,
     click_loss_weight: float,
     jump_loss_weight: float,
+    preemph_loss_weight: float,
+    noise_floor_loss_weight: float,
     stft_recon_loss_weight: float,
     decoder_upsample_mode: str,
     decoder_residual_scale: float,
@@ -664,11 +745,14 @@ def build_model(
         recon_loss_weight=recon_loss_weight,
         multi_spectral_recon_loss_weight=multi_spectral_recon_loss_weight,
         stft_recon_loss_weight=stft_recon_loss_weight,
+        spectral_envelope_loss_weight=spectral_envelope_loss_weight,
         si_sdr_loss_weight=si_sdr_loss_weight,
         correlation_loss_weight=correlation_loss_weight,
         energy_loss_weight=0.1,
         click_loss_weight=click_loss_weight,
         jump_loss_weight=jump_loss_weight,
+        preemph_loss_weight=preemph_loss_weight,
+        noise_floor_loss_weight=noise_floor_loss_weight,
         commitment_loss_weight=0.1,
         adversarial_loss_weight=(
             0.001
@@ -717,6 +801,18 @@ def main() -> None:
         raise ValueError("--si-sdr-loss-start-steps cannot be negative.")
     if args.si_sdr_loss_warmup_steps < 0:
         raise ValueError("--si-sdr-loss-warmup-steps cannot be negative.")
+    if args.spectral_envelope_loss_weight is not None and args.spectral_envelope_loss_weight < 0:
+        raise ValueError("--spectral-envelope-loss-weight cannot be negative.")
+    if (
+        args.spectral_envelope_loss_start_steps is not None and
+        args.spectral_envelope_loss_start_steps < 0
+    ):
+        raise ValueError("--spectral-envelope-loss-start-steps cannot be negative.")
+    if (
+        args.spectral_envelope_loss_warmup_steps is not None and
+        args.spectral_envelope_loss_warmup_steps < 0
+    ):
+        raise ValueError("--spectral-envelope-loss-warmup-steps cannot be negative.")
     if args.decoder_linear_upsample_kernel_min < 0:
         raise ValueError("--decoder-linear-upsample-kernel-min cannot be negative.")
     if args.decoder_residual_scale_start < 0:
@@ -748,6 +844,10 @@ def main() -> None:
         raise ValueError("--click-loss-weight cannot be negative.")
     if args.jump_loss_weight is not None and args.jump_loss_weight < 0:
         raise ValueError("--jump-loss-weight cannot be negative.")
+    if args.preemph_loss_weight is not None and args.preemph_loss_weight < 0:
+        raise ValueError("--preemph-loss-weight cannot be negative.")
+    if args.noise_floor_loss_weight is not None and args.noise_floor_loss_weight < 0:
+        raise ValueError("--noise-floor-loss-weight cannot be negative.")
     if (
         args.transient_loss_warmup_steps is not None and
         args.transient_loss_warmup_steps < 0
@@ -848,6 +948,31 @@ def main() -> None:
         if args.jump_loss_weight is not None
         else stage_defaults["jump_loss_weight"]
     )
+    preemph_loss_weight = (
+        args.preemph_loss_weight
+        if args.preemph_loss_weight is not None
+        else stage_defaults.get("preemph_loss_weight", 0.)
+    )
+    noise_floor_loss_weight = (
+        args.noise_floor_loss_weight
+        if args.noise_floor_loss_weight is not None
+        else stage_defaults.get("noise_floor_loss_weight", 0.)
+    )
+    spectral_envelope_loss_weight = (
+        args.spectral_envelope_loss_weight
+        if args.spectral_envelope_loss_weight is not None
+        else stage_defaults["spectral_envelope_loss_weight"]
+    )
+    spectral_envelope_loss_start_steps = (
+        args.spectral_envelope_loss_start_steps
+        if args.spectral_envelope_loss_start_steps is not None
+        else stage_defaults.get("spectral_envelope_loss_start_steps", 0)
+    )
+    spectral_envelope_loss_warmup_steps = (
+        args.spectral_envelope_loss_warmup_steps
+        if args.spectral_envelope_loss_warmup_steps is not None
+        else stage_defaults.get("spectral_envelope_loss_warmup_steps", 0)
+    )
     transient_loss_warmup_steps = (
         args.transient_loss_warmup_steps
         if args.transient_loss_warmup_steps is not None
@@ -933,6 +1058,13 @@ def main() -> None:
                 "1.000e-04 for [20000, 35000), "
                 "5.000e-05 from step 35000"
             )
+    elif args.stage == "gan_pretrain":
+        print(
+            "Stage-2 LR schedule (generator/discriminator): "
+            "linear warmup, 5.000e-05 before step 50000, "
+            "2.500e-05 for [50000, 75000), "
+            "1.000e-05 from step 75000"
+        )
     print(f"Random seed: {args.seed}")
     print(
         "SI-SDR loss: "
@@ -941,10 +1073,22 @@ def main() -> None:
         f"warmup_steps={args.si_sdr_loss_warmup_steps if si_sdr_loss_weight > 0 else 0}"
     )
     print(
+        "Voiced spectral envelope loss: "
+        f"max_weight={spectral_envelope_loss_weight}, "
+        f"start_steps={spectral_envelope_loss_start_steps if spectral_envelope_loss_weight > 0 else 0}, "
+        f"warmup_steps={spectral_envelope_loss_warmup_steps if spectral_envelope_loss_weight > 0 else 0}, "
+        "band=200-4500 Hz, smoothing_bins=9"
+    )
+    print(
         "Transient noise loss: "
         f"click_weight={click_loss_weight}, "
         f"jump_weight={jump_loss_weight}, "
         f"warmup_steps={transient_loss_warmup_steps}"
+    )
+    print(
+        "Background noise loss: "
+        f"preemph_weight={preemph_loss_weight}, "
+        f"noise_floor_weight={noise_floor_loss_weight}"
     )
     print(
         "Clean checkpoint gate: "
@@ -1027,10 +1171,15 @@ def main() -> None:
     print("RVQ quantize dropout: False")
     print("RVQ dead-code threshold: 5")
     print(f"RVQ codebook synchronization: {world_size > 1}")
-    print(
-        "RVQ codebook training: "
-        f"{'frozen' if args.stage in ('stream_finetune', 'stream_finetune_long') else 'enabled'}"
-    )
+    if args.stage in ("stream_finetune", "stream_finetune_long"):
+        print("RVQ codebook training: frozen")
+    elif stage_defaults.get("freeze_codebook_after_step") is not None:
+        print(
+            "RVQ codebook training: enabled until step "
+            f"{stage_defaults['freeze_codebook_after_step']}, then frozen"
+        )
+    else:
+        print("RVQ codebook training: enabled")
     print(f"Theoretical bitrate: {bitrate / 1000:.1f} kbps")
     if args.stage in ("stream_finetune", "stream_finetune_long"):
         print(
@@ -1060,6 +1209,9 @@ def main() -> None:
         si_sdr_loss_weight=si_sdr_loss_weight,
         click_loss_weight=click_loss_weight,
         jump_loss_weight=jump_loss_weight,
+        spectral_envelope_loss_weight=spectral_envelope_loss_weight,
+        preemph_loss_weight=preemph_loss_weight,
+        noise_floor_loss_weight=noise_floor_loss_weight,
         stft_recon_loss_weight=stft_recon_loss_weight,
         decoder_upsample_mode=args.decoder_upsample_mode,
         decoder_residual_scale=decoder_residual_scale_start,
@@ -1073,9 +1225,16 @@ def main() -> None:
     )
     scheduler = None
     scheduler_kwargs = {}
+    discr_scheduler = None
+    discr_scheduler_kwargs = {}
     if args.stage == "recon_pretrain" and not stage1_plateau_lr_enabled:
         scheduler = LambdaLR
         scheduler_kwargs = dict(lr_lambda=stage1_lr_lambda)
+    elif args.stage == "gan_pretrain":
+        scheduler = LambdaLR
+        scheduler_kwargs = dict(lr_lambda=stage2_lr_lambda)
+        discr_scheduler = LambdaLR
+        discr_scheduler_kwargs = dict(lr_lambda=stage2_discr_lr_lambda)
 
     trainer = SoundStreamTrainer(
         soundstream,
@@ -1093,6 +1252,8 @@ def main() -> None:
         warmup_steps=warmup_steps,
         scheduler=scheduler,
         scheduler_kwargs=scheduler_kwargs,
+        discr_scheduler=discr_scheduler,
+        discr_scheduler_kwargs=discr_scheduler_kwargs,
         plateau_lr_enabled=stage1_plateau_lr_enabled,
         plateau_lr_start_steps=args.plateau_start_steps,
         plateau_lr_factor=args.plateau_factor,
@@ -1117,6 +1278,16 @@ def main() -> None:
         ),
         transient_loss_warmup_steps=transient_loss_warmup_steps,
         decoder_residual_scale_start=decoder_residual_scale_start,
+        spectral_envelope_loss_start_steps=(
+            spectral_envelope_loss_start_steps
+            if spectral_envelope_loss_weight > 0
+            else 0
+        ),
+        spectral_envelope_loss_warmup_steps=(
+            spectral_envelope_loss_warmup_steps
+            if spectral_envelope_loss_weight > 0
+            else 0
+        ),
         decoder_residual_scale_end=decoder_residual_scale_end,
         decoder_residual_scale_warmup_start_steps=decoder_residual_scale_warmup_start_steps,
         decoder_residual_scale_warmup_end_steps=decoder_residual_scale_warmup_end_steps,
@@ -1142,6 +1313,7 @@ def main() -> None:
         gan_ramp_steps=stage_defaults["gan_ramp"],
         gan_adversarial_max=0.001,
         gan_feature_max=5.,
+        freeze_codebook_after_step=stage_defaults.get("freeze_codebook_after_step"),
         freeze_codebook_during_training=args.stage in (
             "stream_finetune",
             "stream_finetune_long",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import math
 from pathlib import Path
 from functools import partial, wraps
 from itertools import cycle, zip_longest
@@ -624,11 +625,14 @@ class SoundStream(Module):
         recon_loss_weight = 1.,
         multi_spectral_recon_loss_weight = 1.,
         stft_recon_loss_weight = 0.,
+        spectral_envelope_loss_weight = 0.,
         si_sdr_loss_weight = 0.,
         correlation_loss_weight = 0.,
         energy_loss_weight = 0.1,
         click_loss_weight = 0.,
         jump_loss_weight = 0.,
+        preemph_loss_weight = 0.,
+        noise_floor_loss_weight = 0.,
         commitment_loss_weight = 0.1,
         adversarial_loss_weight = 1.,
         feature_loss_weight = 100,
@@ -820,6 +824,23 @@ class SoundStream(Module):
         self.stft_recon_settings = []
         self.stft_recon_alphas = []
 
+        # Stage-1 formant / vocal-tract envelope objective. This stays
+        # separate from the raw multi-scale STFT loss: the frequency-smoothed,
+        # voiced-only envelope does not reward individual narrow-band bins.
+        self.spectral_envelope_n_fft = 1024
+        self.spectral_envelope_win_length = 640
+        self.spectral_envelope_hop_length = 160
+        self.spectral_envelope_smoothing_bins = 9
+        self.spectral_envelope_min_hz = 200.
+        self.spectral_envelope_max_hz = 4500.
+        self.spectral_envelope_relative_rms_db = -35.
+        self.spectral_envelope_absolute_rms = 0.003
+        self.register_buffer(
+            'spectral_envelope_window',
+            torch.hann_window(self.spectral_envelope_win_length),
+            persistent = False
+        )
+
         num_transforms = len(multi_spectral_window_powers_of_two)
         multi_spectral_n_ffts = cast_tuple(multi_spectral_n_ffts, num_transforms)
         multi_spectral_n_mels = cast_tuple(multi_spectral_n_mels, num_transforms)
@@ -872,11 +893,14 @@ class SoundStream(Module):
         self.recon_loss_weight = recon_loss_weight
         self.multi_spectral_recon_loss_weight = multi_spectral_recon_loss_weight
         self.stft_recon_loss_weight = stft_recon_loss_weight
+        self.spectral_envelope_loss_weight = spectral_envelope_loss_weight
         self.si_sdr_loss_weight = si_sdr_loss_weight
         self.correlation_loss_weight = correlation_loss_weight
         self.energy_loss_weight = energy_loss_weight
         self.click_loss_weight = click_loss_weight
         self.jump_loss_weight = jump_loss_weight
+        self.preemph_loss_weight = preemph_loss_weight
+        self.noise_floor_loss_weight = noise_floor_loss_weight
         self.commitment_loss_weight = commitment_loss_weight
         self.adversarial_loss_weight = adversarial_loss_weight
         self.feature_loss_weight = feature_loss_weight
@@ -1043,6 +1067,133 @@ class SoundStream(Module):
         )
         return -si_sdr.mean()
 
+    def spectral_envelope_metrics(self, target, recon):
+        """Return voiced, frequency-smoothed vocal-tract envelope errors.
+
+        The per-frame mean log magnitude is removed before comparison so this
+        objective follows the formant-envelope shape rather than absolute
+        loudness or a stationary recording-noise floor.
+        """
+        target_rows = target.float()
+        recon_rows = recon.float()
+        if target_rows.ndim == 3:
+            target_rows = rearrange(target_rows, 'b c n -> (b c) n')
+        if recon_rows.ndim == 3:
+            recon_rows = rearrange(recon_rows, 'b c n -> (b c) n')
+
+        num_samples = min(target_rows.shape[-1], recon_rows.shape[-1])
+        target_rows = target_rows[..., :num_samples]
+        recon_rows = recon_rows[..., :num_samples]
+        if num_samples < self.spectral_envelope_n_fft:
+            padding = self.spectral_envelope_n_fft - num_samples
+            target_rows = F.pad(target_rows, (0, padding))
+            recon_rows = F.pad(recon_rows, (0, padding))
+
+        window = self.spectral_envelope_window.to(
+            device = target_rows.device,
+            dtype = target_rows.dtype
+        )
+        stft_kwargs = dict(
+            n_fft = self.spectral_envelope_n_fft,
+            hop_length = self.spectral_envelope_hop_length,
+            win_length = self.spectral_envelope_win_length,
+            window = window,
+            center = True,
+            pad_mode = 'constant',
+            return_complex = True
+        )
+        target_log_mag = log(
+            torch.stft(target_rows, **stft_kwargs).abs(),
+            eps = 1e-5
+        )
+        recon_log_mag = log(
+            torch.stft(recon_rows, **stft_kwargs).abs(),
+            eps = 1e-5
+        )
+
+        smoothing_bins = self.spectral_envelope_smoothing_bins
+        smooth_padding = smoothing_bins // 2
+        target_envelope = F.avg_pool2d(
+            target_log_mag.unsqueeze(1),
+            kernel_size = (smoothing_bins, 1),
+            stride = 1,
+            padding = (smooth_padding, 0)
+        ).squeeze(1)
+        recon_envelope = F.avg_pool2d(
+            recon_log_mag.unsqueeze(1),
+            kernel_size = (smoothing_bins, 1),
+            stride = 1,
+            padding = (smooth_padding, 0)
+        ).squeeze(1)
+
+        frequencies = torch.fft.rfftfreq(
+            self.spectral_envelope_n_fft,
+            d = 1. / self.target_sample_hz,
+            device = target_rows.device
+        )
+        voice_band = (
+            (frequencies >= self.spectral_envelope_min_hz) &
+            (frequencies <= self.spectral_envelope_max_hz)
+        )
+        target_envelope = target_envelope[:, voice_band]
+        recon_envelope = recon_envelope[:, voice_band]
+
+        # Remove frame-level gain so the loss focuses on envelope shape.
+        target_envelope = target_envelope - target_envelope.mean(
+            dim = 1,
+            keepdim = True
+        )
+        recon_envelope = recon_envelope - recon_envelope.mean(
+            dim = 1,
+            keepdim = True
+        )
+        envelope_error = (recon_envelope - target_envelope).abs()
+
+        frame_rms = F.avg_pool1d(
+            target_rows.square().unsqueeze(1),
+            kernel_size = self.spectral_envelope_win_length,
+            stride = self.spectral_envelope_hop_length,
+            padding = self.spectral_envelope_win_length // 2,
+            count_include_pad = False
+        ).squeeze(1).clamp_min(1e-12).sqrt()
+        num_frames = min(frame_rms.shape[-1], envelope_error.shape[-1])
+        frame_rms = frame_rms[..., :num_frames]
+        envelope_error = envelope_error[..., :num_frames]
+        relative_floor = (
+            frame_rms.amax(dim = -1, keepdim = True) *
+            (10. ** (self.spectral_envelope_relative_rms_db / 20.))
+        )
+        voiced_mask = (
+            (frame_rms >= relative_floor) &
+            (frame_rms >= self.spectral_envelope_absolute_rms)
+        )
+        voiced_weight = voiced_mask.unsqueeze(1).to(envelope_error.dtype)
+
+        def masked_band_mean(error, band_mask):
+            band_error = error[:, band_mask]
+            denominator = (
+                voiced_weight.sum() * max(band_error.shape[1], 1)).clamp_min(1.)
+            return (band_error * voiced_weight).sum() / denominator
+
+        voice_frequencies = frequencies[voice_band]
+        total_loss = masked_band_mean(
+            envelope_error,
+            torch.ones_like(voice_frequencies, dtype = torch.bool)
+        )
+        low_loss = masked_band_mean(
+            envelope_error,
+            (voice_frequencies >= 200.) & (voice_frequencies < 1000.)
+        )
+        mid_loss = masked_band_mean(
+            envelope_error,
+            (voice_frequencies >= 1000.) & (voice_frequencies < 2500.)
+        )
+        high_loss = masked_band_mean(
+            envelope_error,
+            (voice_frequencies >= 2500.) & (voice_frequencies <= 4500.)
+        )
+        voiced_fraction = voiced_mask.float().mean()
+        return total_loss, low_loss, mid_loss, high_loss, voiced_fraction
     def transient_noise_losses(self, target, recon):
         if (
             self.click_loss_weight <= 0 and
@@ -1106,6 +1257,108 @@ class SoundStream(Module):
         jump_loss = jump_excess.square().mean().clamp_min(1e-12).sqrt()
 
         return click_loss, jump_loss
+
+    def background_noise_losses(self, target, recon):
+        """High-frequency reconstruction constraints used by stage 1.
+
+        Pre-emphasis keeps speech detail aligned.  The noise-floor term only
+        penalizes reconstructed high-frequency energy that exceeds the source
+        in low-energy frames, so existing steady recording noise is not
+        rewarded or amplified.
+        """
+        if (
+            self.preemph_loss_weight <= 0 and
+            self.noise_floor_loss_weight <= 0
+        ):
+            return self.zero, self.zero
+
+        if target.shape[-1] < 2 or recon.shape[-1] < 2:
+            return self.zero, self.zero
+
+        target_float = target.float()
+        recon_float = recon.float()
+        preemphasis = 0.97
+        target_highpass = (
+            target_float[..., 1:] -
+            preemphasis * target_float[..., :-1]
+        )
+        recon_highpass = (
+            recon_float[..., 1:] -
+            preemphasis * recon_float[..., :-1]
+        )
+
+        preemph_loss = (
+            F.l1_loss(recon_highpass, target_highpass)
+            if self.preemph_loss_weight > 0
+            else self.zero
+        )
+
+        noise_floor_loss = self.zero
+        if self.noise_floor_loss_weight > 0:
+            target_frames = target_float
+            if target_frames.ndim == 2:
+                target_frames = rearrange(target_frames, 'b n -> b 1 n')
+            if target_highpass.ndim == 2:
+                target_highpass = rearrange(target_highpass, 'b n -> b 1 n')
+                recon_highpass = rearrange(recon_highpass, 'b n -> b 1 n')
+
+            # 20 ms non-overlapping frames keep this diagnostic inexpensive.
+            frame_length = min(
+                max(1, int(round(0.020 * self.target_sample_hz))),
+                target_highpass.shape[-1]
+            )
+            target_frame_rms = F.avg_pool1d(
+                target_frames.square(),
+                kernel_size = frame_length,
+                stride = frame_length
+            ).clamp_min(1e-10).sqrt()
+            target_highpass_rms = F.avg_pool1d(
+                target_highpass.square(),
+                kernel_size = frame_length,
+                stride = frame_length
+            ).clamp_min(1e-10).sqrt()
+            recon_highpass_rms = F.avg_pool1d(
+                recon_highpass.square(),
+                kernel_size = frame_length,
+                stride = frame_length
+            ).clamp_min(1e-10).sqrt()
+
+            num_frames = min(
+                target_frame_rms.shape[-1],
+                target_highpass_rms.shape[-1],
+                recon_highpass_rms.shape[-1]
+            )
+            target_frame_rms = target_frame_rms[..., :num_frames]
+            target_highpass_rms = target_highpass_rms[..., :num_frames]
+            recon_highpass_rms = recon_highpass_rms[..., :num_frames]
+
+            # Use the quietest 30% of each example, with an absolute ceiling
+            # to avoid treating ordinary voiced frames as silence.
+            quiet_threshold = torch.quantile(
+                target_frame_rms.detach().float(),
+                0.30,
+                dim = -1,
+                keepdim = True
+            ).to(dtype = target_frame_rms.dtype)
+            quiet_threshold = quiet_threshold.clamp_max(0.03)
+            quiet_mask = (target_frame_rms <= quiet_threshold).to(
+                dtype = recon_highpass_rms.dtype
+            )
+
+            # A 10% margin prevents harmless measurement jitter from being
+            # optimized. Log ratios make the loss scale robust to loudness.
+            eps = 1e-5
+            log_excess = F.relu(
+                torch.log(recon_highpass_rms + eps) -
+                torch.log(target_highpass_rms + eps) -
+                math.log(1.10)
+            )
+            noise_floor_loss = (
+                (log_excess * quiet_mask).sum() /
+                quiet_mask.sum().clamp_min(1.)
+            )
+
+        return preemph_loss, noise_floor_loss
 
     def generator_perceptual_losses(self, real, fake):
         if self.adversarial_loss_weight <= 0 and self.feature_loss_weight <= 0:
@@ -1258,6 +1511,50 @@ class SoundStream(Module):
     def tokenize(self, audio):
         self.eval()
         return self.forward(audio, return_codes_only = True)
+
+    def forward_bypass_rvq(
+        self,
+        x,
+        is_denoising = None,
+        return_recons_only = True,
+        input_sample_hz = None,
+        curtail_from_left = False
+    ):
+        """Diagnostic path: Encoder -> Decoder, skipping RVQ quantization.
+
+        This is intended for reconstruction debugging only.  It keeps the same
+        preprocessing, encoder attention, optional FiLM conditioning, decoder
+        attention, and output unpacking as the normal forward path, but does not
+        call `self.rq`.
+        """
+        process_input = partial(self.process_input, input_sample_hz = input_sample_hz, curtail_from_left = curtail_from_left)
+
+        x, ps = process_input(x)
+
+        x = self.encoder(x)
+        x = rearrange(x, 'b c n -> b n c')
+
+        denoise_input = None
+        if exists(self.encoder_attn):
+            x = self.encoder_attn(x)
+
+        if exists(is_denoising):
+            denoise_input = torch.tensor([is_denoising, not is_denoising], dtype = x.dtype, device = self.device)
+            x = self.encoder_film(x, denoise_input)
+
+        if exists(is_denoising):
+            x = self.decoder_film(x, denoise_input)
+
+        if exists(self.decoder_attn):
+            x = self.decoder_attn(x)
+
+        x = rearrange(x, 'b n c -> b c n')
+        recon_x = self.decoder(x)
+
+        if return_recons_only:
+            recon_x, = unpack(recon_x, ps, '* c n')
+
+        return recon_x
 
     def forward(
         self,
@@ -1416,6 +1713,12 @@ class SoundStream(Module):
             else self.zero
         )
         click_loss, jump_loss = self.transient_noise_losses(target, recon_x)
+        spectral_envelope_loss = (
+            self.spectral_envelope_metrics(target, recon_x)[0]
+            if self.spectral_envelope_loss_weight > 0
+            else self.zero
+        )
+        preemph_loss, noise_floor_loss = self.background_noise_losses(target, recon_x)
         adversarial_loss, feature_loss = self.generator_perceptual_losses(
             orig_x,
             recon_x
@@ -1430,9 +1733,12 @@ class SoundStream(Module):
             multi_spectral_recon_loss * self.multi_spectral_recon_loss_weight +
             stft_recon_loss * self.stft_recon_loss_weight +
             si_sdr_loss * self.si_sdr_loss_weight +
+            spectral_envelope_loss * self.spectral_envelope_loss_weight +
             correlation_loss * self.correlation_loss_weight +
             click_loss * self.click_loss_weight +
             jump_loss * self.jump_loss_weight +
+            preemph_loss * self.preemph_loss_weight +
+            noise_floor_loss * self.noise_floor_loss_weight +
             adversarial_loss * self.adversarial_loss_weight +
             feature_loss * self.feature_loss_weight +
             all_commitment_loss * self.commitment_loss_weight
@@ -1443,6 +1749,7 @@ class SoundStream(Module):
                 recon_loss,
                 multi_spectral_recon_loss,
                 stft_recon_loss,
+                spectral_envelope_loss,
                 adversarial_loss,
                 feature_loss,
                 all_commitment_loss,
@@ -1450,6 +1757,8 @@ class SoundStream(Module):
                 correlation_loss,
                 click_loss,
                 jump_loss,
+                preemph_loss,
+                noise_floor_loss,
                 self.zero
             )
 
@@ -1801,6 +2110,12 @@ class FrameStreamingSoundStream(SoundStream):
             else self.zero
         )
         click_loss, jump_loss = self.transient_noise_losses(target, recon_x)
+        preemph_loss, noise_floor_loss = self.background_noise_losses(target, recon_x)
+        spectral_envelope_loss = (
+            self.spectral_envelope_metrics(target, recon_x)[0]
+            if self.spectral_envelope_loss_weight > 0
+            else self.zero
+        )
         adversarial_loss, feature_loss = self.generator_perceptual_losses(
             orig_x,
             recon_x
@@ -1813,9 +2128,12 @@ class FrameStreamingSoundStream(SoundStream):
             multi_spectral_recon_loss * self.multi_spectral_recon_loss_weight +
             stft_recon_loss * self.stft_recon_loss_weight +
             si_sdr_loss * self.si_sdr_loss_weight +
+            spectral_envelope_loss * self.spectral_envelope_loss_weight +
             correlation_loss * self.correlation_loss_weight +
             click_loss * self.click_loss_weight +
             jump_loss * self.jump_loss_weight +
+            preemph_loss * self.preemph_loss_weight +
+            noise_floor_loss * self.noise_floor_loss_weight +
             adversarial_loss * self.adversarial_loss_weight +
             feature_loss * self.feature_loss_weight +
             all_commitment_loss * self.commitment_loss_weight +
@@ -1827,6 +2145,7 @@ class FrameStreamingSoundStream(SoundStream):
                 recon_loss,
                 multi_spectral_recon_loss,
                 stft_recon_loss,
+                spectral_envelope_loss,
                 adversarial_loss,
                 feature_loss,
                 all_commitment_loss,
@@ -1834,6 +2153,8 @@ class FrameStreamingSoundStream(SoundStream):
                 correlation_loss,
                 click_loss,
                 jump_loss,
+                preemph_loss,
+                noise_floor_loss,
                 boundary_loss
             )
 

@@ -154,6 +154,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable block/context inference and run ordinary whole-file inference.",
     )
+    parser.add_argument(
+        "--bypass-rvq",
+        action="store_true",
+        help=(
+            "Diagnostic mode: reconstruct with Encoder -> Decoder and skip RVQ. "
+            "Use this to determine whether noise comes from RVQ quantization or "
+            "from the encoder/decoder itself."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -226,6 +235,7 @@ def run_frame_streaming_codec(
     model: FrameStreamingSoundStream,
     wave: torch.Tensor,
     num_quantizers: int,
+    bypass_rvq: bool = False,
 ) -> torch.Tensor:
     encoder_state = None
     decoder_state = None
@@ -233,15 +243,25 @@ def run_frame_streaming_codec(
     batched_wave = wave.unsqueeze(0)
 
     for frame in batched_wave.split(model.stream_frame_size, dim=-1):
-        _, codes, _, encoder_state = model.encode_frame(
-            frame,
-            state=encoder_state,
-            num_quantizers=num_quantizers,
-        )
-        reconstructed, decoder_state = model.decode_codes_frame(
-            codes,
-            state=decoder_state,
-        )
+        if bypass_rvq:
+            latent, encoder_state = model.encode_frame_latent(
+                frame,
+                state=encoder_state,
+            )
+            reconstructed, decoder_state = model.decode_frame(
+                latent,
+                state=decoder_state,
+            )
+        else:
+            _, codes, _, encoder_state = model.encode_frame(
+                frame,
+                state=encoder_state,
+                num_quantizers=num_quantizers,
+            )
+            reconstructed, decoder_state = model.decode_codes_frame(
+                codes,
+                state=decoder_state,
+            )
         reconstructed_frames.append(reconstructed)
 
     return torch.cat(reconstructed_frames, dim=-1)
@@ -254,6 +274,7 @@ def run_block_context_codec(
     num_quantizers: int,
     block_seconds: float,
     context_ms: float,
+    bypass_rvq: bool = False,
 ) -> torch.Tensor:
     sample_rate = int(model.target_sample_hz)
     frame_multiple = int(model.seq_len_multiple_of)
@@ -292,11 +313,17 @@ def run_block_context_codec(
         previous_start = max(0, start - context_samples)
         context = wave[..., previous_start:start]
         codec_input = torch.cat((context, current_padded), dim=-1)
-        reconstructed = model(
-            codec_input.unsqueeze(0),
-            return_recons_only=True,
-            num_quantizers=num_quantizers,
-        )
+        if bypass_rvq:
+            reconstructed = model.forward_bypass_rvq(
+                codec_input.unsqueeze(0),
+                return_recons_only=True,
+            )
+        else:
+            reconstructed = model(
+                codec_input.unsqueeze(0),
+                return_recons_only=True,
+                num_quantizers=num_quantizers,
+            )
         reconstructed = reconstructed[
             ...,
             context.shape[-1]:(context.shape[-1] + valid_samples)
@@ -363,7 +390,12 @@ def main() -> None:
                 * frame_multiple
             )
             wave = F.pad(wave, (0, padded_num_samples - original_num_samples))
-            recon = run_frame_streaming_codec(model, wave, num_quantizers)
+            recon = run_frame_streaming_codec(
+                model,
+                wave,
+                num_quantizers,
+                bypass_rvq=args.bypass_rvq,
+            )
         elif args.whole_file:
             padded_num_samples = (
                 (original_num_samples + frame_multiple - 1)
@@ -371,11 +403,17 @@ def main() -> None:
                 * frame_multiple
             )
             wave = F.pad(wave, (0, padded_num_samples - original_num_samples))
-            recon = model(
-                wave.unsqueeze(0),
-                return_recons_only=True,
-                num_quantizers=num_quantizers,
-            )
+            if args.bypass_rvq:
+                recon = model.forward_bypass_rvq(
+                    wave.unsqueeze(0),
+                    return_recons_only=True,
+                )
+            else:
+                recon = model(
+                    wave.unsqueeze(0),
+                    return_recons_only=True,
+                    num_quantizers=num_quantizers,
+                )
         else:
             recon = run_block_context_codec(
                 model,
@@ -383,6 +421,7 @@ def main() -> None:
                 num_quantizers=num_quantizers,
                 block_seconds=args.block_seconds,
                 context_ms=args.context_ms,
+                bypass_rvq=args.bypass_rvq,
             )
 
     recon = recon.squeeze(0).detach().cpu()
@@ -430,6 +469,7 @@ def main() -> None:
     )
     print(f"RVQ quantizers: {num_quantizers}/{model.num_quantizers}")
     print(f"Codec payload bitrate: {bitrate:.0f} bps")
+    print(f"RVQ bypass diagnostic: {args.bypass_rvq}")
     if isinstance(model, FrameStreamingSoundStream):
         print(f"Inference mode: frame streaming ({model.stream_frame_size} samples/frame)")
     elif args.whole_file:

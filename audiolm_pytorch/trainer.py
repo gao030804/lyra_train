@@ -290,6 +290,8 @@ class SoundStreamTrainer(nn.Module):
         best_eval_batches: int = 8,
         si_sdr_loss_start_steps: int = 0,
         si_sdr_loss_warmup_steps: int = 0,
+        spectral_envelope_loss_start_steps: int = 0,
+        spectral_envelope_loss_warmup_steps: int = 0,
         transient_loss_warmup_steps: int = 0,
         decoder_residual_scale_start: float = 1.,
         decoder_residual_scale_end: float = 1.,
@@ -313,6 +315,7 @@ class SoundStreamTrainer(nn.Module):
         gan_ramp_steps: int = 0,
         gan_adversarial_max: float = 0.1,
         gan_feature_max: float = 10.,
+        freeze_codebook_after_step: int | None = None,
         freeze_codebook_during_training: bool = False,
         log_losses_every: int = 1,
         results_folder: str = './results',
@@ -384,6 +387,11 @@ class SoundStreamTrainer(nn.Module):
         )
         self.si_sdr_loss_start_steps = si_sdr_loss_start_steps
         self.si_sdr_loss_warmup_steps = si_sdr_loss_warmup_steps
+        self.spectral_envelope_loss_max_weight = float(
+            getattr(soundstream, 'spectral_envelope_loss_weight', 0.)
+        )
+        self.spectral_envelope_loss_start_steps = spectral_envelope_loss_start_steps
+        self.spectral_envelope_loss_warmup_steps = spectral_envelope_loss_warmup_steps
         self.click_loss_max_weight = float(
             getattr(soundstream, 'click_loss_weight', 0.)
         )
@@ -727,6 +735,8 @@ class SoundStreamTrainer(nn.Module):
         self.gan_ramp_steps = gan_ramp_steps
         self.gan_adversarial_max = gan_adversarial_max
         self.gan_feature_max = gan_feature_max
+        assert not exists(freeze_codebook_after_step) or freeze_codebook_after_step >= 0
+        self.freeze_codebook_after_step = freeze_codebook_after_step
         self.freeze_codebook_during_training = freeze_codebook_during_training
 
         self.apply_grad_penalty_every = apply_grad_penalty_every
@@ -758,6 +768,40 @@ class SoundStreamTrainer(nn.Module):
         self.ema_soundstream.ema_model.load_state_dict(
             self.unwrapped_soundstream.state_dict()
         )
+        self.sync_ema_runtime_state()
+
+    def sync_ema_runtime_state(self):
+        """Copy non-state-dict model controls to the EMA reconstruction path.
+
+        Decoder residual scaling and scheduled loss weights are ordinary Python
+        attributes, so EMA parameter updates do not copy them automatically.
+        Keeping them synchronized makes EMA validation match the configuration
+        stored with an EMA checkpoint.
+        """
+        if not self.use_ema:
+            return
+
+        online_model = self.unwrapped_soundstream
+        ema_model = self.ema_soundstream.ema_model
+
+        if (
+            hasattr(online_model, 'decoder_residual_scale') and
+            hasattr(ema_model, 'set_decoder_residual_scale')
+        ):
+            ema_model.set_decoder_residual_scale(
+                online_model.decoder_residual_scale
+            )
+
+        for attribute in (
+            'si_sdr_loss_weight',
+            'spectral_envelope_loss_weight',
+            'click_loss_weight',
+            'jump_loss_weight',
+            'preemph_loss_weight',
+            'noise_floor_loss_weight'
+        ):
+            if hasattr(online_model, attribute) and hasattr(ema_model, attribute):
+                setattr(ema_model, attribute, getattr(online_model, attribute))
 
     def save(self, path):
         path = Path(path)
@@ -1182,6 +1226,13 @@ class SoundStreamTrainer(nn.Module):
             recon = F.pad(recon, (0, padding))
 
         _, multi_spectral_recon_loss, stft_recon_loss, _ = model.reconstruction_losses(target, recon)
+        (
+            spectral_envelope_loss,
+            spectral_envelope_low,
+            spectral_envelope_mid,
+            spectral_envelope_high,
+            spectral_envelope_voiced_fraction
+        ) = model.spectral_envelope_metrics(target, recon)
 
         target_centered = target - target.mean(dim = -1, keepdim = True)
         recon_centered = recon - recon.mean(dim = -1, keepdim = True)
@@ -1274,6 +1325,11 @@ class SoundStreamTrainer(nn.Module):
             multi_spectral_recon_loss = float(multi_spectral_recon_loss.detach().cpu()),
             stft_recon_loss = float(stft_recon_loss.detach().cpu()),
             commitment_loss = 0.,
+            spectral_envelope_loss = float(spectral_envelope_loss.detach().cpu()),
+            spectral_envelope_low = float(spectral_envelope_low.detach().cpu()),
+            spectral_envelope_mid = float(spectral_envelope_mid.detach().cpu()),
+            spectral_envelope_high = float(spectral_envelope_high.detach().cpu()),
+            spectral_envelope_voiced_fraction = float(spectral_envelope_voiced_fraction.detach().cpu()),
             boundary_loss = float(boundary_loss.detach().cpu()),
             energy_loss = float(energy_loss.detach().cpu()),
             rms_ratio = float(rms_ratio.detach().cpu()),
@@ -2003,8 +2059,15 @@ class SoundStreamTrainer(nn.Module):
         self.unwrapped_soundstream.load_state_dict(pkg['model'])
 
         if self.use_ema:
-            assert 'ema_model' in pkg
-            self.ema_soundstream.load_state_dict(pkg['ema_model'])
+            if 'ema_model' in pkg:
+                self.ema_soundstream.load_state_dict(pkg['ema_model'])
+                self.sync_ema_runtime_state()
+            else:
+                self.print(
+                    "checkpoint has no EMA state; initializing EMA from the "
+                    "loaded online model"
+                )
+                self.copy_online_to_ema()
 
         self.optim.load_state_dict(pkg['optim'])
         if exists(self.plateau_scheduler) and exists(pkg.get('plateau_scheduler')):
@@ -2128,6 +2191,31 @@ class SoundStreamTrainer(nn.Module):
             )
 
         model.si_sdr_loss_weight = self.si_sdr_loss_max_weight * progress
+        return progress
+
+    def update_spectral_envelope_loss_weight(self, steps):
+        model = self.unwrapped_soundstream
+        if self.spectral_envelope_loss_max_weight <= 0:
+            model.spectral_envelope_loss_weight = 0.
+            return 0.
+
+        if steps < self.spectral_envelope_loss_start_steps:
+            model.spectral_envelope_loss_weight = 0.
+            return 0.
+
+        if self.spectral_envelope_loss_warmup_steps <= 0:
+            progress = 1.
+        else:
+            progress = min(
+                1.,
+                max(
+                    0.,
+                    (steps - self.spectral_envelope_loss_start_steps) /
+                    self.spectral_envelope_loss_warmup_steps
+                )
+            )
+
+        model.spectral_envelope_loss_weight = self.spectral_envelope_loss_max_weight * progress
         return progress
 
     def update_transient_loss_weights(self, steps):
@@ -2263,8 +2351,14 @@ class SoundStreamTrainer(nn.Module):
         log_losses = self.log_losses_every > 0 and not (steps % self.log_losses_every)
         gan_progress = self.update_gan_weights(steps)
         si_sdr_loss_progress = self.update_si_sdr_loss_weight(steps)
+        spectral_envelope_loss_progress = self.update_spectral_envelope_loss_weight(steps)
         transient_loss_progress = self.update_transient_loss_weights(steps)
+        freeze_codebook = (
+            self.freeze_codebook_during_training or
+            (exists(self.freeze_codebook_after_step) and steps >= self.freeze_codebook_after_step)
+        )
         decoder_residual_scale = self.update_decoder_residual_scale(steps)
+        self.sync_ema_runtime_state()
 
         self.soundstream.train()
 
@@ -2295,6 +2389,7 @@ class SoundStreamTrainer(nn.Module):
                     recon_loss,
                     multi_spectral_recon_loss,
                     stft_recon_loss,
+                    spectral_envelope_loss,
                     adversarial_loss,
                     feature_loss,
                     all_commitment_loss,
@@ -2302,11 +2397,13 @@ class SoundStreamTrainer(nn.Module):
                     correlation_loss,
                     click_loss,
                     jump_loss,
+                    preemph_loss,
+                    noise_floor_loss,
                     boundary_loss
                 ) = self.soundstream(
                     wave,
                     return_loss_breakdown = True,
-                    freeze_codebook = self.freeze_codebook_during_training
+                    freeze_codebook = freeze_codebook
                 )
 
                 self.accelerator.backward(loss / self.grad_accum_every)
@@ -2319,6 +2416,7 @@ class SoundStreamTrainer(nn.Module):
             accum_log(logs, dict(
                 multi_spectral_recon_loss = multi_spectral_recon_loss.item() / self.grad_accum_every,
                 stft_recon_loss = stft_recon_loss.item() / self.grad_accum_every,
+                spectral_envelope_loss = spectral_envelope_loss.item() / self.grad_accum_every,
                 adversarial_loss = adversarial_loss.item() / self.grad_accum_every,
                 feature_loss = feature_loss.item() / self.grad_accum_every,
                 all_commitment_loss = all_commitment_loss.item() / self.grad_accum_every,
@@ -2326,6 +2424,8 @@ class SoundStreamTrainer(nn.Module):
                 correlation_loss = correlation_loss.item() / self.grad_accum_every,
                 click_loss = click_loss.item() / self.grad_accum_every,
                 jump_loss = jump_loss.item() / self.grad_accum_every,
+                preemph_loss = preemph_loss.item() / self.grad_accum_every,
+                noise_floor_loss = noise_floor_loss.item() / self.grad_accum_every,
                 boundary_loss = boundary_loss.item() / self.grad_accum_every,
             ))
 
@@ -2351,6 +2451,8 @@ class SoundStreamTrainer(nn.Module):
             f"(w={model.multi_spectral_recon_loss_weight:.4g}) | "
             f"stft={logs['stft_recon_loss']:.6f}"
             f"(w={model.stft_recon_loss_weight:.4g}) | "
+            f"formant_env={logs['spectral_envelope_loss']:.6f}"
+            f"(w={model.spectral_envelope_loss_weight:.4g},ramp={spectral_envelope_loss_progress:.4f}) | "
             f"corr_loss={logs['correlation_loss']:.6f}"
             f"(w={model.correlation_loss_weight:.4g}) | "
             f"si_sdr_loss={logs['si_sdr_loss']:.6f}"
@@ -2359,7 +2461,12 @@ class SoundStreamTrainer(nn.Module):
             f"(w={model.click_loss_weight:.4g},ramp={transient_loss_progress:.4f}) | "
             f"jump_loss={logs['jump_loss']:.6f}"
             f"(w={model.jump_loss_weight:.4g},ramp={transient_loss_progress:.4f}) | "
+            f"preemph_loss={logs['preemph_loss']:.6f}"
+            f"(w={model.preemph_loss_weight:.4g}) | "
+            f"noise_floor_loss={logs['noise_floor_loss']:.6f}"
+            f"(w={model.noise_floor_loss_weight:.4g}) | "
             f"decoder_res_scale={decoder_residual_scale:.4f} | "
+            f"rvq_frozen={int(freeze_codebook)} | "
             f"commit={logs['all_commitment_loss']:.6f}"
         )
 
@@ -2409,8 +2516,9 @@ class SoundStreamTrainer(nn.Module):
 
         self.accelerator.wait_for_everyone()
 
-        if self.is_main and self.use_ema:
+        if self.use_ema:
             self.ema_soundstream.update()
+            self.sync_ema_runtime_state()
 
         # sample results every so often
 
@@ -2567,6 +2675,11 @@ class SoundStreamTrainer(nn.Module):
                 f"ema_si_sdr={ema_score['si_sdr']:.3f}, "
                 f"ema_aligned_corr={ema_score['aligned_correlation']:.3f}, "
                 f"ema_aligned_si_sdr={ema_score['aligned_si_sdr']:.3f}, "
+                f"ema_env={ema_score.get('spectral_envelope_loss', 0.):.4f}, "
+                f"ema_env_low={ema_score.get('spectral_envelope_low', 0.):.4f}, "
+                f"ema_env_mid={ema_score.get('spectral_envelope_mid', 0.):.4f}, "
+                f"ema_env_high={ema_score.get('spectral_envelope_high', 0.):.4f}, "
+                f"ema_voiced={ema_score.get('spectral_envelope_voiced_fraction', 0.):.3f}, "
                 f"ema_peak={ema_score.get('recon_peak', 0.):.3f}, "
                 f"ema_clip={ema_score.get('recon_clip_fraction', 0.) * 100:.3f}%, "
                 f"ema_jump_ratio={ema_score.get('jump_ratio', 0.):.2f}, "
@@ -2589,6 +2702,11 @@ class SoundStreamTrainer(nn.Module):
                 f"online_si_sdr={online_score['si_sdr']:.3f}, "
                 f"online_aligned_corr={online_score['aligned_correlation']:.3f}, "
                 f"online_aligned_si_sdr={online_score['aligned_si_sdr']:.3f}, "
+                f"online_env={online_score.get('spectral_envelope_loss', 0.):.4f}, "
+                f"online_env_low={online_score.get('spectral_envelope_low', 0.):.4f}, "
+                f"online_env_mid={online_score.get('spectral_envelope_mid', 0.):.4f}, "
+                f"online_env_high={online_score.get('spectral_envelope_high', 0.):.4f}, "
+                f"online_voiced={online_score.get('spectral_envelope_voiced_fraction', 0.):.3f}, "
                 f"online_peak={online_score.get('recon_peak', 0.):.3f}, "
                 f"online_clip={online_score.get('recon_clip_fraction', 0.) * 100:.3f}%, "
                 f"online_jump_ratio={online_score.get('jump_ratio', 0.):.2f}, "
