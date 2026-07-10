@@ -291,6 +291,10 @@ class SoundStreamTrainer(nn.Module):
         si_sdr_loss_start_steps: int = 0,
         si_sdr_loss_warmup_steps: int = 0,
         transient_loss_warmup_steps: int = 0,
+        decoder_residual_scale_start: float = 1.,
+        decoder_residual_scale_end: float = 1.,
+        decoder_residual_scale_warmup_start_steps: int = 0,
+        decoder_residual_scale_warmup_end_steps: int = 0,
         clean_gate: bool = True,
         clean_gate_min_aligned_si_sdr: float = 0.,
         clean_gate_min_aligned_corr: float = 0.65,
@@ -387,6 +391,14 @@ class SoundStreamTrainer(nn.Module):
             getattr(soundstream, 'jump_loss_weight', 0.)
         )
         self.transient_loss_warmup_steps = transient_loss_warmup_steps
+        assert decoder_residual_scale_start >= 0.
+        assert decoder_residual_scale_end >= 0.
+        assert decoder_residual_scale_warmup_start_steps >= 0
+        assert decoder_residual_scale_warmup_end_steps >= decoder_residual_scale_warmup_start_steps
+        self.decoder_residual_scale_start = decoder_residual_scale_start
+        self.decoder_residual_scale_end = decoder_residual_scale_end
+        self.decoder_residual_scale_warmup_start_steps = decoder_residual_scale_warmup_start_steps
+        self.decoder_residual_scale_warmup_end_steps = decoder_residual_scale_warmup_end_steps
         self.clean_gate = clean_gate
         self.clean_gate_min_aligned_si_sdr = clean_gate_min_aligned_si_sdr
         self.clean_gate_min_aligned_corr = clean_gate_min_aligned_corr
@@ -2140,6 +2152,30 @@ class SoundStreamTrainer(nn.Module):
         model.jump_loss_weight = self.jump_loss_max_weight * progress
         return progress
 
+    def update_decoder_residual_scale(self, steps):
+        model = self.unwrapped_soundstream
+
+        if not hasattr(model, 'set_decoder_residual_scale'):
+            return 1.
+
+        start_scale = self.decoder_residual_scale_start
+        end_scale = self.decoder_residual_scale_end
+        warmup_start = self.decoder_residual_scale_warmup_start_steps
+        warmup_end = self.decoder_residual_scale_warmup_end_steps
+
+        if steps < warmup_start:
+            scale = start_scale
+        elif warmup_end == warmup_start:
+            scale = end_scale
+        elif steps >= warmup_end:
+            scale = end_scale
+        else:
+            progress = (steps - warmup_start) / (warmup_end - warmup_start)
+            scale = start_scale + (end_scale - start_scale) * progress
+
+        model.set_decoder_residual_scale(scale)
+        return scale
+
     def update_discriminators(self, device, steps, logs):
         apply_grad_penalty = (
             self.apply_grad_penalty_every > 0 and
@@ -2228,6 +2264,7 @@ class SoundStreamTrainer(nn.Module):
         gan_progress = self.update_gan_weights(steps)
         si_sdr_loss_progress = self.update_si_sdr_loss_weight(steps)
         transient_loss_progress = self.update_transient_loss_weights(steps)
+        decoder_residual_scale = self.update_decoder_residual_scale(steps)
 
         self.soundstream.train()
 
@@ -2322,6 +2359,7 @@ class SoundStreamTrainer(nn.Module):
             f"(w={model.click_loss_weight:.4g},ramp={transient_loss_progress:.4f}) | "
             f"jump_loss={logs['jump_loss']:.6f}"
             f"(w={model.jump_loss_weight:.4g},ramp={transient_loss_progress:.4f}) | "
+            f"decoder_res_scale={decoder_residual_scale:.4f} | "
             f"commit={logs['all_commitment_loss']:.6f}"
         )
 

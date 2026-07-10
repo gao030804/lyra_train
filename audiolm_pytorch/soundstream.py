@@ -312,12 +312,16 @@ class ComplexSTFTDiscriminator(Module):
 # sound stream
 
 class Residual(Module):
-    def __init__(self, fn: Module):
+    def __init__(self, fn: Module, scale = 1.):
         super().__init__()
         self.fn = fn
+        self.residual_scale = float(scale)
+
+    def set_residual_scale(self, scale: float):
+        self.residual_scale = float(scale)
 
     def forward(self, x, **kwargs):
-        return self.fn(x, **kwargs) + x
+        return self.fn(x, **kwargs) * self.residual_scale + x
 
 class ChannelTranspose(Module):
     def __init__(self, fn: Module):
@@ -451,14 +455,14 @@ class CausalLinearUpsampleConv1d(Module):
 
         return out, (next_prev, next_conv_state)
 
-def ResidualUnit(chan_in, chan_out, dilation, kernel_size = 7, squeeze_excite = False, pad_mode = 'reflect'):
+def ResidualUnit(chan_in, chan_out, dilation, kernel_size = 7, squeeze_excite = False, pad_mode = 'reflect', residual_scale = 1.):
     return Residual(Sequential(
         CausalConv1d(chan_in, chan_out, kernel_size, dilation = dilation, pad_mode = pad_mode),
         nn.ELU(),
         CausalConv1d(chan_out, chan_out, 1, pad_mode = pad_mode),
         nn.ELU(),
         SqueezeExcite(chan_out) if squeeze_excite else None
-    ))
+    ), scale = residual_scale)
 
 def EncoderBlock(chan_in, chan_out, stride, cycle_dilations = (1, 3, 9), squeeze_excite = False, pad_mode = 'reflect'):
     it = cycle(cycle_dilations)
@@ -478,18 +482,26 @@ def DecoderBlock(
     cycle_dilations = (1, 3, 9),
     squeeze_excite = False,
     pad_mode = 'reflect',
-    upsample_mode = 'convtranspose'
+    upsample_mode = 'convtranspose',
+    residual_scale = 1.,
+    linear_upsample_kernel_min = 0
 ):
     even_stride = (stride % 2 == 0)
     padding = (stride + (0 if even_stride else 1)) // 2
     output_padding = 0 if even_stride else 1
 
-    residual_unit = partial(ResidualUnit, squeeze_excite = squeeze_excite, pad_mode = pad_mode)
+    residual_unit = partial(
+        ResidualUnit,
+        squeeze_excite = squeeze_excite,
+        pad_mode = pad_mode,
+        residual_scale = residual_scale
+    )
 
     if upsample_mode == 'convtranspose':
         upsample = CausalConvTranspose1d(chan_in, chan_out, 2 * stride, stride = stride)
     elif upsample_mode == 'linear':
-        upsample = CausalLinearUpsampleConv1d(chan_in, chan_out, 2 * stride, stride = stride, pad_mode = pad_mode)
+        upsample_kernel_size = max(2 * stride, linear_upsample_kernel_min)
+        upsample = CausalLinearUpsampleConv1d(chan_in, chan_out, upsample_kernel_size, stride = stride, pad_mode = pad_mode)
     else:
         raise ValueError(f'unknown decoder upsample mode: {upsample_mode}')
 
@@ -507,7 +519,7 @@ def stream_module(module, x, state = None):
 
     if isinstance(module, Residual):
         residual, next_state = stream_module(module.fn, x, state)
-        return residual + x, next_state
+        return residual * module.residual_scale + x, next_state
 
     if isinstance(module, nn.Sequential):
         states = state if exists(state) else [None] * len(module)
@@ -604,6 +616,8 @@ class SoundStream(Module):
         enc_cycle_dilations = (1, 3, 9),
         dec_cycle_dilations = (1, 3, 9),
         decoder_upsample_mode = 'convtranspose',
+        decoder_residual_scale = 1.,
+        decoder_linear_upsample_kernel_min = 0,
         multi_spectral_window_powers_of_two = tuple(range(6, 12)),
         multi_spectral_n_ffts = 512,
         multi_spectral_n_mels = 64,
@@ -651,7 +665,13 @@ class SoundStream(Module):
         self.strides = strides
         if decoder_upsample_mode not in ('convtranspose', 'linear'):
             raise ValueError(f'unknown decoder upsample mode: {decoder_upsample_mode}')
+        if decoder_residual_scale < 0:
+            raise ValueError(f'decoder_residual_scale must be >= 0, got {decoder_residual_scale}')
+        if decoder_linear_upsample_kernel_min < 0:
+            raise ValueError(f'decoder_linear_upsample_kernel_min must be >= 0, got {decoder_linear_upsample_kernel_min}')
         self.decoder_upsample_mode = decoder_upsample_mode
+        self.decoder_residual_scale = float(decoder_residual_scale)
+        self.decoder_linear_upsample_kernel_min = int(decoder_linear_upsample_kernel_min)
 
         layer_channels = tuple(map(lambda t: t * channels, channel_mults))
         layer_channels = (channels, *layer_channels)
@@ -763,7 +783,9 @@ class SoundStream(Module):
                 dec_cycle_dilations,
                 squeeze_excite,
                 pad_mode,
-                upsample_mode = decoder_upsample_mode
+                upsample_mode = decoder_upsample_mode,
+                residual_scale = decoder_residual_scale,
+                linear_upsample_kernel_min = decoder_linear_upsample_kernel_min
             ))
 
             if use_gate_loop_layers:
@@ -868,6 +890,24 @@ class SoundStream(Module):
     @property
     def configs(self):
         return pickle.loads(self._configs)
+
+    def _update_config(self, **updates):
+        config = self.configs
+        config.update(updates)
+        self._configs = pickle.dumps(config)
+
+    def set_decoder_residual_scale(self, scale: float):
+        scale = float(scale)
+        if scale < 0:
+            raise ValueError(f'decoder residual scale must be >= 0, got {scale}')
+
+        self.decoder_residual_scale = scale
+
+        for module in self.decoder.modules():
+            if isinstance(module, Residual):
+                module.set_residual_scale(scale)
+
+        self._update_config(decoder_residual_scale = scale)
 
     def reconstruction_losses(self, target, recon):
         wave_l1 = F.l1_loss(recon, target)

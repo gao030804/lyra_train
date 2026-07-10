@@ -434,6 +434,40 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--decoder-linear-upsample-kernel-min",
+        type=int,
+        default=7,
+        help=(
+            "Minimum kernel size for decoder linear-upsample CausalConv1d. "
+            "With the default 7, large-stride layers keep 2*stride while the "
+            "final small-stride layer is lightly smoothed."
+        ),
+    )
+    parser.add_argument(
+        "--decoder-residual-scale-start",
+        type=float,
+        default=0.2,
+        help="Decoder residual scale before the warmup window in recon_pretrain.",
+    )
+    parser.add_argument(
+        "--decoder-residual-scale-end",
+        type=float,
+        default=1.0,
+        help="Decoder residual scale after the warmup window in recon_pretrain.",
+    )
+    parser.add_argument(
+        "--decoder-residual-scale-warmup-start-steps",
+        type=int,
+        default=10_000,
+        help="Step where decoder residual scale begins increasing.",
+    )
+    parser.add_argument(
+        "--decoder-residual-scale-warmup-end-steps",
+        type=int,
+        default=50_000,
+        help="Step where decoder residual scale reaches the end value.",
+    )
+    parser.add_argument(
         "--boundary-loss-weight",
         type=float,
         default=0.1,
@@ -559,6 +593,26 @@ def load_model_weights_only(
                 "Use a checkpoint trained with the same decoder structure, or "
                 "rerun with --decoder-upsample-mode matching the checkpoint."
             )
+        checkpoint_kernel_min = checkpoint_config.get(
+            "decoder_linear_upsample_kernel_min",
+            0,
+        )
+        model_kernel_min = getattr(
+            model,
+            "decoder_linear_upsample_kernel_min",
+            None,
+        )
+        if (
+            checkpoint_upsample == "linear" and
+            model_kernel_min is not None and
+            checkpoint_kernel_min != model_kernel_min
+        ):
+            raise ValueError(
+                "Checkpoint decoder linear upsample kernel-min mismatch: "
+                f"checkpoint={checkpoint_kernel_min}, current_model={model_kernel_min}. "
+                "This changes decoder parameter shapes; use a matching checkpoint "
+                "or rerun with --decoder-linear-upsample-kernel-min matching the checkpoint."
+            )
     state_dict = pkg["model"] if "model" in pkg else pkg
     model.load_state_dict(state_dict, strict=True)
 
@@ -579,6 +633,8 @@ def build_model(
     jump_loss_weight: float,
     stft_recon_loss_weight: float,
     decoder_upsample_mode: str,
+    decoder_residual_scale: float,
+    decoder_linear_upsample_kernel_min: int,
     sync_codebook: bool | None = None,
 ) -> SoundStream:
     if sync_codebook is None:
@@ -586,7 +642,7 @@ def build_model(
 
     if stage == "recon_pretrain":
         recon_loss_weight = 10.
-        multi_spectral_recon_loss_weight = 2.
+        multi_spectral_recon_loss_weight = 1.1
         correlation_loss_weight = 0.02
     else:
         recon_loss_weight = 10. if stage == "overfit" else 1.
@@ -632,6 +688,8 @@ def build_model(
         attn_heads=4,
         attn_depth=1,
         decoder_upsample_mode=decoder_upsample_mode,
+        decoder_residual_scale=decoder_residual_scale,
+        decoder_linear_upsample_kernel_min=decoder_linear_upsample_kernel_min,
         pad_mode="constant",
     )
 
@@ -659,6 +717,19 @@ def main() -> None:
         raise ValueError("--si-sdr-loss-start-steps cannot be negative.")
     if args.si_sdr_loss_warmup_steps < 0:
         raise ValueError("--si-sdr-loss-warmup-steps cannot be negative.")
+    if args.decoder_linear_upsample_kernel_min < 0:
+        raise ValueError("--decoder-linear-upsample-kernel-min cannot be negative.")
+    if args.decoder_residual_scale_start < 0:
+        raise ValueError("--decoder-residual-scale-start cannot be negative.")
+    if args.decoder_residual_scale_end < 0:
+        raise ValueError("--decoder-residual-scale-end cannot be negative.")
+    if args.decoder_residual_scale_warmup_start_steps < 0:
+        raise ValueError("--decoder-residual-scale-warmup-start-steps cannot be negative.")
+    if args.decoder_residual_scale_warmup_end_steps < args.decoder_residual_scale_warmup_start_steps:
+        raise ValueError(
+            "--decoder-residual-scale-warmup-end-steps must be >= "
+            "--decoder-residual-scale-warmup-start-steps."
+        )
     if args.plateau_start_steps < 0:
         raise ValueError("--plateau-start-steps cannot be negative.")
     if not 0. < args.plateau_factor < 1.:
@@ -789,7 +860,7 @@ def main() -> None:
         else 1.0
     )
     multi_spectral_recon_loss_weight = (
-        2.0
+        1.1
         if args.stage == "recon_pretrain"
         else 0.7
     )
@@ -797,6 +868,26 @@ def main() -> None:
         0.02
         if args.stage == "recon_pretrain"
         else 0.0
+    )
+    decoder_residual_scale_start = (
+        args.decoder_residual_scale_start
+        if args.stage == "recon_pretrain"
+        else 1.0
+    )
+    decoder_residual_scale_end = (
+        args.decoder_residual_scale_end
+        if args.stage == "recon_pretrain"
+        else 1.0
+    )
+    decoder_residual_scale_warmup_start_steps = (
+        args.decoder_residual_scale_warmup_start_steps
+        if args.stage == "recon_pretrain"
+        else 0
+    )
+    decoder_residual_scale_warmup_end_steps = (
+        args.decoder_residual_scale_warmup_end_steps
+        if args.stage == "recon_pretrain"
+        else 0
     )
     stage1_plateau_lr_enabled = (
         args.stage == "recon_pretrain" and
@@ -884,6 +975,14 @@ def main() -> None:
         f"{stft_recon_loss_weight}"
     )
     print(f"Decoder upsample mode: {args.decoder_upsample_mode}")
+    print(f"Decoder linear upsample kernel min: {args.decoder_linear_upsample_kernel_min}")
+    print(
+        "Decoder residual scale schedule: "
+        f"{decoder_residual_scale_start} until step "
+        f"{decoder_residual_scale_warmup_start_steps}, "
+        f"linear to {decoder_residual_scale_end} by step "
+        f"{decoder_residual_scale_warmup_end_steps}"
+    )
     print(f"Discriminator learning rate: {stage_defaults['discr_lr']}")
     use_ema = stage_defaults.get("use_ema", True)
     print(f"EMA enabled: {use_ema}")
@@ -963,6 +1062,8 @@ def main() -> None:
         jump_loss_weight=jump_loss_weight,
         stft_recon_loss_weight=stft_recon_loss_weight,
         decoder_upsample_mode=args.decoder_upsample_mode,
+        decoder_residual_scale=decoder_residual_scale_start,
+        decoder_linear_upsample_kernel_min=args.decoder_linear_upsample_kernel_min,
         sync_codebook=(world_size > 1),
     )
 
@@ -1015,6 +1116,10 @@ def main() -> None:
             else 0
         ),
         transient_loss_warmup_steps=transient_loss_warmup_steps,
+        decoder_residual_scale_start=decoder_residual_scale_start,
+        decoder_residual_scale_end=decoder_residual_scale_end,
+        decoder_residual_scale_warmup_start_steps=decoder_residual_scale_warmup_start_steps,
+        decoder_residual_scale_warmup_end_steps=decoder_residual_scale_warmup_end_steps,
         clean_gate=not args.disable_clean_gate,
         clean_gate_min_aligned_si_sdr=args.clean_gate_min_aligned_si_sdr,
         clean_gate_min_aligned_corr=args.clean_gate_min_aligned_corr,

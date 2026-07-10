@@ -410,6 +410,14 @@ def main() -> None:
         "Decoder upsample mode: "
         f"{getattr(model, 'decoder_upsample_mode', 'unknown')}"
     )
+    print(
+        "Decoder linear upsample kernel min: "
+        f"{getattr(model, 'decoder_linear_upsample_kernel_min', 'unknown')}"
+    )
+    print(
+        "Decoder residual scale: "
+        f"{getattr(model, 'decoder_residual_scale', 'unknown')}"
+    )
     print(f"Input: {args.input_audio}")
     print(f"Output: {args.output}")
     print(f"Sample rate: {sample_rate} Hz")
