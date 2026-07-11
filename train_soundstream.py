@@ -264,7 +264,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--si-sdr-loss-weight",
         type=float,
-        default=0.05,
+        default=0.07,
         help=(
             "Maximum SI-SDR loss weight for recon_pretrain. "
             "Use 0 for the pure Saturday baseline; other stages keep it disabled."
@@ -399,7 +399,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help=(
-            "Low-energy-frame excess high-frequency noise loss weight. "
+            "Quiet-frame multiband spectral excess noise loss weight. "
             "Defaults to 0.05 for recon_pretrain, 0.02 for gan_pretrain, "
             "and zero for later stages."
         ),
@@ -1088,7 +1088,7 @@ def main() -> None:
     print(
         "Background noise loss: "
         f"preemph_weight={preemph_loss_weight}, "
-        f"noise_floor_weight={noise_floor_loss_weight}"
+        f"multiband_noise_floor_weight={noise_floor_loss_weight}"
     )
     print(
         "Clean checkpoint gate: "

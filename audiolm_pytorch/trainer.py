@@ -1233,6 +1233,10 @@ class SoundStreamTrainer(nn.Module):
             spectral_envelope_high,
             spectral_envelope_voiced_fraction
         ) = model.spectral_envelope_metrics(target, recon)
+        _, quiet_hf_excess_db = model.quiet_multiband_noise_metrics(
+            target,
+            recon
+        )
 
         target_centered = target - target.mean(dim = -1, keepdim = True)
         recon_centered = recon - recon.mean(dim = -1, keepdim = True)
@@ -1330,6 +1334,7 @@ class SoundStreamTrainer(nn.Module):
             spectral_envelope_mid = float(spectral_envelope_mid.detach().cpu()),
             spectral_envelope_high = float(spectral_envelope_high.detach().cpu()),
             spectral_envelope_voiced_fraction = float(spectral_envelope_voiced_fraction.detach().cpu()),
+            quiet_hf_excess_db = float(quiet_hf_excess_db.detach().cpu()),
             boundary_loss = float(boundary_loss.detach().cpu()),
             energy_loss = float(energy_loss.detach().cpu()),
             rms_ratio = float(rms_ratio.detach().cpu()),
@@ -2680,6 +2685,7 @@ class SoundStreamTrainer(nn.Module):
                 f"ema_env_mid={ema_score.get('spectral_envelope_mid', 0.):.4f}, "
                 f"ema_env_high={ema_score.get('spectral_envelope_high', 0.):.4f}, "
                 f"ema_voiced={ema_score.get('spectral_envelope_voiced_fraction', 0.):.3f}, "
+                f"ema_quiet_hf_excess_db={ema_score.get('quiet_hf_excess_db', 0.):.2f}, "
                 f"ema_peak={ema_score.get('recon_peak', 0.):.3f}, "
                 f"ema_clip={ema_score.get('recon_clip_fraction', 0.) * 100:.3f}%, "
                 f"ema_jump_ratio={ema_score.get('jump_ratio', 0.):.2f}, "
@@ -2707,6 +2713,7 @@ class SoundStreamTrainer(nn.Module):
                 f"online_env_mid={online_score.get('spectral_envelope_mid', 0.):.4f}, "
                 f"online_env_high={online_score.get('spectral_envelope_high', 0.):.4f}, "
                 f"online_voiced={online_score.get('spectral_envelope_voiced_fraction', 0.):.3f}, "
+                f"online_quiet_hf_excess_db={online_score.get('quiet_hf_excess_db', 0.):.2f}, "
                 f"online_peak={online_score.get('recon_peak', 0.):.3f}, "
                 f"online_clip={online_score.get('recon_clip_fraction', 0.) * 100:.3f}%, "
                 f"online_jump_ratio={online_score.get('jump_ratio', 0.):.2f}, "

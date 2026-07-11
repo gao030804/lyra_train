@@ -1258,14 +1258,83 @@ class SoundStream(Module):
 
         return click_loss, jump_loss
 
-    def background_noise_losses(self, target, recon):
-        """High-frequency reconstruction constraints used by stage 1.
+    def quiet_multiband_noise_metrics(self, target, recon):
+        """One-sided quiet-frame band loss plus a validation-only 2-8 kHz metric."""
+        target_rows, recon_rows = target.float(), recon.float()
+        if target_rows.ndim == 3:
+            target_rows = rearrange(target_rows, 'b c n -> (b c) n')
+        if recon_rows.ndim == 3:
+            recon_rows = rearrange(recon_rows, 'b c n -> (b c) n')
 
-        Pre-emphasis keeps speech detail aligned.  The noise-floor term only
-        penalizes reconstructed high-frequency energy that exceeds the source
-        in low-energy frames, so existing steady recording noise is not
-        rewarded or amplified.
-        """
+        num_samples = min(target_rows.shape[-1], recon_rows.shape[-1])
+        target_rows = target_rows[..., :num_samples]
+        recon_rows = recon_rows[..., :num_samples]
+        if num_samples == 0:
+            return self.zero, self.zero
+
+        frame_length = max(1, int(round(0.040 * self.target_sample_hz)))
+        hop_length = max(1, int(round(0.020 * self.target_sample_hz)))
+        if num_samples < frame_length:
+            padding = frame_length - num_samples
+            target_rows = F.pad(target_rows, (0, padding))
+            recon_rows = F.pad(recon_rows, (0, padding))
+
+        target_frames = target_rows.unfold(-1, frame_length, hop_length)
+        recon_frames = recon_rows.unfold(-1, frame_length, hop_length)
+        frame_rms = target_frames.square().mean(dim = -1).clamp_min(1e-10).sqrt()
+        quiet_threshold = torch.quantile(
+            frame_rms.detach(), 0.30, dim = -1, keepdim = True
+        ).clamp_max(0.03)
+        quiet_mask = (frame_rms <= quiet_threshold).to(target_frames.dtype)
+
+        window = torch.hann_window(
+            frame_length, device = target_frames.device, dtype = target_frames.dtype
+        )
+        n_fft = 1 << (frame_length - 1).bit_length()
+        normalization = window.square().sum().clamp_min(1e-8)
+        target_power = torch.fft.rfft(
+            target_frames * window, n = n_fft, dim = -1
+        ).abs().square() / normalization
+        recon_power = torch.fft.rfft(
+            recon_frames * window, n = n_fft, dim = -1
+        ).abs().square() / normalization
+        frequencies = torch.fft.rfftfreq(
+            n_fft, d = 1. / self.target_sample_hz, device = target_frames.device
+        )
+
+        bands = (
+            (0., 1_000., 0.25), (1_000., 2_000., 0.50),
+            (2_000., 4_000., 1.00),
+            (4_000., min(8_000., self.target_sample_hz / 2), 1.25),
+        )
+        losses, loss_weights, hf_values, hf_weights = [], [], [], []
+        quiet_count = quiet_mask.sum().clamp_min(1.)
+        margin = math.log(10.) / 10.
+        db_scale = 10. / math.log(10.)
+        for low_hz, high_hz, alpha in bands:
+            band_mask = (frequencies >= low_hz) & (frequencies < high_hz)
+            if high_hz <= low_hz or not band_mask.any():
+                continue
+            target_band = target_power[..., band_mask].mean(dim = -1)
+            recon_band = recon_power[..., band_mask].mean(dim = -1)
+            log_ratio = torch.log(recon_band + 1e-10) - torch.log(target_band + 1e-10)
+            excess = (F.relu(log_ratio - margin) * quiet_mask).sum() / quiet_count
+            losses.append(alpha * excess)
+            loss_weights.append(alpha)
+            if low_hz >= 2_000.:
+                excess_db = (F.relu(log_ratio * db_scale) * quiet_mask).sum() / quiet_count
+                hf_values.append(alpha * excess_db)
+                hf_weights.append(alpha)
+
+        loss = torch.stack(losses).sum() / max(sum(loss_weights), 1e-8) if losses else self.zero
+        quiet_hf_excess_db = (
+            torch.stack(hf_values).sum() / max(sum(hf_weights), 1e-8)
+            if hf_values else self.zero
+        )
+        return loss, quiet_hf_excess_db
+
+    def background_noise_losses(self, target, recon):
+        """Stage-specific pre-emphasis and quiet-frame multiband constraints."""
         if (
             self.preemph_loss_weight <= 0 and
             self.noise_floor_loss_weight <= 0
@@ -1277,87 +1346,24 @@ class SoundStream(Module):
 
         target_float = target.float()
         recon_float = recon.float()
-        preemphasis = 0.97
-        target_highpass = (
-            target_float[..., 1:] -
-            preemphasis * target_float[..., :-1]
-        )
-        recon_highpass = (
-            recon_float[..., 1:] -
-            preemphasis * recon_float[..., :-1]
-        )
+        preemph_loss = self.zero
+        if self.preemph_loss_weight > 0:
+            preemphasis = 0.97
+            target_highpass = (
+                target_float[..., 1:] -
+                preemphasis * target_float[..., :-1]
+            )
+            recon_highpass = (
+                recon_float[..., 1:] -
+                preemphasis * recon_float[..., :-1]
+            )
+            preemph_loss = F.l1_loss(recon_highpass, target_highpass)
 
-        preemph_loss = (
-            F.l1_loss(recon_highpass, target_highpass)
-            if self.preemph_loss_weight > 0
+        noise_floor_loss = (
+            self.quiet_multiband_noise_metrics(target_float, recon_float)[0]
+            if self.noise_floor_loss_weight > 0
             else self.zero
         )
-
-        noise_floor_loss = self.zero
-        if self.noise_floor_loss_weight > 0:
-            target_frames = target_float
-            if target_frames.ndim == 2:
-                target_frames = rearrange(target_frames, 'b n -> b 1 n')
-            if target_highpass.ndim == 2:
-                target_highpass = rearrange(target_highpass, 'b n -> b 1 n')
-                recon_highpass = rearrange(recon_highpass, 'b n -> b 1 n')
-
-            # 20 ms non-overlapping frames keep this diagnostic inexpensive.
-            frame_length = min(
-                max(1, int(round(0.020 * self.target_sample_hz))),
-                target_highpass.shape[-1]
-            )
-            target_frame_rms = F.avg_pool1d(
-                target_frames.square(),
-                kernel_size = frame_length,
-                stride = frame_length
-            ).clamp_min(1e-10).sqrt()
-            target_highpass_rms = F.avg_pool1d(
-                target_highpass.square(),
-                kernel_size = frame_length,
-                stride = frame_length
-            ).clamp_min(1e-10).sqrt()
-            recon_highpass_rms = F.avg_pool1d(
-                recon_highpass.square(),
-                kernel_size = frame_length,
-                stride = frame_length
-            ).clamp_min(1e-10).sqrt()
-
-            num_frames = min(
-                target_frame_rms.shape[-1],
-                target_highpass_rms.shape[-1],
-                recon_highpass_rms.shape[-1]
-            )
-            target_frame_rms = target_frame_rms[..., :num_frames]
-            target_highpass_rms = target_highpass_rms[..., :num_frames]
-            recon_highpass_rms = recon_highpass_rms[..., :num_frames]
-
-            # Use the quietest 30% of each example, with an absolute ceiling
-            # to avoid treating ordinary voiced frames as silence.
-            quiet_threshold = torch.quantile(
-                target_frame_rms.detach().float(),
-                0.30,
-                dim = -1,
-                keepdim = True
-            ).to(dtype = target_frame_rms.dtype)
-            quiet_threshold = quiet_threshold.clamp_max(0.03)
-            quiet_mask = (target_frame_rms <= quiet_threshold).to(
-                dtype = recon_highpass_rms.dtype
-            )
-
-            # A 10% margin prevents harmless measurement jitter from being
-            # optimized. Log ratios make the loss scale robust to loudness.
-            eps = 1e-5
-            log_excess = F.relu(
-                torch.log(recon_highpass_rms + eps) -
-                torch.log(target_highpass_rms + eps) -
-                math.log(1.10)
-            )
-            noise_floor_loss = (
-                (log_excess * quiet_mask).sum() /
-                quiet_mask.sum().clamp_min(1.)
-            )
-
         return preemph_loss, noise_floor_loss
 
     def generator_perceptual_losses(self, real, fake):
