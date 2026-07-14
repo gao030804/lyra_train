@@ -232,7 +232,7 @@ class ComplexSTFTDiscriminator(Module):
         win_length = 1024,
         stft_normalized = False,
         stft_window_fn = torch.hann_window,
-        logits_abs = True
+        logits_abs = False
     ):
         super().__init__()
         self.init_conv = ComplexConv2d(input_channels, channels, 7, padding = 3)
@@ -301,9 +301,16 @@ class ComplexSTFTDiscriminator(Module):
         complex_logits = self.final_conv(x)
 
         if self.logits_abs:
+            # Kept only as a compatibility option.  Magnitude logits are
+            # non-negative and therefore cannot satisfy the fake branch of a
+            # hinge discriminator (which requires D(fake) <= -1).
             complex_logits = complex_logits.abs()
         else:
-            complex_logits = torch.view_as_real(complex_logits)
+            # Hinge GAN needs one signed real-valued score per logit.  Do not
+            # use view_as_real here: treating real and imaginary parts as two
+            # independent logits gives the imaginary component an unrelated
+            # hinge target.
+            complex_logits = complex_logits.real
 
         if not return_intermediates:
             return complex_logits
@@ -601,7 +608,7 @@ class SoundStream(Module):
         finite_scalar_quantizer_levels: list[int] | None = None,
         rq_num_quantizers = 8,
         rq_commitment_weight = 1.,
-        rq_ema_decay = 0.95,
+        rq_ema_decay = 0.99,
         rq_quantize_dropout_multiple_of = 1,
         rq_quantize_dropout = True,
         rq_groups = 1,
@@ -647,7 +654,7 @@ class SoundStream(Module):
         attn_dynamic_pos_bias = False,
         use_gate_loop_layers = False,
         squeeze_excite = False,
-        complex_stft_discr_logits_abs = True,
+        complex_stft_discr_logits_abs = False,
         pad_mode = 'reflect',
         stft_discriminator: Module | None = None,  # can pass in own stft discriminator
         complex_stft_discr_kwargs: dict = dict()
@@ -813,7 +820,7 @@ class SoundStream(Module):
         if not exists(self.stft_discriminator):
             self.stft_discriminator = ComplexSTFTDiscriminator(
                 stft_normalized = stft_normalized,
-                logits_abs = complex_stft_discr_logits_abs,  # whether to output as abs() or use view_as_real
+                logits_abs = complex_stft_discr_logits_abs,
                 **complex_stft_discr_kwargs
             )
 
@@ -821,6 +828,7 @@ class SoundStream(Module):
 
         self.mel_spec_transforms = ModuleList([])
         self.mel_spec_recon_alphas = []
+        self.mel_spec_log_recon_alphas = []
         self.stft_recon_settings = []
         self.stft_recon_alphas = []
 
@@ -852,9 +860,11 @@ class SoundStream(Module):
             1024: 1.00,
             2048: 0.75
         }
+        # Short windows are auxiliary. Mid-scale STFTs dominate speech-formant
+        # reconstruction and reduce pressure to fit high-frequency spikes.
         stft_weight_by_win_length = {
-            64: 0.40,
-            128: 0.70,
+            64: 0.25,
+            128: 0.50,
             256: 1.00,
             512: 1.00,
             1024: 1.00,
@@ -881,6 +891,10 @@ class SoundStream(Module):
 
             self.mel_spec_transforms.append(melspec_transform)
             self.mel_spec_recon_alphas.append(alpha)
+            # SoundStream gives the log-Mel branch more frequency-resolution
+            # emphasis at long windows.  The final aggregation normalizes by
+            # the sum of these weights, so its scale stays stable.
+            self.mel_spec_log_recon_alphas.append(math.sqrt(win_length / 2))
             self.stft_recon_settings.append((
                 calculated_n_fft,
                 win_length,
@@ -955,27 +969,39 @@ class SoundStream(Module):
             self.energy_loss_weight * energy_loss
         )
 
-        spectral_losses = []
-        spectral_weights = []
-        for mel_transform, alpha in zip(
+        linear_spectral_losses = []
+        linear_spectral_weights = []
+        log_spectral_losses = []
+        log_spectral_weights = []
+        for mel_transform, linear_alpha, log_alpha in zip(
             self.mel_spec_transforms,
-            self.mel_spec_recon_alphas
+            self.mel_spec_recon_alphas,
+            self.mel_spec_log_recon_alphas
         ):
             target_mel, recon_mel = map(mel_transform, (target, recon))
             linear_loss = F.l1_loss(recon_mel, target_mel)
-            log_loss = F.l1_loss(
+            log_loss = F.mse_loss(
                 log(recon_mel, eps = 1e-5),
                 log(target_mel, eps = 1e-5)
             )
-            spectral_losses.append(alpha * (0.8 * linear_loss + log_loss))
-            spectral_weights.append(alpha)
+            linear_spectral_losses.append(0.8 * linear_alpha * linear_loss)
+            linear_spectral_weights.append(linear_alpha)
+            log_spectral_losses.append(log_alpha * log_loss)
+            log_spectral_weights.append(log_alpha)
 
-        spectral_loss = (
-            torch.stack(spectral_losses).sum() /
-            max(sum(spectral_weights), 1e-8)
-            if spectral_losses
+        linear_spectral_loss = (
+            torch.stack(linear_spectral_losses).sum() /
+            max(sum(linear_spectral_weights), 1e-8)
+            if linear_spectral_losses
             else self.zero
         )
+        log_spectral_loss = (
+            torch.stack(log_spectral_losses).sum() /
+            max(sum(log_spectral_weights), 1e-8)
+            if log_spectral_losses
+            else self.zero
+        )
+        spectral_loss = linear_spectral_loss + 0.5 * log_spectral_loss
 
         stft_loss = self.zero
         if self.stft_recon_loss_weight > 0:

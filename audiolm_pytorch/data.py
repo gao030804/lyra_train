@@ -90,6 +90,7 @@ class SoundDataset(Dataset):
             if exists(min_rms_db)
             else None
         )
+
         self.target_sample_hz = cast_tuple(target_sample_hz)
         num_outputs = len(self.target_sample_hz)
 
@@ -129,21 +130,27 @@ class SoundDataset(Dataset):
             if audio_length > max_length:
                 max_start = audio_length - max_length
                 if self.fixed_crop:
-                    starts = torch.linspace(0, max_start, steps = 10).long()
-                else:
-                    starts = torch.randint(0, max_start + 1, (10,))
-
-                candidates = [
-                    data[:, int(start):int(start) + max_length]
-                    for start in starts
-                ]
-                if exists(self.min_rms) or self.fixed_crop:
+                    # Preserve the deterministic overfit/debug behavior.
+                    starts = torch.linspace(
+                        0,
+                        max_start,
+                        steps = 10
+                    ).long()
+                    candidates = [
+                        data[:, int(start):int(start) + max_length]
+                        for start in starts
+                    ]
                     data = max(
                         candidates,
                         key = lambda candidate: candidate.square().mean().item()
                     )
                 else:
-                    data = candidates[0]
+                    # Use one uniformly random crop for every ordinary
+                    # training sample.  Do not rank candidate windows by RMS:
+                    # the codec must also model pauses, quiet speech, and the
+                    # real background-noise distribution.
+                    start = torch.randint(0, max_start + 1, ()).item()
+                    data = data[:, start:start + max_length]
             else:
                 data = F.pad(data, (0, max_length - audio_length), 'constant')
 

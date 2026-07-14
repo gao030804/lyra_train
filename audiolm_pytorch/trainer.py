@@ -279,6 +279,14 @@ class SoundStreamTrainer(nn.Module):
         plateau_lr_cooldown: int = 2,
         plateau_lr_min_lr: float = 2e-5,
         plateau_lr_unclean_grace_checks: int = 8,
+        plateau_lr_metric: str = 'aligned_si_sdr',
+        plateau_lr_update_discriminator: bool = False,
+        plateau_lr_discr_min_lr: float | None = None,
+        plateau_lr_require_quality_retention: bool = False,
+        generator_hold_steps: int = 0,
+        generator_hold_lr: float | None = None,
+        discriminator_hold_steps: int = 0,
+        discriminator_hold_lr: float | None = None,
         discr_warmup_steps: int | None = None,
         discr_scheduler: Type[LRScheduler] | None = None,
         discr_scheduler_kwargs: dict = dict(),
@@ -297,6 +305,7 @@ class SoundStreamTrainer(nn.Module):
         decoder_residual_scale_end: float = 1.,
         decoder_residual_scale_warmup_start_steps: int = 0,
         decoder_residual_scale_warmup_end_steps: int = 0,
+        best_checkpoint_min_step: int = 0,
         clean_gate: bool = True,
         clean_gate_min_aligned_si_sdr: float = 0.,
         clean_gate_min_aligned_corr: float = 0.65,
@@ -307,6 +316,12 @@ class SoundStreamTrainer(nn.Module):
         clean_gate_max_click_score: float = 6.,
         clean_gate_max_jump_ratio: float = 2.,
         clean_gate_max_p999_jump_ratio: float = 1.75,
+        quality_retention_gate: bool = False,
+        quality_retention_max_aligned_si_sdr_drop: float = 0.30,
+        quality_retention_max_aligned_corr_drop: float = 0.02,
+        quality_retention_max_quiet_hf_excess_db_rise: float = 0.50,
+        quality_retention_patience: int = 3,
+        quality_retention_rvq_patience: int = 2,
         early_stopping_patience: int | None = None,
         early_stopping_min_delta: float = 0.,
         early_stopping_min_steps: int = 0,
@@ -316,6 +331,7 @@ class SoundStreamTrainer(nn.Module):
         gan_adversarial_max: float = 0.1,
         gan_feature_max: float = 10.,
         freeze_codebook_after_step: int | None = None,
+        freeze_codebook_before_step: int | None = None,
         freeze_codebook_during_training: bool = False,
         log_losses_every: int = 1,
         results_folder: str = './results',
@@ -403,10 +419,12 @@ class SoundStreamTrainer(nn.Module):
         assert decoder_residual_scale_end >= 0.
         assert decoder_residual_scale_warmup_start_steps >= 0
         assert decoder_residual_scale_warmup_end_steps >= decoder_residual_scale_warmup_start_steps
+        assert best_checkpoint_min_step >= 0
         self.decoder_residual_scale_start = decoder_residual_scale_start
         self.decoder_residual_scale_end = decoder_residual_scale_end
         self.decoder_residual_scale_warmup_start_steps = decoder_residual_scale_warmup_start_steps
         self.decoder_residual_scale_warmup_end_steps = decoder_residual_scale_warmup_end_steps
+        self.best_checkpoint_min_step = best_checkpoint_min_step
         self.clean_gate = clean_gate
         self.clean_gate_min_aligned_si_sdr = clean_gate_min_aligned_si_sdr
         self.clean_gate_min_aligned_corr = clean_gate_min_aligned_corr
@@ -417,6 +435,20 @@ class SoundStreamTrainer(nn.Module):
         self.clean_gate_max_click_score = clean_gate_max_click_score
         self.clean_gate_max_jump_ratio = clean_gate_max_jump_ratio
         self.clean_gate_max_p999_jump_ratio = clean_gate_max_p999_jump_ratio
+        assert quality_retention_max_aligned_si_sdr_drop >= 0.
+        assert quality_retention_max_aligned_corr_drop >= 0.
+        assert quality_retention_max_quiet_hf_excess_db_rise >= 0.
+        assert quality_retention_patience > 0
+        assert quality_retention_rvq_patience > 0
+        self.quality_retention_gate = quality_retention_gate
+        self.quality_retention_max_aligned_si_sdr_drop = quality_retention_max_aligned_si_sdr_drop
+        self.quality_retention_max_aligned_corr_drop = quality_retention_max_aligned_corr_drop
+        self.quality_retention_max_quiet_hf_excess_db_rise = quality_retention_max_quiet_hf_excess_db_rise
+        self.quality_retention_patience = quality_retention_patience
+        self.quality_retention_rvq_patience = quality_retention_rvq_patience
+        self.quality_retention_baseline = None
+        self.quality_retention_bad_evals = 0
+        self.quality_retention_rvq_bad_evals = 0
 
         hyperparameters = {
             "num_train_steps": num_train_steps,
@@ -436,6 +468,9 @@ class SoundStreamTrainer(nn.Module):
             scheduler_kwargs = scheduler_kwargs,
             warmup_steps = warmup_steps
         )
+        # Keep the undampened target LR so a temporary Stage-2 retention cap
+        # can be released exactly at its configured boundary.
+        self.generator_hold_base_lrs = tuple(self.optim.warmup.lrs)
 
         assert plateau_lr_start_steps >= 0
         assert 0. < plateau_lr_factor < 1.
@@ -443,7 +478,16 @@ class SoundStreamTrainer(nn.Module):
         assert plateau_lr_threshold >= 0.
         assert plateau_lr_cooldown >= 0
         assert plateau_lr_min_lr >= 0.
+        assert plateau_lr_metric in {'aligned_si_sdr', 'score'}
         assert plateau_lr_unclean_grace_checks >= 0
+        plateau_lr_discr_min_lr = default(
+            plateau_lr_discr_min_lr,
+            plateau_lr_min_lr
+        )
+        assert plateau_lr_discr_min_lr >= 0.
+        assert generator_hold_steps >= 0
+        if exists(generator_hold_lr):
+            assert generator_hold_lr > 0.
         self.plateau_lr_enabled = plateau_lr_enabled
         self.plateau_lr_start_steps = plateau_lr_start_steps
         self.plateau_lr_factor = plateau_lr_factor
@@ -451,7 +495,18 @@ class SoundStreamTrainer(nn.Module):
         self.plateau_lr_threshold = plateau_lr_threshold
         self.plateau_lr_cooldown = plateau_lr_cooldown
         self.plateau_lr_min_lr = plateau_lr_min_lr
+        self.plateau_lr_metric = plateau_lr_metric
         self.plateau_lr_unclean_grace_checks = plateau_lr_unclean_grace_checks
+        self.plateau_lr_update_discriminator = plateau_lr_update_discriminator
+        self.plateau_lr_discr_min_lr = plateau_lr_discr_min_lr
+        self.plateau_lr_require_quality_retention = plateau_lr_require_quality_retention
+        self.generator_hold_steps = generator_hold_steps
+        self.generator_hold_lr = generator_hold_lr
+        assert discriminator_hold_steps >= 0
+        if exists(discriminator_hold_lr):
+            assert discriminator_hold_lr > 0.
+        self.discriminator_hold_steps = discriminator_hold_steps
+        self.discriminator_hold_lr = discriminator_hold_lr
         self.plateau_lr_unclean_checks = 0
         # Build this after the trainer modules are passed through
         # accelerator.prepare().  Otherwise the scheduler can hold a reference
@@ -477,6 +532,15 @@ class SoundStreamTrainer(nn.Module):
             scheduler = discr_scheduler,
             scheduler_kwargs = discr_scheduler_kwargs,
             warmup_steps = discr_warmup_steps
+        )
+        self.discriminator_hold_base_lrs = {
+            name: tuple(
+                group['lr'] for group in optimizer.optimizer.param_groups
+            )
+            for name, optimizer in self.multiscale_discriminator_optim_iter()
+        }
+        self.discriminator_hold_base_lrs['stft'] = tuple(
+            group['lr'] for group in self.discr_optim.optimizer.param_groups
         )
 
         # max grad norm
@@ -736,7 +800,9 @@ class SoundStreamTrainer(nn.Module):
         self.gan_adversarial_max = gan_adversarial_max
         self.gan_feature_max = gan_feature_max
         assert not exists(freeze_codebook_after_step) or freeze_codebook_after_step >= 0
+        assert not exists(freeze_codebook_before_step) or freeze_codebook_before_step >= 0
         self.freeze_codebook_after_step = freeze_codebook_after_step
+        self.freeze_codebook_before_step = freeze_codebook_before_step
         self.freeze_codebook_during_training = freeze_codebook_during_training
 
         self.apply_grad_penalty_every = apply_grad_penalty_every
@@ -822,6 +888,9 @@ class SoundStreamTrainer(nn.Module):
             best_aligned_si_sdr = self.best_aligned_si_sdr,
             early_stopping_bad_evals = self.early_stopping_bad_evals,
             early_stopping_triggered = self.early_stopping_triggered,
+            quality_retention_baseline = self.quality_retention_baseline,
+            quality_retention_bad_evals = self.quality_retention_bad_evals,
+            quality_retention_rvq_bad_evals = self.quality_retention_rvq_bad_evals,
             trainer_step = trainer_step,
             version = __version__
         )
@@ -1186,6 +1255,34 @@ class SoundStreamTrainer(nn.Module):
         target_clip_fraction = (target.abs() >= 0.98).float().mean()
         recon_clip_fraction = (recon.abs() >= 0.98).float().mean()
 
+        # Validation-only DC / very-low-frequency diagnostics. Keep target and
+        # reconstruction untouched: correlation may center internally, but codec
+        # output is never de-meaned or filtered here.
+        target_dc = target.mean(dim = -1).mean()
+        recon_dc = recon.mean(dim = -1).mean()
+        dc_abs_error = (
+            target.mean(dim = -1) - recon.mean(dim = -1)
+        ).abs().mean()
+        low_n_fft = min(1024, target.shape[-1], recon.shape[-1])
+        if low_n_fft >= 2:
+            target_low_spec = torch.fft.rfft(target.float(), n = low_n_fft, dim = -1)
+            recon_low_spec = torch.fft.rfft(recon.float(), n = low_n_fft, dim = -1)
+            low_bin_count = min(
+                target_low_spec.shape[-1],
+                max(1, int(50 * low_n_fft / model.target_sample_hz) + 1)
+            )
+            target_low_freq_0_50_power = target_low_spec[..., :low_bin_count].abs().square().mean()
+            recon_low_freq_0_50_power = recon_low_spec[..., :low_bin_count].abs().square().mean()
+            target_low_freq_0_50_db = 10 * torch.log10(target_low_freq_0_50_power.clamp_min(1e-12))
+            recon_low_freq_0_50_db = 10 * torch.log10(recon_low_freq_0_50_power.clamp_min(1e-12))
+            low_freq_0_50_excess_db = recon_low_freq_0_50_db - target_low_freq_0_50_db
+            low_freq_0_50_abs_error_db = low_freq_0_50_excess_db.abs()
+        else:
+            target_low_freq_0_50_db = target.new_tensor(0.)
+            recon_low_freq_0_50_db = target.new_tensor(0.)
+            low_freq_0_50_excess_db = target.new_tensor(0.)
+            low_freq_0_50_abs_error_db = target.new_tensor(0.)
+
         if target.shape[-1] > 1 and recon.shape[-1] > 1:
             target_jump = target.diff(dim = -1).abs()
             recon_jump = recon.diff(dim = -1).abs()
@@ -1301,7 +1398,7 @@ class SoundStreamTrainer(nn.Module):
                 (aligned_correlation >= 0.5) &
                 (aligned_si_sdr >= -5.)
             )
-        elif self.best_checkpoint_metric == 'recon_pretrain':
+        elif self.best_checkpoint_metric in ('recon_pretrain', 'spectral_refine'):
             validation_eligible = (
                 validation_eligible &
                 (aligned_correlation >= 0.5) &
@@ -1340,6 +1437,13 @@ class SoundStreamTrainer(nn.Module):
             rms_ratio = float(rms_ratio.detach().cpu()),
             target_peak = float(target_peak.detach().cpu()),
             recon_peak = float(recon_peak.detach().cpu()),
+            target_dc = float(target_dc.detach().cpu()),
+            recon_dc = float(recon_dc.detach().cpu()),
+            dc_abs_error = float(dc_abs_error.detach().cpu()),
+            target_low_freq_0_50_db = float(target_low_freq_0_50_db.detach().cpu()),
+            recon_low_freq_0_50_db = float(recon_low_freq_0_50_db.detach().cpu()),
+            low_freq_0_50_excess_db = float(low_freq_0_50_excess_db.detach().cpu()),
+            low_freq_0_50_abs_error_db = float(low_freq_0_50_abs_error_db.detach().cpu()),
             target_clip_fraction = float(target_clip_fraction.detach().cpu()),
             recon_clip_fraction = float(recon_clip_fraction.detach().cpu()),
             target_max_jump = float(target_max_jump.detach().cpu()),
@@ -1943,6 +2047,50 @@ class SoundStreamTrainer(nn.Module):
 
         return reasons
 
+    @property
+    def has_quality_retention_baseline(self):
+        return isinstance(self.quality_retention_baseline, dict)
+
+    def set_quality_retention_baseline(self, metrics):
+        required = (
+            'aligned_si_sdr',
+            'aligned_correlation',
+            'quiet_hf_excess_db',
+        )
+        missing = [key for key in required if key not in metrics]
+        if missing:
+            raise KeyError(f"quality-retention baseline missing metrics: {missing}")
+        self.quality_retention_baseline = {
+            key: float(metrics[key]) for key in required
+        }
+        self.quality_retention_bad_evals = 0
+        self.quality_retention_rvq_bad_evals = 0
+
+    def quality_retention_failure_reasons(self, metrics):
+        if not self.quality_retention_gate or not self.has_quality_retention_baseline:
+            return []
+
+        baseline = self.quality_retention_baseline
+        reasons = []
+        if metrics.get('aligned_si_sdr', float('-inf')) < (
+            baseline['aligned_si_sdr'] - self.quality_retention_max_aligned_si_sdr_drop
+        ):
+            reasons.append('aligned_si_sdr')
+        if metrics.get('aligned_correlation', float('-inf')) < (
+            baseline['aligned_correlation'] - self.quality_retention_max_aligned_corr_drop
+        ):
+            reasons.append('aligned_corr')
+        if metrics.get('quiet_hf_excess_db', float('inf')) > (
+            baseline['quiet_hf_excess_db'] +
+            self.quality_retention_max_quiet_hf_excess_db_rise
+        ):
+            reasons.append('quiet_hf')
+        if metrics.get('q00_validation_eligible', 0.) < 0.5:
+            reasons.append('q00')
+        if metrics.get('q01_validation_eligible', 0.) < 0.5:
+            reasons.append('q01')
+        return reasons
+
     def evaluate_fixed_validation_score(self, model):
         totals = Counter()
         total_code_counts = None
@@ -1978,16 +2126,21 @@ class SoundStreamTrainer(nn.Module):
             averaged_metrics.get('codebook_q00_active_ratio', 0.) >= 0.30 and
             averaged_metrics.get('codebook_q00_perplexity', 0.) >= 16.
         )
+        q01_eligible = (
+            averaged_metrics.get('codebook_q01_active_ratio', 0.) >= 0.30 and
+            averaged_metrics.get('codebook_q01_perplexity', 0.) >= 16.
+        )
         rvq_eligible = (
             averaged_metrics.get('active_code_ratio', 0.) >= 0.25 and
             averaged_metrics.get('codebook_perplexity', 0.) >= 20. and
             averaged_metrics.get('codebook_collapsed_quantizers', 0) <= 2
         )
         averaged_metrics['q00_validation_eligible'] = float(q00_eligible)
+        averaged_metrics['q01_validation_eligible'] = float(q01_eligible)
         averaged_metrics['rvq_validation_eligible'] = float(rvq_eligible)
         clean_eligible = self.clean_gate_passes(averaged_metrics)
         averaged_metrics['clean_validation_eligible'] = float(clean_eligible)
-        if self.best_checkpoint_metric in ('recon_pretrain', 'gan_pretrain'):
+        if self.best_checkpoint_metric in ('recon_pretrain', 'spectral_refine', 'gan_pretrain'):
             # Stage-1 depends on a healthy full RVQ stack. Avoid selecting
             # checkpoints whose aggregate score improves after q00 or later
             # residual quantizers have collapsed. Stage-2 starts from that
@@ -2018,7 +2171,7 @@ class SoundStreamTrainer(nn.Module):
 
         return ReduceLROnPlateau(
             self.optim.optimizer,
-            mode = 'max',
+            mode = 'min' if self.plateau_lr_metric == 'score' else 'max',
             factor = self.plateau_lr_factor,
             patience = self.plateau_lr_patience,
             threshold = self.plateau_lr_threshold,
@@ -2039,6 +2192,39 @@ class SoundStreamTrainer(nn.Module):
             group['lr'] = float(lr)
 
         self.optim.sync_warmup_lrs_from_optimizer()
+
+    def scale_discriminator_lrs_from_plateau(self, factor):
+        """Apply a generator plateau reduction to every Stage-2 discriminator.
+
+        The discriminator has no independent validation target. Scaling it by
+        the actual generator LR ratio preserves the intended 1:2 G:D schedule,
+        including a final partial reduction when either minimum LR is reached.
+        """
+        if not self.plateau_lr_update_discriminator:
+            return []
+
+        optimizers = [
+            ('stft', self.discr_optim),
+            *self.multiscale_discriminator_optim_iter(),
+        ]
+        changes = []
+        for name, discriminator_optim in optimizers:
+            old_lrs = [
+                group['lr']
+                for group in discriminator_optim.optimizer.param_groups
+            ]
+            for group in discriminator_optim.optimizer.param_groups:
+                group['lr'] = max(
+                    group['lr'] * factor,
+                    self.plateau_lr_discr_min_lr
+                )
+            discriminator_optim.sync_warmup_lrs_from_optimizer()
+            new_lrs = [
+                group['lr']
+                for group in discriminator_optim.optimizer.param_groups
+            ]
+            changes.append((name, old_lrs, new_lrs))
+        return changes
 
     def load(self, path):
         path = Path(path)
@@ -2084,6 +2270,9 @@ class SoundStreamTrainer(nn.Module):
         self.best_aligned_si_sdr = pkg.get('best_aligned_si_sdr', float('-inf'))
         self.early_stopping_bad_evals = pkg.get('early_stopping_bad_evals', 0)
         self.early_stopping_triggered = pkg.get('early_stopping_triggered', False)
+        self.quality_retention_baseline = pkg.get('quality_retention_baseline')
+        self.quality_retention_bad_evals = pkg.get('quality_retention_bad_evals', 0)
+        self.quality_retention_rvq_bad_evals = pkg.get('quality_retention_rvq_bad_evals', 0)
 
         for key, _ in self.multiscale_discriminator_iter():
             discr_optim = getattr(self, key)
@@ -2269,6 +2458,74 @@ class SoundStreamTrainer(nn.Module):
         model.set_decoder_residual_scale(scale)
         return scale
 
+    def cap_generator_lr_for_retention(self, steps):
+        """Cap early Stage-2 generator updates without disturbing warmup/plateau.
+
+        The cap is applied immediately before the optimizer update.  It leaves
+        the standard initial warmup intact when it is already below the cap,
+        and it ends cleanly before GAN/discriminator training begins.
+        """
+        current_lr = self.optim.optimizer.param_groups[0]['lr']
+        if (
+            exists(self.generator_hold_lr) and
+            steps < self.generator_hold_steps
+        ):
+            applied_lr = min(current_lr, self.generator_hold_lr)
+            for group in self.optim.optimizer.param_groups:
+                group['lr'] = min(group['lr'], self.generator_hold_lr)
+            return applied_lr
+
+        if (
+            exists(self.generator_hold_lr) and
+            steps == self.generator_hold_steps
+        ):
+            for group, base_lr in zip(
+                self.optim.optimizer.param_groups,
+                self.generator_hold_base_lrs,
+            ):
+                group['lr'] = base_lr
+            self.optim.sync_warmup_lrs_from_optimizer()
+            return self.generator_hold_base_lrs[0]
+
+        return current_lr
+
+    def cap_discriminator_lr_for_retention(self, steps):
+        """Keep every Stage-2 discriminator conservative during GAN ramp-up.
+
+        The discriminator still trains from step zero, but its learning rate is
+        capped until the generator has spent the full retention/ramp window
+        adapting to adversarial gradients.  The cap covers both the STFT and
+        waveform-scale discriminators and is released to their configured base
+        rate at one shared step.
+        """
+        optimizers = [('stft', self.discr_optim), *self.multiscale_discriminator_optim_iter()]
+        current_lr = self.discr_optim.optimizer.param_groups[0]['lr']
+
+        if (
+            exists(self.discriminator_hold_lr) and
+            steps < self.discriminator_hold_steps
+        ):
+            for _, optimizer in optimizers:
+                for group in optimizer.optimizer.param_groups:
+                    group['lr'] = min(group['lr'], self.discriminator_hold_lr)
+                optimizer.sync_warmup_lrs_from_optimizer()
+            return self.discriminator_hold_lr
+
+        if (
+            exists(self.discriminator_hold_lr) and
+            steps == self.discriminator_hold_steps
+        ):
+            for name, optimizer in optimizers:
+                for group, base_lr in zip(
+                    optimizer.optimizer.param_groups,
+                    self.discriminator_hold_base_lrs[name],
+                ):
+                    group['lr'] = base_lr
+                optimizer.sync_warmup_lrs_from_optimizer()
+            return self.discriminator_hold_base_lrs['stft'][0]
+
+        return current_lr
+
     def update_discriminators(self, device, steps, logs):
         apply_grad_penalty = (
             self.apply_grad_penalty_every > 0 and
@@ -2360,6 +2617,7 @@ class SoundStreamTrainer(nn.Module):
         transient_loss_progress = self.update_transient_loss_weights(steps)
         freeze_codebook = (
             self.freeze_codebook_during_training or
+            (exists(self.freeze_codebook_before_step) and steps < self.freeze_codebook_before_step) or
             (exists(self.freeze_codebook_after_step) and steps >= self.freeze_codebook_after_step)
         )
         decoder_residual_scale = self.update_decoder_residual_scale(steps)
@@ -2437,11 +2695,15 @@ class SoundStreamTrainer(nn.Module):
         if exists(self.max_grad_norm):
             self.accelerator.clip_grad_norm_(self.soundstream.parameters(), self.max_grad_norm)
 
+        generator_update_lr = self.cap_generator_lr_for_retention(steps)
         self.optim.step()
         self.optim.zero_grad()
 
         if self.enable_gan and gan_progress > 0:
+            discriminator_update_lr = self.cap_discriminator_lr_for_retention(steps)
             self.update_discriminators(device, steps, logs)
+        else:
+            discriminator_update_lr = self.discr_optim.optimizer.param_groups[0]['lr']
 
         # build pretty printed losses
 
@@ -2487,8 +2749,10 @@ class SoundStreamTrainer(nn.Module):
             f"feature={logs['feature_loss']:.6f}"
             f"(w={model.feature_loss_weight:.4g}) | "
             f"gan_ramp={gan_progress:.4f} | "
-            f"lr_g={generator_lr:.3e} | "
-            f"lr_d={discriminator_lr:.3e}"
+            f"lr_g_update={generator_update_lr:.3e} | "
+            f"lr_g_next={generator_lr:.3e} | "
+            f"lr_d_update={discriminator_update_lr:.3e} | "
+            f"lr_d_next={discriminator_lr:.3e}"
         )
 
         if log_losses:
@@ -2633,10 +2897,18 @@ class SoundStreamTrainer(nn.Module):
             if self.use_ema:
                 candidate_models.append(('ema', ema_model, ema_score))
 
+            quality_reasons = {
+                name: self.quality_retention_failure_reasons(metrics)
+                for name, _, metrics in candidate_models
+            }
             eligible_candidates = [
                 (name, model, metrics)
                 for name, model, metrics in candidate_models
-                if metrics['validation_eligible'] >= 0.5
+                if (
+                    steps >= self.best_checkpoint_min_step and
+                    metrics['validation_eligible'] >= 0.5 and
+                    not quality_reasons[name]
+                )
             ]
             if eligible_candidates:
                 selected_name, selected_model, selected_metrics = min(
@@ -2714,6 +2986,9 @@ class SoundStreamTrainer(nn.Module):
                 f"online_env_high={online_score.get('spectral_envelope_high', 0.):.4f}, "
                 f"online_voiced={online_score.get('spectral_envelope_voiced_fraction', 0.):.3f}, "
                 f"online_quiet_hf_excess_db={online_score.get('quiet_hf_excess_db', 0.):.2f}, "
+                f"online_target_dc={online_score.get('target_dc', 0.):+.5f}, "
+                f"online_recon_dc={online_score.get('recon_dc', 0.):+.5f}, "
+                f"online_lf0_50_excess_db={online_score.get('low_freq_0_50_excess_db', 0.):+.2f}, "
                 f"online_peak={online_score.get('recon_peak', 0.):.3f}, "
                 f"online_clip={online_score.get('recon_clip_fraction', 0.) * 100:.3f}%, "
                 f"online_jump_ratio={online_score.get('jump_ratio', 0.):.2f}, "
@@ -2723,6 +2998,7 @@ class SoundStreamTrainer(nn.Module):
                 f"online_active_codes={online_score['active_code_ratio']:.3f}, "
                 f"online_perplexity={online_score['codebook_perplexity']:.1f}, "
                 f"online_q00_ok={online_score.get('q00_validation_eligible', 0.):.0f}, "
+                f"online_q01_ok={online_score.get('q01_validation_eligible', 0.):.0f}, "
                 f"online_rvq_ok={online_score.get('rvq_validation_eligible', 0.):.0f}, "
                 f"online_collapsed_q={int(online_score.get('codebook_collapsed_quantizers', 0))} | "
                 f"best_aligned_si_sdr={self.best_aligned_si_sdr:.3f}, "
@@ -2738,32 +3014,87 @@ class SoundStreamTrainer(nn.Module):
                     f"{self.format_codebook_diagnostics(ema_score)}"
                 )
 
+            if self.quality_retention_gate:
+                passing_candidates = [
+                    name for name, _, _ in candidate_models
+                    if not quality_reasons[name]
+                ]
+                if passing_candidates:
+                    self.quality_retention_bad_evals = 0
+                    self.quality_retention_rvq_bad_evals = 0
+                else:
+                    self.quality_retention_bad_evals += 1
+                    rvq_bad = all(
+                        ('q00' in quality_reasons[name] or 'q01' in quality_reasons[name])
+                        for name, _, _ in candidate_models
+                    )
+                    self.quality_retention_rvq_bad_evals = (
+                        self.quality_retention_rvq_bad_evals + 1 if rvq_bad else 0
+                    )
+                    online_quality_fail = ','.join(quality_reasons['online']) or 'none'
+                    self.print(
+                        f"{steps}: Stage-2 quality retention gate rejected all candidates "
+                        f"(online_fail={online_quality_fail}, "
+                        f"quality_bad={self.quality_retention_bad_evals}/"
+                        f"{self.quality_retention_patience}, rvq_bad="
+                        f"{self.quality_retention_rvq_bad_evals}/"
+                        f"{self.quality_retention_rvq_patience})"
+                    )
+                    if (
+                        self.quality_retention_bad_evals >= self.quality_retention_patience or
+                        self.quality_retention_rvq_bad_evals >= self.quality_retention_rvq_patience
+                    ):
+                        self.early_stopping_triggered = True
+                        self.save(str(self.results_folder / 'latest.pt'))
+                        self.print(
+                            f"{steps}: Stage-2 quality retention hard stop triggered; "
+                            "the initialized reconstruction baseline was not preserved."
+                        )
+
             if exists(self.plateau_scheduler):
-                plateau_metric = float(
-                    online_score.get('aligned_si_sdr', float('-inf'))
+                plateau_default = (
+                    float('inf')
+                    if self.plateau_lr_metric == 'score'
+                    else float('-inf')
                 )
-                plateau_clean_ready = (
-                    online_score.get('clean_validation_eligible', 0.) >= 0.5
+                plateau_metric = float(
+                    online_score.get(self.plateau_lr_metric, plateau_default)
                 )
                 plateau_after_start = steps >= self.plateau_lr_start_steps
                 plateau_unclean_fallback = False
-                if plateau_after_start and isfinite(plateau_metric):
-                    if plateau_clean_ready:
-                        self.plateau_lr_unclean_checks = 0
-                    else:
-                        self.plateau_lr_unclean_checks += 1
-                        plateau_unclean_fallback = (
-                            self.plateau_lr_unclean_checks >=
-                            self.plateau_lr_unclean_grace_checks
-                        )
-                plateau_ready = (
-                    plateau_after_start and
-                    isfinite(plateau_metric) and
-                    (
-                        plateau_clean_ready or
-                        plateau_unclean_fallback
-                    )
+                plateau_quality_ready = (
+                    not self.plateau_lr_require_quality_retention or
+                    not self.quality_retention_failure_reasons(online_score)
                 )
+                if self.plateau_lr_require_quality_retention:
+                    # Stage-2 must not lower LR merely because GAN training is
+                    # plateauing while it is already regressing from Stage 1.5.
+                    plateau_ready = (
+                        plateau_after_start and
+                        isfinite(plateau_metric) and
+                        plateau_quality_ready
+                    )
+                else:
+                    plateau_clean_ready = (
+                        online_score.get('clean_validation_eligible', 0.) >= 0.5
+                    )
+                    if plateau_after_start and isfinite(plateau_metric):
+                        if plateau_clean_ready:
+                            self.plateau_lr_unclean_checks = 0
+                        else:
+                            self.plateau_lr_unclean_checks += 1
+                            plateau_unclean_fallback = (
+                                self.plateau_lr_unclean_checks >=
+                                self.plateau_lr_unclean_grace_checks
+                            )
+                    plateau_ready = (
+                        plateau_after_start and
+                        isfinite(plateau_metric) and
+                        (
+                            plateau_clean_ready or
+                            plateau_unclean_fallback
+                        )
+                    )
                 if plateau_ready:
                     plateau_metric_tensor[0] = plateau_metric
                     plateau_metric_tensor[1] = 1.
@@ -2876,26 +3207,49 @@ class SoundStreamTrainer(nn.Module):
                     group['lr']
                     for group in self.optim.optimizer.param_groups
                 ]
+                lr_changed = any(
+                    abs(old_lr_i - new_lr_i) > 1e-12
+                    for old_lr_i, new_lr_i in zip(old_lrs, new_lrs)
+                )
+                discr_lr_changes = []
+                if lr_changed and old_lrs[0] > 0.:
+                    discr_lr_changes = self.scale_discriminator_lrs_from_plateau(
+                        new_lrs[0] / old_lrs[0]
+                    )
                 if self.is_main:
                     old_lr = old_lrs[0]
                     new_lr = new_lrs[0]
-                    lr_changed = any(
-                        abs(old_lr_i - new_lr_i) > 1e-12
-                        for old_lr_i, new_lr_i in zip(old_lrs, new_lrs)
+                    metric_name = f"online_{self.plateau_lr_metric}"
+                    metric_value = (
+                        f"{plateau_metric:.6f}"
+                        if self.plateau_lr_metric == 'score'
+                        else f"{plateau_metric:.3f}"
+                    )
+                    source = (
+                        'quality_retention'
+                        if self.plateau_lr_require_quality_retention
+                        else ('unclean_fallback' if plateau_unclean_fallback else 'clean')
                     )
                     if lr_changed:
+                        discr_summary = ''
+                        if discr_lr_changes:
+                            _, old_discr_lrs, new_discr_lrs = discr_lr_changes[0]
+                            discr_summary = (
+                                f"; discriminator LR {old_discr_lrs[0]:.3e} "
+                                f"to {new_discr_lrs[0]:.3e}"
+                            )
                         self.print(
                             f"{steps}: ReduceLROnPlateau lowered generator LR "
-                            f"from {old_lr:.3e} to {new_lr:.3e} "
-                            f"(online_aligned_si_sdr={plateau_metric:.3f}, "
-                            f"source={'unclean_fallback' if plateau_unclean_fallback else 'clean'})"
+                            f"from {old_lr:.3e} to {new_lr:.3e}{discr_summary} "
+                            f"({metric_name}={metric_value}, "
+                            f"source={source})"
                         )
                     else:
                         self.print(
                             f"{steps}: ReduceLROnPlateau observed "
-                            f"online_aligned_si_sdr={plateau_metric:.3f}; "
+                            f"{metric_name}={metric_value}; "
                             f"generator_lr={new_lr:.3e}; "
-                            f"source={'unclean_fallback' if plateau_unclean_fallback else 'clean'}"
+                            f"source={source}"
                         )
             elif self.is_main:
                 inactive_reasons = []
@@ -2904,8 +3258,19 @@ class SoundStreamTrainer(nn.Module):
                         f"before_start_step_{self.plateau_lr_start_steps}"
                     )
                 if not isfinite(plateau_metric):
-                    inactive_reasons.append("invalid_online_aligned_si_sdr")
-                if (
+                    inactive_reasons.append(
+                        f"invalid_online_{self.plateau_lr_metric}"
+                    )
+                if self.plateau_lr_require_quality_retention:
+                    quality_reasons = (
+                        self.quality_retention_failure_reasons(online_score)
+                        if 'online_score' in locals() else ['missing_online_score']
+                    )
+                    if quality_reasons:
+                        inactive_reasons.append(
+                            "quality_retention:" + ",".join(quality_reasons)
+                        )
+                elif (
                     'online_score' in locals() and
                     online_score.get('clean_validation_eligible', 0.) < 0.5
                 ):

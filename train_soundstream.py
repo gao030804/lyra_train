@@ -36,10 +36,14 @@ DEFAULT_AUDIO_DIR = (
 STAGE_RESULTS_DIRS = {
     "overfit": PROJECT_DIR / "results" / "overfit-64d-23q",
     "recon_pretrain": PROJECT_DIR / "results" / "recon-pretrain-64d-23q",
+    "spectral_refine": PROJECT_DIR / "results" / "stage1-spectral-refine-64d-23q",
     "gan_pretrain": PROJECT_DIR / "results" / "gan-pretrain-64d-23q",
     "stream_finetune": PROJECT_DIR / "results" / "stream-finetune-64d-23q",
     "stream_finetune_long": PROJECT_DIR / "results" / "stream-finetune-long-64d-23q",
 }
+
+RECONSTRUCTION_STAGES = frozenset(("recon_pretrain", "spectral_refine", "gan_pretrain"))
+GAN_STAGES = frozenset(("gan_pretrain", "stream_finetune", "stream_finetune_long"))
 
 STAGE_DEFAULTS = {
     "overfit": dict(
@@ -60,28 +64,60 @@ STAGE_DEFAULTS = {
         ema_update_after_step=0, ema_update_every=1,
         use_ema=True,
         click_loss_weight=0., jump_loss_weight=0.,
-        preemph_loss_weight=0., noise_floor_loss_weight=0.05,
+        preemph_loss_weight=0., noise_floor_loss_weight=0.03,
         transient_loss_warmup_steps=15_000,
         spectral_envelope_loss_weight=0.05,
         spectral_envelope_loss_start_steps=5_000,
         spectral_envelope_loss_warmup_steps=10_000,
         stft_recon_loss_weight=0.,
+        si_sdr_loss_weight=0.07,
+        si_sdr_loss_start_steps=5_000,
+        si_sdr_loss_warmup_steps=15_000,
         gan_start=0, gan_ramp=0,
+        gan_adversarial_max=0., gan_feature_max=0.,
+    ),
+    # Stage 1.5 starts from the validation-selected stage-1 codec. It keeps
+    # RVQ trainable and only adds a small spectral refinement objective.
+    "spectral_refine": dict(
+        steps=10_000, batch_size=4, segment_seconds=4.,
+        save_every=1_000, eval_every=250, min_steps=5_000, patience=30,
+        lr=1e-5, discr_lr=None, ema_beta=0.999,
+        ema_update_after_step=0, ema_update_every=1,
+        use_ema=True,
+        click_loss_weight=0., jump_loss_weight=0.,
+        preemph_loss_weight=0., noise_floor_loss_weight=0.03,
+        transient_loss_warmup_steps=0,
+        spectral_envelope_loss_weight=0.05,
+        spectral_envelope_loss_start_steps=0,
+        spectral_envelope_loss_warmup_steps=0,
+        stft_recon_loss_weight=0.10,
+        si_sdr_loss_weight=0.03,
+        si_sdr_loss_start_steps=0,
+        si_sdr_loss_warmup_steps=0,
+        gan_start=0, gan_ramp=0,
+        gan_adversarial_max=0., gan_feature_max=0.,
     ),
     "gan_pretrain": dict(
-        steps=100_000, batch_size=4, segment_seconds=4.,
+        steps=200_000, batch_size=4, segment_seconds=4.,
         save_every=5_000, eval_every=500, min_steps=30_000, patience=30,
-        lr=5e-5, discr_lr=5e-5, ema_beta=0.999,
+        lr=1e-5, discr_lr=2e-5, ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
+        use_ema=True,
         click_loss_weight=0., jump_loss_weight=0.,
         preemph_loss_weight=0., noise_floor_loss_weight=0.02,
         transient_loss_warmup_steps=0,
-        spectral_envelope_loss_weight=0.01,
+        spectral_envelope_loss_weight=0.,
         spectral_envelope_loss_start_steps=0,
-        spectral_envelope_loss_warmup_steps=5_000,
+        spectral_envelope_loss_warmup_steps=0,
         stft_recon_loss_weight=0.,
-        gan_start=5_000, gan_ramp=15_000,
-        freeze_codebook_after_step=30_000,
+        si_sdr_loss_weight=0.03,
+        si_sdr_loss_start_steps=0,
+        si_sdr_loss_warmup_steps=0,
+        # Stage 2 starts from a validation-selected Stage-1 codec.  Train G
+        # and D from step zero, while their low-LR retention window and the
+        # slow GAN ramp protect reconstruction quality.
+        gan_start=0, gan_ramp=20_000,
+        gan_adversarial_max=0.0002, gan_feature_max=1.0,
     ),
     "stream_finetune": dict(
         steps=20_000, batch_size=4, segment_seconds=2.,
@@ -264,23 +300,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--si-sdr-loss-weight",
         type=float,
-        default=0.07,
-        help=(
-            "Maximum SI-SDR loss weight for recon_pretrain. "
-            "Use 0 for the pure Saturday baseline; other stages keep it disabled."
-        ),
+        default=None,
+        help="Maximum SI-SDR loss weight. Defaults depend on --stage.",
     )
     parser.add_argument(
         "--si-sdr-loss-start-steps",
         type=int,
-        default=5_000,
-        help="Keep SI-SDR loss weight at zero for this many recon_pretrain steps.",
+        default=None,
+        help="Keep SI-SDR loss at zero for this many steps; defaults depend on --stage.",
     )
     parser.add_argument(
         "--si-sdr-loss-warmup-steps",
         type=int,
-        default=15_000,
-        help="After --si-sdr-loss-start-steps, linearly ramp SI-SDR loss over this many recon_pretrain steps.",
+        default=None,
+        help="SI-SDR ramp duration after its start step; defaults depend on --stage.",
     )
     parser.add_argument(
         "--spectral-envelope-loss-weight",
@@ -366,6 +399,57 @@ def parse_args() -> argparse.Namespace:
             "many consecutive validation checks. This does not relax best "
             "checkpoint clean-gate eligibility."
         ),
+    )
+    parser.add_argument(
+        "--stage2-plateau-lr",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "For gan_pretrain, lower generator and discriminator LR together "
+            "only after post-ramp validation plateaus while quality retention holds."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-plateau-start-steps",
+        type=int,
+        default=60_000,
+        help="Do not allow Stage-2 plateau LR reductions before this completed step.",
+    )
+    parser.add_argument(
+        "--stage2-plateau-factor",
+        type=float,
+        default=0.5,
+        help="Stage-2 G/D LR multiplier for each validation-plateau reduction.",
+    )
+    parser.add_argument(
+        "--stage2-plateau-patience",
+        type=int,
+        default=16,
+        help="Stage-2 quality-retained validation checks without a reconstruction-score improvement before reducing LR.",
+    )
+    parser.add_argument(
+        "--stage2-plateau-threshold",
+        type=float,
+        default=0.01,
+        help="Minimum absolute reduction in Stage-2 validation reconstruction score counted by plateau.",
+    )
+    parser.add_argument(
+        "--stage2-plateau-cooldown",
+        type=int,
+        default=2,
+        help="Validation checks to wait after a Stage-2 LR reduction.",
+    )
+    parser.add_argument(
+        "--stage2-plateau-min-lr",
+        type=float,
+        default=2e-6,
+        help="Minimum Stage-2 generator LR.",
+    )
+    parser.add_argument(
+        "--stage2-plateau-discr-min-lr",
+        type=float,
+        default=4e-6,
+        help="Minimum Stage-2 discriminator LR.",
     )
     parser.add_argument(
         "--click-loss-weight",
@@ -477,6 +561,45 @@ def parse_args() -> argparse.Namespace:
         help="Maximum p99.9 jump ratio for best checkpoint eligibility.",
     )
     parser.add_argument(
+        "--stage2-quality-retention-gate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "For gan_pretrain, reject best-checkpoint updates that regress beyond "
+            "the initialized stage-1 baseline and stop after sustained regression."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-max-aligned-si-sdr-drop",
+        type=float,
+        default=0.30,
+        help="Maximum Stage-2 aligned SI-SDR drop from its initialization baseline in dB.",
+    )
+    parser.add_argument(
+        "--stage2-max-aligned-corr-drop",
+        type=float,
+        default=0.02,
+        help="Maximum Stage-2 aligned correlation drop from its initialization baseline.",
+    )
+    parser.add_argument(
+        "--stage2-max-quiet-hf-excess-db-rise",
+        type=float,
+        default=0.50,
+        help="Maximum Stage-2 quiet-HF excess rise from its initialization baseline in dB.",
+    )
+    parser.add_argument(
+        "--stage2-quality-retention-patience",
+        type=int,
+        default=3,
+        help="Consecutive validation regressions before the Stage-2 quality hard stop.",
+    )
+    parser.add_argument(
+        "--stage2-rvq-retention-patience",
+        type=int,
+        default=2,
+        help="Consecutive q00/q01 regressions before the Stage-2 RVQ hard stop.",
+    )
+    parser.add_argument(
         "--stream-context-frames",
         type=int,
         default=0,
@@ -516,14 +639,48 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--decoder-residual-scale-warmup-start-steps",
         type=int,
-        default=10_000,
+        default=0,
         help="Step where decoder residual scale begins increasing.",
+    )
+    parser.add_argument(
+        "--stage2-generator-hold-steps",
+        type=int,
+        default=20_000,
+        help=(
+            "For gan_pretrain, keep the generator at a conservative LR during "
+            "the initial GAN ramp so the Stage-1 reconstruction baseline is retained."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-generator-hold-lr",
+        type=float,
+        default=5e-6,
+        help="Generator LR during the initial Stage-2 GAN ramp.",
+    )
+    parser.add_argument(
+        "--stage2-discriminator-hold-steps",
+        type=int,
+        default=20_000,
+        help=(
+            "For gan_pretrain, keep every discriminator at a conservative LR "
+            "during the initial GAN ramp while still updating from step zero."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-discriminator-hold-lr",
+        type=float,
+        default=1e-5,
+        help="Discriminator LR during the initial Stage-2 GAN ramp.",
     )
     parser.add_argument(
         "--decoder-residual-scale-warmup-end-steps",
         type=int,
-        default=50_000,
-        help="Step where decoder residual scale reaches the end value.",
+        default=15_000,
+        help=(
+            "Step where decoder residual scale reaches the end value. "
+            "Stage-1 best checkpoints are held until this point so downstream "
+            "stages never inherit an in-progress residual-scale schedule."
+        ),
     )
     parser.add_argument(
         "--boundary-loss-weight",
@@ -619,25 +776,6 @@ def latest_checkpoint(results_dir: Path) -> Path | None:
     )
 
 
-def stage2_lr_lambda(step: int) -> float:
-    """Piecewise stage-2 multiplier for both generator and discriminator.
-
-    Stage 2 keeps the conservative 5e-5 base LR while GAN losses ramp in,
-    then reduces it for refinement over the longer 100k-step run.
-    """
-    if step < 50_000:
-        return 1.0
-    if step < 75_000:
-        return 0.5
-
-    return 0.2
-
-
-def stage2_discr_lr_lambda(step: int) -> float:
-    # Discriminator steps begin after gan_start=5000. Offset local scheduler
-    # steps so its LR milestones remain aligned to the global training step.
-    return stage2_lr_lambda(step + 5_000)
-
 
 def calculate_bitrate(
     sample_rate: int,
@@ -655,8 +793,9 @@ def calculate_bitrate(
 def load_model_weights_only(
     model: torch.nn.Module,
     checkpoint: Path,
-) -> None:
+) -> dict:
     pkg = torch.load(str(checkpoint), map_location="cpu")
+    checkpoint_config = {}
     if "config" in pkg:
         checkpoint_config = pickle.loads(pkg["config"])
         checkpoint_upsample = checkpoint_config.get(
@@ -693,6 +832,7 @@ def load_model_weights_only(
             )
     state_dict = pkg["model"] if "model" in pkg else pkg
     model.load_state_dict(state_dict, strict=True)
+    return checkpoint_config
 
 
 def build_model(
@@ -713,6 +853,8 @@ def build_model(
     preemph_loss_weight: float,
     noise_floor_loss_weight: float,
     stft_recon_loss_weight: float,
+    gan_adversarial_max: float,
+    gan_feature_max: float,
     decoder_upsample_mode: str,
     decoder_residual_scale: float,
     decoder_linear_upsample_kernel_min: int,
@@ -721,10 +863,12 @@ def build_model(
     if sync_codebook is None:
         sync_codebook = int(os.environ.get("WORLD_SIZE", "1")) > 1
 
-    if stage == "recon_pretrain":
+    if stage in RECONSTRUCTION_STAGES:
         recon_loss_weight = 10.
         multi_spectral_recon_loss_weight = 1.1
-        correlation_loss_weight = 0.02
+        correlation_loss_weight = (
+            0.02 if stage in ("recon_pretrain", "spectral_refine") else 0.
+        )
     else:
         recon_loss_weight = 10. if stage == "overfit" else 1.
         multi_spectral_recon_loss_weight = 0.7
@@ -754,18 +898,10 @@ def build_model(
         preemph_loss_weight=preemph_loss_weight,
         noise_floor_loss_weight=noise_floor_loss_weight,
         commitment_loss_weight=0.1,
-        adversarial_loss_weight=(
-            0.001
-            if stage in ("gan_pretrain", "stream_finetune", "stream_finetune_long")
-            else 0.
-        ),
-        feature_loss_weight=(
-            5.
-            if stage in ("gan_pretrain", "stream_finetune", "stream_finetune_long")
-            else 0.
-        ),
+        adversarial_loss_weight=(gan_adversarial_max if stage in GAN_STAGES else 0.),
+        feature_loss_weight=(gan_feature_max if stage in GAN_STAGES else 0.),
         rq_quantize_dropout=False,
-        rq_threshold_ema_dead_code=5,
+        rq_threshold_ema_dead_code=2,
         rq_kwargs=dict(sync_codebook=sync_codebook),
         attn_window_size=64,
         attn_dim_head=32,
@@ -795,11 +931,11 @@ def main() -> None:
 
     if args.seed < 0:
         raise ValueError("--seed must be non-negative.")
-    if args.si_sdr_loss_weight < 0:
+    if args.si_sdr_loss_weight is not None and args.si_sdr_loss_weight < 0:
         raise ValueError("--si-sdr-loss-weight cannot be negative.")
-    if args.si_sdr_loss_start_steps < 0:
+    if args.si_sdr_loss_start_steps is not None and args.si_sdr_loss_start_steps < 0:
         raise ValueError("--si-sdr-loss-start-steps cannot be negative.")
-    if args.si_sdr_loss_warmup_steps < 0:
+    if args.si_sdr_loss_warmup_steps is not None and args.si_sdr_loss_warmup_steps < 0:
         raise ValueError("--si-sdr-loss-warmup-steps cannot be negative.")
     if args.spectral_envelope_loss_weight is not None and args.spectral_envelope_loss_weight < 0:
         raise ValueError("--spectral-envelope-loss-weight cannot be negative.")
@@ -840,6 +976,28 @@ def main() -> None:
         raise ValueError("--plateau-min-lr cannot be negative.")
     if args.plateau_unclean_grace_checks < 0:
         raise ValueError("--plateau-unclean-grace-checks cannot be negative.")
+    if args.stage2_plateau_start_steps < 0:
+        raise ValueError("--stage2-plateau-start-steps cannot be negative.")
+    if not 0. < args.stage2_plateau_factor < 1.:
+        raise ValueError("--stage2-plateau-factor must be between 0 and 1.")
+    if args.stage2_plateau_patience <= 0:
+        raise ValueError("--stage2-plateau-patience must be greater than zero.")
+    if args.stage2_plateau_threshold < 0:
+        raise ValueError("--stage2-plateau-threshold cannot be negative.")
+    if args.stage2_plateau_cooldown < 0:
+        raise ValueError("--stage2-plateau-cooldown cannot be negative.")
+    if args.stage2_plateau_min_lr < 0:
+        raise ValueError("--stage2-plateau-min-lr cannot be negative.")
+    if args.stage2_plateau_discr_min_lr < 0:
+        raise ValueError("--stage2-plateau-discr-min-lr cannot be negative.")
+    if args.stage2_generator_hold_steps < 0:
+        raise ValueError("--stage2-generator-hold-steps cannot be negative.")
+    if args.stage2_generator_hold_lr <= 0:
+        raise ValueError("--stage2-generator-hold-lr must be positive.")
+    if args.stage2_discriminator_hold_steps < 0:
+        raise ValueError("--stage2-discriminator-hold-steps cannot be negative.")
+    if args.stage2_discriminator_hold_lr <= 0:
+        raise ValueError("--stage2-discriminator-hold-lr must be positive.")
     if args.click_loss_weight is not None and args.click_loss_weight < 0:
         raise ValueError("--click-loss-weight cannot be negative.")
     if args.jump_loss_weight is not None and args.jump_loss_weight < 0:
@@ -868,6 +1026,16 @@ def main() -> None:
     ):
         if getattr(args, name) < 0:
             raise ValueError(f"--{name.replace('_', '-')} cannot be negative.")
+    for name in (
+        "stage2_max_aligned_si_sdr_drop",
+        "stage2_max_aligned_corr_drop",
+        "stage2_max_quiet_hf_excess_db_rise",
+    ):
+        if getattr(args, name) < 0:
+            raise ValueError(f"--{name.replace('_', '-')} cannot be negative.")
+    for name in ("stage2_quality_retention_patience", "stage2_rvq_retention_patience"):
+        if getattr(args, name) <= 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be greater than zero.")
     if args.dl_num_workers < 0:
         raise ValueError("--dl-num-workers cannot be negative.")
     seed_everything(args.seed)
@@ -933,11 +1101,26 @@ def main() -> None:
     # 50 frames/s * 23 quantizers * 8 bits/index = 9.2 kbps.
     codebook_size = 256
     num_quantizers = 23
-    si_sdr_loss_weight = (
-        args.si_sdr_loss_weight
-        if args.stage == "recon_pretrain"
-        else 0.0
-    )
+    if args.stage in RECONSTRUCTION_STAGES:
+        si_sdr_loss_weight = (
+            args.si_sdr_loss_weight
+            if args.si_sdr_loss_weight is not None
+            else stage_defaults.get("si_sdr_loss_weight", 0.)
+        )
+        si_sdr_loss_start_steps = (
+            args.si_sdr_loss_start_steps
+            if args.si_sdr_loss_start_steps is not None
+            else stage_defaults.get("si_sdr_loss_start_steps", 0)
+        )
+        si_sdr_loss_warmup_steps = (
+            args.si_sdr_loss_warmup_steps
+            if args.si_sdr_loss_warmup_steps is not None
+            else stage_defaults.get("si_sdr_loss_warmup_steps", 0)
+        )
+    else:
+        si_sdr_loss_weight = 0.
+        si_sdr_loss_start_steps = 0
+        si_sdr_loss_warmup_steps = 0
     click_loss_weight = (
         args.click_loss_weight
         if args.click_loss_weight is not None
@@ -979,44 +1162,20 @@ def main() -> None:
         else stage_defaults["transient_loss_warmup_steps"]
     )
     stft_recon_loss_weight = stage_defaults["stft_recon_loss_weight"]
-    waveform_recon_loss_weight = (
-        10.0
-        if args.stage in ("overfit", "recon_pretrain")
-        else 1.0
-    )
-    multi_spectral_recon_loss_weight = (
-        1.1
-        if args.stage == "recon_pretrain"
-        else 0.7
-    )
-    correlation_loss_weight = (
-        0.02
-        if args.stage == "recon_pretrain"
-        else 0.0
-    )
-    decoder_residual_scale_start = (
-        args.decoder_residual_scale_start
-        if args.stage == "recon_pretrain"
-        else 1.0
-    )
-    decoder_residual_scale_end = (
-        args.decoder_residual_scale_end
-        if args.stage == "recon_pretrain"
-        else 1.0
-    )
-    decoder_residual_scale_warmup_start_steps = (
-        args.decoder_residual_scale_warmup_start_steps
-        if args.stage == "recon_pretrain"
-        else 0
-    )
-    decoder_residual_scale_warmup_end_steps = (
-        args.decoder_residual_scale_warmup_end_steps
-        if args.stage == "recon_pretrain"
-        else 0
-    )
+    waveform_recon_loss_weight = 10.0 if args.stage in ("overfit", *RECONSTRUCTION_STAGES) else 1.0
+    multi_spectral_recon_loss_weight = 1.1 if args.stage in RECONSTRUCTION_STAGES else 0.7
+    correlation_loss_weight = 0.02 if args.stage in RECONSTRUCTION_STAGES else 0.0
+    decoder_residual_scale_start = args.decoder_residual_scale_start
+    decoder_residual_scale_end = args.decoder_residual_scale_end
+    decoder_residual_scale_warmup_start_steps = args.decoder_residual_scale_warmup_start_steps
+    decoder_residual_scale_warmup_end_steps = args.decoder_residual_scale_warmup_end_steps
     stage1_plateau_lr_enabled = (
         args.stage == "recon_pretrain" and
         args.stage1_plateau_lr
+    )
+    stage2_plateau_lr_enabled = (
+        args.stage == "gan_pretrain" and
+        args.stage2_plateau_lr
     )
 
     bitrate = calculate_bitrate(
@@ -1058,19 +1217,39 @@ def main() -> None:
                 "1.000e-04 for [20000, 35000), "
                 "5.000e-05 from step 35000"
             )
+    elif args.stage == "spectral_refine":
+        print("Stage-1.5 LR schedule: fixed 1.000e-05 after the standard warmup.")
     elif args.stage == "gan_pretrain":
+        if stage2_plateau_lr_enabled:
+            print(
+                "Stage-2 LR schedule: standard warmup, then generator=1.000e-05 / "
+                "discriminator=2.000e-05 until step "
+                f"{args.stage2_plateau_start_steps}; validation ReduceLROnPlateau "
+                "then lowers both together on quality-retained reconstruction score "
+                "(10*wave + 1.1*Mel; lower is better) "
+                f"(factor={args.stage2_plateau_factor}, "
+                f"patience={args.stage2_plateau_patience}, "
+                f"threshold={args.stage2_plateau_threshold}, "
+                f"cooldown={args.stage2_plateau_cooldown}, "
+                f"min_g_lr={args.stage2_plateau_min_lr}, "
+                f"min_d_lr={args.stage2_plateau_discr_min_lr})"
+            )
+        else:
+            print("Stage-2 LR schedule: fixed generator=1.000e-05, discriminator=2.000e-05 after the standard warmup.")
         print(
-            "Stage-2 LR schedule (generator/discriminator): "
-            "linear warmup, 5.000e-05 before step 50000, "
-            "2.500e-05 for [50000, 75000), "
-            "1.000e-05 from step 75000"
+            "Stage-2 retention phase: generator is capped at "
+            f"{args.stage2_generator_hold_lr:.3e} for steps [0, "
+            f"{args.stage2_generator_hold_steps}), then returns to 1.000e-05; "
+            "discriminators update from step 0 at "
+            f"{args.stage2_discriminator_hold_lr:.3e} for steps [0, "
+            f"{args.stage2_discriminator_hold_steps}), then return to 2.000e-05."
         )
     print(f"Random seed: {args.seed}")
     print(
         "SI-SDR loss: "
         f"max_weight={si_sdr_loss_weight}, "
-        f"start_steps={args.si_sdr_loss_start_steps if si_sdr_loss_weight > 0 else 0}, "
-        f"warmup_steps={args.si_sdr_loss_warmup_steps if si_sdr_loss_weight > 0 else 0}"
+        f"start_steps={si_sdr_loss_start_steps if si_sdr_loss_weight > 0 else 0}, "
+        f"warmup_steps={si_sdr_loss_warmup_steps if si_sdr_loss_weight > 0 else 0}"
     )
     print(
         "Voiced spectral envelope loss: "
@@ -1102,6 +1281,17 @@ def main() -> None:
         f"jump<={args.clean_gate_max_jump_ratio}, "
         f"p999_jump<={args.clean_gate_max_p999_jump_ratio}"
     )
+    if args.stage == "gan_pretrain":
+        print(
+            "Stage-2 quality retention gate: "
+            f"enabled={args.stage2_quality_retention_gate}, "
+            f"aligned_si_sdr_drop<={args.stage2_max_aligned_si_sdr_drop:.2f} dB, "
+            f"aligned_corr_drop<={args.stage2_max_aligned_corr_drop:.3f}, "
+            f"quiet_hf_excess_rise<={args.stage2_max_quiet_hf_excess_db_rise:.2f} dB, "
+            "q00/q01=(active>=0.30, perplexity>=16), "
+            f"hard_stop=(quality={args.stage2_quality_retention_patience}, "
+            f"rvq={args.stage2_rvq_retention_patience}) validation checks"
+        )
     print(
         "Signed correlation loss weight: "
         f"{correlation_loss_weight}"
@@ -1127,6 +1317,12 @@ def main() -> None:
         f"linear to {decoder_residual_scale_end} by step "
         f"{decoder_residual_scale_warmup_end_steps}"
     )
+    if args.stage == "recon_pretrain":
+        print(
+            "Stage-1 best-checkpoint eligibility begins at step "
+            f"{decoder_residual_scale_warmup_end_steps}, after decoder residual "
+            f"scale reaches {decoder_residual_scale_end}."
+        )
     print(f"Discriminator learning rate: {stage_defaults['discr_lr']}")
     use_ema = stage_defaults.get("use_ema", True)
     print(f"EMA enabled: {use_ema}")
@@ -1141,7 +1337,8 @@ def main() -> None:
         "GAN schedule: "
         f"start={stage_defaults['gan_start']}, "
         f"ramp={stage_defaults['gan_ramp']}, "
-        "adversarial_max=0.001, feature_max=5.0"
+        f"adversarial_max={stage_defaults.get('gan_adversarial_max', 0.001)}, "
+        f"feature_max={stage_defaults.get('gan_feature_max', 5.0)}"
     )
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     effective_global_batch = (
@@ -1173,6 +1370,11 @@ def main() -> None:
     print(f"RVQ codebook synchronization: {world_size > 1}")
     if args.stage in ("stream_finetune", "stream_finetune_long"):
         print("RVQ codebook training: frozen")
+    elif args.stage == "gan_pretrain":
+        print(
+            "RVQ codebook training: frozen for steps [0, 5000), then enabled "
+            "(including EMA statistics and dead-code replacement)"
+        )
     elif stage_defaults.get("freeze_codebook_after_step") is not None:
         print(
             "RVQ codebook training: enabled until step "
@@ -1213,6 +1415,8 @@ def main() -> None:
         preemph_loss_weight=preemph_loss_weight,
         noise_floor_loss_weight=noise_floor_loss_weight,
         stft_recon_loss_weight=stft_recon_loss_weight,
+        gan_adversarial_max=stage_defaults.get("gan_adversarial_max", 0.001),
+        gan_feature_max=stage_defaults.get("gan_feature_max", 5.0),
         decoder_upsample_mode=args.decoder_upsample_mode,
         decoder_residual_scale=decoder_residual_scale_start,
         decoder_linear_upsample_kernel_min=args.decoder_linear_upsample_kernel_min,
@@ -1230,11 +1434,6 @@ def main() -> None:
     if args.stage == "recon_pretrain" and not stage1_plateau_lr_enabled:
         scheduler = LambdaLR
         scheduler_kwargs = dict(lr_lambda=stage1_lr_lambda)
-    elif args.stage == "gan_pretrain":
-        scheduler = LambdaLR
-        scheduler_kwargs = dict(lr_lambda=stage2_lr_lambda)
-        discr_scheduler = LambdaLR
-        discr_scheduler_kwargs = dict(lr_lambda=stage2_discr_lr_lambda)
 
     trainer = SoundStreamTrainer(
         soundstream,
@@ -1244,7 +1443,6 @@ def main() -> None:
         data_max_length_seconds=segment_seconds,
         dataset_max_files=(args.overfit_files if args.stage == "overfit" else None),
         dataset_fixed_crop=(args.stage == "overfit"),
-        dataset_min_rms_db=-45.,
         num_train_steps=num_train_steps,
         lr=stage_defaults["lr"],
         discr_lr=stage_defaults["discr_lr"],
@@ -1254,25 +1452,72 @@ def main() -> None:
         scheduler_kwargs=scheduler_kwargs,
         discr_scheduler=discr_scheduler,
         discr_scheduler_kwargs=discr_scheduler_kwargs,
-        plateau_lr_enabled=stage1_plateau_lr_enabled,
-        plateau_lr_start_steps=args.plateau_start_steps,
-        plateau_lr_factor=args.plateau_factor,
-        plateau_lr_patience=args.plateau_patience,
-        plateau_lr_threshold=args.plateau_threshold,
-        plateau_lr_cooldown=args.plateau_cooldown,
-        plateau_lr_min_lr=args.plateau_min_lr,
+        plateau_lr_enabled=(stage1_plateau_lr_enabled or stage2_plateau_lr_enabled),
+        plateau_lr_start_steps=(
+            args.stage2_plateau_start_steps if stage2_plateau_lr_enabled
+            else args.plateau_start_steps
+        ),
+        plateau_lr_factor=(
+            args.stage2_plateau_factor if stage2_plateau_lr_enabled
+            else args.plateau_factor
+        ),
+        plateau_lr_patience=(
+            args.stage2_plateau_patience if stage2_plateau_lr_enabled
+            else args.plateau_patience
+        ),
+        plateau_lr_threshold=(
+            args.stage2_plateau_threshold if stage2_plateau_lr_enabled
+            else args.plateau_threshold
+        ),
+        plateau_lr_cooldown=(
+            args.stage2_plateau_cooldown if stage2_plateau_lr_enabled
+            else args.plateau_cooldown
+        ),
+        plateau_lr_min_lr=(
+            args.stage2_plateau_min_lr if stage2_plateau_lr_enabled
+            else args.plateau_min_lr
+        ),
         plateau_lr_unclean_grace_checks=args.plateau_unclean_grace_checks,
+        plateau_lr_metric=(
+            'score' if stage2_plateau_lr_enabled else 'aligned_si_sdr'
+        ),
+        plateau_lr_update_discriminator=stage2_plateau_lr_enabled,
+        plateau_lr_discr_min_lr=(
+            args.stage2_plateau_discr_min_lr if stage2_plateau_lr_enabled
+            else None
+        ),
+        plateau_lr_require_quality_retention=stage2_plateau_lr_enabled,
+        generator_hold_steps=(
+            args.stage2_generator_hold_steps
+            if args.stage == "gan_pretrain"
+            else 0
+        ),
+        generator_hold_lr=(
+            args.stage2_generator_hold_lr
+            if args.stage == "gan_pretrain"
+            else None
+        ),
+        discriminator_hold_steps=(
+            args.stage2_discriminator_hold_steps
+            if args.stage == "gan_pretrain"
+            else 0
+        ),
+        discriminator_hold_lr=(
+            args.stage2_discriminator_hold_lr
+            if args.stage == "gan_pretrain"
+            else None
+        ),
         save_results_every=args.save_results_every,
         save_model_every=save_model_every,
         best_eval_every=best_eval_every,
         best_eval_batches=args.best_eval_batches,
         si_sdr_loss_start_steps=(
-            args.si_sdr_loss_start_steps
+            si_sdr_loss_start_steps
             if si_sdr_loss_weight > 0
             else 0
         ),
         si_sdr_loss_warmup_steps=(
-            args.si_sdr_loss_warmup_steps
+            si_sdr_loss_warmup_steps
             if si_sdr_loss_weight > 0
             else 0
         ),
@@ -1291,6 +1536,11 @@ def main() -> None:
         decoder_residual_scale_end=decoder_residual_scale_end,
         decoder_residual_scale_warmup_start_steps=decoder_residual_scale_warmup_start_steps,
         decoder_residual_scale_warmup_end_steps=decoder_residual_scale_warmup_end_steps,
+        best_checkpoint_min_step=(
+            decoder_residual_scale_warmup_end_steps
+            if args.stage == "recon_pretrain"
+            else 0
+        ),
         clean_gate=not args.disable_clean_gate,
         clean_gate_min_aligned_si_sdr=args.clean_gate_min_aligned_si_sdr,
         clean_gate_min_aligned_corr=args.clean_gate_min_aligned_corr,
@@ -1304,16 +1554,23 @@ def main() -> None:
         early_stopping_patience=early_stopping_patience,
         early_stopping_min_delta=args.early_stopping_min_delta,
         early_stopping_min_steps=early_stopping_min_steps,
-        enable_gan=args.stage in (
-            "gan_pretrain",
-            "stream_finetune",
-            "stream_finetune_long",
-        ),
+        enable_gan=args.stage in GAN_STAGES,
         gan_start_step=stage_defaults["gan_start"],
         gan_ramp_steps=stage_defaults["gan_ramp"],
-        gan_adversarial_max=0.001,
-        gan_feature_max=5.,
+        gan_adversarial_max=stage_defaults.get("gan_adversarial_max", 0.001),
+        gan_feature_max=stage_defaults.get("gan_feature_max", 5.),
+        quality_retention_gate=(
+            args.stage == "gan_pretrain" and args.stage2_quality_retention_gate
+        ),
+        quality_retention_max_aligned_si_sdr_drop=args.stage2_max_aligned_si_sdr_drop,
+        quality_retention_max_aligned_corr_drop=args.stage2_max_aligned_corr_drop,
+        quality_retention_max_quiet_hf_excess_db_rise=args.stage2_max_quiet_hf_excess_db_rise,
+        quality_retention_patience=args.stage2_quality_retention_patience,
+        quality_retention_rvq_patience=args.stage2_rvq_retention_patience,
         freeze_codebook_after_step=stage_defaults.get("freeze_codebook_after_step"),
+        freeze_codebook_before_step=(
+            5_000 if args.stage == "gan_pretrain" else None
+        ),
         freeze_codebook_during_training=args.stage in (
             "stream_finetune",
             "stream_finetune_long",
@@ -1341,6 +1598,7 @@ def main() -> None:
         trainer.load(str(checkpoint))
     else:
         predecessor_stage = {
+            "spectral_refine": "recon_pretrain",
             "gan_pretrain": "recon_pretrain",
             "stream_finetune": "gan_pretrain",
             "stream_finetune_long": "stream_finetune",
@@ -1353,9 +1611,16 @@ def main() -> None:
                 if args.predecessor_results_dir is not None
                 else STAGE_RESULTS_DIRS[predecessor_stage]
             )
-            predecessor_best = predecessor_dir / "best_selected.pt"
-            if predecessor_best.exists():
-                init_checkpoint = predecessor_best
+            predecessor_candidates = (
+                ("best_by_aligned_si_sdr.pt", "best_selected.pt")
+                if predecessor_stage in ("recon_pretrain", "spectral_refine")
+                else ("best_selected.pt",)
+            )
+            init_checkpoint = next(
+                (predecessor_dir / name for name in predecessor_candidates
+                 if (predecessor_dir / name).exists()),
+                None,
+            )
 
         if predecessor_stage is not None and init_checkpoint is None:
             expected_predecessor_dir = (
@@ -1365,17 +1630,88 @@ def main() -> None:
             )
             raise FileNotFoundError(
                 f"{args.stage} requires --init-checkpoint or "
-                f"{expected_predecessor_dir / 'best_selected.pt'}"
+                f"a validation-selected checkpoint under {expected_predecessor_dir}"
             )
 
         if init_checkpoint is not None:
             print(f"Initializing {args.stage} from checkpoint: {init_checkpoint}")
-            load_model_weights_only(trainer.unwrapped_soundstream, init_checkpoint)
+            checkpoint_config = load_model_weights_only(
+                trainer.unwrapped_soundstream,
+                init_checkpoint,
+            )
+            if args.stage in ("spectral_refine", "gan_pretrain"):
+                if "decoder_residual_scale" not in checkpoint_config:
+                    raise ValueError(
+                        "Initialization checkpoint does not record decoder_residual_scale; "
+                        "cannot safely continue a staged run without changing decoder behavior."
+                    )
+                inherited_residual_scale = float(
+                    checkpoint_config["decoder_residual_scale"]
+                )
+                if inherited_residual_scale < 0.:
+                    raise ValueError(
+                        "Initialization checkpoint has invalid decoder_residual_scale="
+                        f"{inherited_residual_scale}."
+                    )
+                trainer.unwrapped_soundstream.set_decoder_residual_scale(
+                    inherited_residual_scale
+                )
+                trainer.decoder_residual_scale_start = inherited_residual_scale
+                trainer.decoder_residual_scale_end = inherited_residual_scale
+                trainer.decoder_residual_scale_warmup_start_steps = 0
+                trainer.decoder_residual_scale_warmup_end_steps = 0
+                print(
+                    f"Preserved decoder residual scale from initialization checkpoint: "
+                    f"{inherited_residual_scale:.4f} (fixed for {args.stage})."
+                )
             if trainer.use_ema:
                 trainer.copy_online_to_ema()
                 print("Synchronized EMA from initialized online weights.")
 
         print("Starting a new training run.")
+
+    if (
+        args.stage == "gan_pretrain" and
+        trainer.quality_retention_gate and
+        not trainer.has_quality_retention_baseline
+    ):
+        # Evaluate once on rank 0, then distribute the numerical baseline so
+        # resumed / distributed workers carry identical retention state.
+        baseline_keys = (
+            "aligned_si_sdr",
+            "aligned_correlation",
+            "quiet_hf_excess_db",
+        )
+        baseline_values = torch.zeros(
+            len(baseline_keys),
+            device=trainer.accelerator.device,
+            dtype=torch.float64,
+        )
+        if trainer.is_main:
+            baseline_metrics = trainer.evaluate_fixed_validation_score(
+                trainer.unwrapped_soundstream
+            )
+            baseline_values.copy_(torch.tensor(
+                [baseline_metrics[key] for key in baseline_keys],
+                device=baseline_values.device,
+                dtype=baseline_values.dtype,
+            ))
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.broadcast(baseline_values, src=0)
+        baseline_metrics = dict(zip(
+            baseline_keys,
+            (float(value) for value in baseline_values.cpu().tolist()),
+        ))
+        trainer.set_quality_retention_baseline(baseline_metrics)
+        if trainer.is_main:
+            print(
+                "Stage-2 quality retention baseline recorded from initialized "
+                "checkpoint: "
+                f"aligned_si_sdr={baseline_metrics['aligned_si_sdr']:.3f}, "
+                f"aligned_corr={baseline_metrics['aligned_correlation']:.3f}, "
+                f"quiet_hf_excess_db={baseline_metrics['quiet_hf_excess_db']:.3f}"
+            )
+        trainer.accelerator.wait_for_everyone()
 
     trainer.train()
     trainer.accelerator.wait_for_everyone()
@@ -1422,7 +1758,7 @@ def main() -> None:
         world_size = trainer.accelerator.num_processes
         rank_test_files = selected_test_files[rank::world_size]
         save_test_reconstructions = (
-            args.stage == "recon_pretrain" and
+            args.stage in ("recon_pretrain", "spectral_refine") and
             args.save_test_reconstructions and
             len(selected_test_files) > 0
         )
