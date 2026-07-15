@@ -335,12 +335,18 @@ class SoundStreamTrainer(nn.Module):
         quality_retention_max_aligned_si_sdr_drop: float = 0.30,
         quality_retention_max_aligned_corr_drop: float = 0.02,
         quality_retention_max_quiet_hf_excess_db_rise: float = 0.50,
+        quality_retention_max_click_score_rise: float = 0.30,
+        quality_retention_q00_min_active_ratio: float = 0.70,
+        quality_retention_q00_min_perplexity: float = 50.,
+        quality_retention_q00_warn_active_ratio: float = 0.80,
+        quality_retention_q00_warn_perplexity: float = 70.,
         quality_retention_patience: int = 3,
         quality_retention_rvq_patience: int = 2,
         early_stopping_patience: int | None = None,
         early_stopping_min_delta: float = 0.,
         early_stopping_min_steps: int = 0,
         enable_gan: bool = True,
+        allow_discriminator_reinitialization: bool = False,
         gan_start_step: int = 0,
         gan_ramp_steps: int = 0,
         gan_adversarial_max: float = 0.1,
@@ -348,6 +354,7 @@ class SoundStreamTrainer(nn.Module):
         freeze_codebook_after_step: int | None = None,
         freeze_codebook_before_step: int | None = None,
         freeze_codebook_during_training: bool = False,
+        freeze_encoder_before_step: int | None = None,
         log_losses_every: int = 1,
         results_folder: str = './results',
         valid_frac: float = 0.05,
@@ -361,6 +368,9 @@ class SoundStreamTrainer(nn.Module):
         ema_update_after_step: int = 500,
         ema_update_every: int = 10,
         apply_grad_penalty_every: int = 4,
+        waveform_grad_penalty_gamma: float = 0.,
+        stft_grad_penalty_every: int = 16,
+        stft_grad_penalty_gamma: float = 1e-4,
         dl_num_workers: int = 0,
         accelerator: Accelerator | None = None,
         accelerate_kwargs: dict = dict(),
@@ -481,12 +491,22 @@ class SoundStreamTrainer(nn.Module):
         assert quality_retention_max_aligned_si_sdr_drop >= 0.
         assert quality_retention_max_aligned_corr_drop >= 0.
         assert quality_retention_max_quiet_hf_excess_db_rise >= 0.
+        assert quality_retention_max_click_score_rise >= 0.
+        assert 0. <= quality_retention_q00_min_active_ratio <= 1.
+        assert quality_retention_q00_min_perplexity >= 0.
+        assert 0. <= quality_retention_q00_warn_active_ratio <= 1.
+        assert quality_retention_q00_warn_perplexity >= 0.
         assert quality_retention_patience > 0
         assert quality_retention_rvq_patience > 0
         self.quality_retention_gate = quality_retention_gate
         self.quality_retention_max_aligned_si_sdr_drop = quality_retention_max_aligned_si_sdr_drop
         self.quality_retention_max_aligned_corr_drop = quality_retention_max_aligned_corr_drop
         self.quality_retention_max_quiet_hf_excess_db_rise = quality_retention_max_quiet_hf_excess_db_rise
+        self.quality_retention_max_click_score_rise = quality_retention_max_click_score_rise
+        self.quality_retention_q00_min_active_ratio = quality_retention_q00_min_active_ratio
+        self.quality_retention_q00_min_perplexity = quality_retention_q00_min_perplexity
+        self.quality_retention_q00_warn_active_ratio = quality_retention_q00_warn_active_ratio
+        self.quality_retention_q00_warn_perplexity = quality_retention_q00_warn_perplexity
         self.quality_retention_patience = quality_retention_patience
         self.quality_retention_rvq_patience = quality_retention_rvq_patience
         self.quality_retention_baseline = None
@@ -589,13 +609,11 @@ class SoundStreamTrainer(nn.Module):
             warmup_steps = discr_warmup_steps
         )
         self.discriminator_hold_base_lrs = {
-            name: tuple(
-                group['lr'] for group in optimizer.optimizer.param_groups
-            )
+            name: tuple(float(lr) for lr in optimizer.warmup.lrs)
             for name, optimizer in self.multiscale_discriminator_optim_iter()
         }
         self.discriminator_hold_base_lrs['stft'] = tuple(
-            group['lr'] for group in self.discr_optim.optimizer.param_groups
+            float(lr) for lr in self.discr_optim.warmup.lrs
         )
 
         # max grad norm
@@ -851,17 +869,27 @@ class SoundStreamTrainer(nn.Module):
         self.early_stopping_bad_evals = 0
         self.early_stopping_triggered = False
         self.enable_gan = enable_gan
+        self.allow_discriminator_reinitialization = allow_discriminator_reinitialization
         self.gan_start_step = gan_start_step
         self.gan_ramp_steps = gan_ramp_steps
         self.gan_adversarial_max = gan_adversarial_max
         self.gan_feature_max = gan_feature_max
         assert not exists(freeze_codebook_after_step) or freeze_codebook_after_step >= 0
         assert not exists(freeze_codebook_before_step) or freeze_codebook_before_step >= 0
+        assert not exists(freeze_encoder_before_step) or freeze_encoder_before_step >= 0
         self.freeze_codebook_after_step = freeze_codebook_after_step
         self.freeze_codebook_before_step = freeze_codebook_before_step
         self.freeze_codebook_during_training = freeze_codebook_during_training
+        self.freeze_encoder_before_step = freeze_encoder_before_step
 
+        assert apply_grad_penalty_every >= 0
+        assert waveform_grad_penalty_gamma >= 0.
+        assert stft_grad_penalty_every >= 0
+        assert stft_grad_penalty_gamma >= 0.
         self.apply_grad_penalty_every = apply_grad_penalty_every
+        self.waveform_grad_penalty_gamma = waveform_grad_penalty_gamma
+        self.stft_grad_penalty_every = stft_grad_penalty_every
+        self.stft_grad_penalty_gamma = stft_grad_penalty_gamma
 
         self.results_folder = Path(results_folder)
 
@@ -2213,6 +2241,7 @@ class SoundStreamTrainer(nn.Module):
             'aligned_si_sdr',
             'aligned_correlation',
             'quiet_hf_excess_db',
+            'click_score',
         )
         missing = [key for key in required if key not in metrics]
         if missing:
@@ -2242,7 +2271,17 @@ class SoundStreamTrainer(nn.Module):
             self.quality_retention_max_quiet_hf_excess_db_rise
         ):
             reasons.append('quiet_hf')
-        if metrics.get('q00_validation_eligible', 0.) < 0.5:
+        if metrics.get('click_score', float('inf')) > (
+            baseline.get('click_score', self.clean_gate_max_click_score) +
+            self.quality_retention_max_click_score_rise
+        ):
+            reasons.append('click')
+        if (
+            metrics.get('codebook_q00_active_ratio', 0.) <
+            self.quality_retention_q00_min_active_ratio or
+            metrics.get('codebook_q00_perplexity', 0.) <
+            self.quality_retention_q00_min_perplexity
+        ):
             reasons.append('q00')
         if metrics.get('q01_validation_eligible', 0.) < 0.5:
             reasons.append('q01')
@@ -2280,8 +2319,22 @@ class SoundStreamTrainer(nn.Module):
             averaged_metrics['aligned_si_sdr'] >= -5.
         )
         q00_eligible = (
-            averaged_metrics.get('codebook_q00_active_ratio', 0.) >= 0.30 and
-            averaged_metrics.get('codebook_q00_perplexity', 0.) >= 16.
+            averaged_metrics.get('codebook_q00_active_ratio', 0.) >= (
+                self.quality_retention_q00_min_active_ratio
+                if self.best_checkpoint_metric == 'gan_pretrain' else 0.30
+            ) and
+            averaged_metrics.get('codebook_q00_perplexity', 0.) >= (
+                self.quality_retention_q00_min_perplexity
+                if self.best_checkpoint_metric == 'gan_pretrain' else 16.
+            )
+        )
+        averaged_metrics['q00_retention_warning'] = float(
+            self.best_checkpoint_metric == 'gan_pretrain' and (
+                averaged_metrics.get('codebook_q00_active_ratio', 0.) <
+                self.quality_retention_q00_warn_active_ratio or
+                averaged_metrics.get('codebook_q00_perplexity', 0.) <
+                self.quality_retention_q00_warn_perplexity
+            )
         )
         q01_eligible = (
             averaged_metrics.get('codebook_q01_active_ratio', 0.) >= 0.30 and
@@ -2404,7 +2457,33 @@ class SoundStreamTrainer(nn.Module):
 
         # otherwise load things normally
 
-        self.unwrapped_soundstream.load_state_dict(pkg['model'])
+        discriminator_reinitialized = False
+        try:
+            self.unwrapped_soundstream.load_state_dict(pkg['model'])
+        except RuntimeError as full_load_error:
+            # A corrected discriminator architecture changes only discriminator
+            # tensor shapes.  Verify the generator/RVQ state still matches
+            # strictly before allowing a non-GAN stage to resume.
+            try:
+                skipped_keys = self.unwrapped_soundstream.load_generator_state_dict(
+                    pkg['model']
+                )
+            except RuntimeError:
+                raise full_load_error
+
+            if self.enable_gan and not self.allow_discriminator_reinitialization:
+                raise RuntimeError(
+                    "This checkpoint uses an incompatible discriminator "
+                    "architecture. Do not resume the old GAN stage; initialize "
+                    "a fresh stage 2 from the stage-1 validation-best checkpoint."
+                ) from full_load_error
+
+            discriminator_reinitialized = True
+            self.print(
+                "Resumed generator/RVQ state with the corrected discriminator "
+                f"architecture; reinitialized {len(skipped_keys)} discriminator "
+                "state keys."
+            )
         if (
             'config' in pkg and
             hasattr(self.unwrapped_soundstream, 'restore_decoder_runtime_state')
@@ -2420,7 +2499,36 @@ class SoundStreamTrainer(nn.Module):
 
         if self.use_ema:
             if 'ema_model' in pkg:
-                self.ema_soundstream.load_state_dict(pkg['ema_model'])
+                if discriminator_reinitialized:
+                    ema_pkg = pkg['ema_model']
+                    ema_generator_state = {
+                        key[len('ema_model.'):]: value
+                        for key, value in ema_pkg.items()
+                        if key.startswith('ema_model.')
+                    }
+                    if ema_generator_state:
+                        self.ema_soundstream.ema_model.load_generator_state_dict(
+                            ema_generator_state
+                        )
+                        current_ema_state = self.ema_soundstream.state_dict()
+                        compatible_ema_meta = {
+                            key: value
+                            for key, value in ema_pkg.items()
+                            if (
+                                not key.startswith('ema_model.') and
+                                key in current_ema_state and
+                                hasattr(value, 'shape') and
+                                current_ema_state[key].shape == value.shape
+                            )
+                        }
+                        self.ema_soundstream.load_state_dict(
+                            compatible_ema_meta,
+                            strict = False
+                        )
+                    else:
+                        self.copy_online_to_ema()
+                else:
+                    self.ema_soundstream.load_state_dict(pkg['ema_model'])
                 self.sync_ema_runtime_state()
             else:
                 self.print(
@@ -2434,7 +2542,8 @@ class SoundStreamTrainer(nn.Module):
             self.plateau_scheduler.load_state_dict(pkg['plateau_scheduler'])
             self.sync_optimizer_lrs_from_plateau_scheduler()
         self.plateau_lr_unclean_checks = pkg.get('plateau_lr_unclean_checks', 0)
-        self.discr_optim.load_state_dict(pkg['discr_optim'])
+        if not discriminator_reinitialized:
+            self.discr_optim.load_state_dict(pkg['discr_optim'])
         self.best_valid_score = pkg.get('best_valid_score', float('inf'))
         self.best_aligned_si_sdr = pkg.get('best_aligned_si_sdr', float('-inf'))
         self.best_frame_leakage_score = pkg.get('best_frame_leakage_score', float('inf'))
@@ -2444,9 +2553,10 @@ class SoundStreamTrainer(nn.Module):
         self.quality_retention_bad_evals = pkg.get('quality_retention_bad_evals', 0)
         self.quality_retention_rvq_bad_evals = pkg.get('quality_retention_rvq_bad_evals', 0)
 
-        for key, _ in self.multiscale_discriminator_iter():
-            discr_optim = getattr(self, key)
-            discr_optim.load_state_dict(pkg[key])
+        if not discriminator_reinitialized:
+            for key, _ in self.multiscale_discriminator_iter():
+                discr_optim = getattr(self, key)
+                discr_optim.load_state_dict(pkg[key])
 
         # + 1 to start from the next step and avoid overwriting the last checkpoint
 
@@ -2722,6 +2832,7 @@ class SoundStreamTrainer(nn.Module):
         current_lr = self.optim.optimizer.param_groups[0]['lr']
         if (
             exists(self.generator_hold_lr) and
+            self.generator_hold_steps > 0 and
             steps < self.generator_hold_steps
         ):
             applied_lr = min(current_lr, self.generator_hold_lr)
@@ -2731,6 +2842,7 @@ class SoundStreamTrainer(nn.Module):
 
         if (
             exists(self.generator_hold_lr) and
+            self.generator_hold_steps > 0 and
             steps == self.generator_hold_steps
         ):
             for group, base_lr in zip(
@@ -2757,6 +2869,7 @@ class SoundStreamTrainer(nn.Module):
 
         if (
             exists(self.discriminator_hold_lr) and
+            self.discriminator_hold_steps > 0 and
             steps < self.discriminator_hold_steps
         ):
             # Do not call ``sync_warmup_lrs_from_optimizer`` here.  During the
@@ -2773,6 +2886,7 @@ class SoundStreamTrainer(nn.Module):
 
         if (
             exists(self.discriminator_hold_lr) and
+            self.discriminator_hold_steps > 0 and
             steps == self.discriminator_hold_steps
         ):
             for name, optimizer in optimizers:
@@ -2787,9 +2901,15 @@ class SoundStreamTrainer(nn.Module):
         return current_lr
 
     def update_discriminators(self, device, steps, logs):
-        apply_grad_penalty = (
+        apply_waveform_grad_penalty = (
+            self.waveform_grad_penalty_gamma > 0. and
             self.apply_grad_penalty_every > 0 and
             not (steps % self.apply_grad_penalty_every)
+        )
+        apply_stft_grad_penalty = (
+            self.stft_grad_penalty_gamma > 0. and
+            self.stft_grad_penalty_every > 0 and
+            not (steps % self.stft_grad_penalty_every)
         )
         self.discr_optim.zero_grad()
 
@@ -2809,12 +2929,20 @@ class SoundStreamTrainer(nn.Module):
             with self.accelerator.autocast(), context():
                 discr_losses = self.soundstream(
                     wave,
-                    apply_grad_penalty = apply_grad_penalty,
+                    apply_grad_penalty = apply_waveform_grad_penalty,
+                    apply_stft_grad_penalty = apply_stft_grad_penalty,
+                    waveform_grad_penalty_gamma = self.waveform_grad_penalty_gamma,
+                    stft_grad_penalty_gamma = self.stft_grad_penalty_gamma,
                     return_discr_loss = True,
                     return_discr_losses_separately = True,
                     freeze_codebook = True
                 )
                 for name, discr_loss in discr_losses:
+                    if not torch.isfinite(discr_loss).all():
+                        raise RuntimeError(
+                            f"non-finite discriminator loss at step {steps}: "
+                            f"{name}={discr_loss.detach().float().cpu().item()}"
+                        )
                     self.accelerator.backward(
                         discr_loss / self.grad_accum_every,
                         retain_graph = True
@@ -2823,6 +2951,20 @@ class SoundStreamTrainer(nn.Module):
                         logs,
                         {name: discr_loss.item() / self.grad_accum_every}
                     )
+                    if name == 'stft_grad_penalty':
+                        weighted = float(discr_loss.detach().float().cpu().item())
+                        raw = weighted / max(0.5 * self.stft_grad_penalty_gamma, 1e-30)
+                        accum_log(logs, {
+                            'stft_r1_raw': raw / self.grad_accum_every,
+                            'stft_r1_gamma': self.stft_grad_penalty_gamma / self.grad_accum_every,
+                            'stft_r1_weighted': weighted / self.grad_accum_every,
+                        })
+                        if weighted > 1.:
+                            self.print(
+                                f"{steps}: warning: STFT R1 weighted penalty "
+                                f"is unusually high ({weighted:.6f} > 1.0; "
+                                f"raw={raw:.6f}, gamma={self.stft_grad_penalty_gamma:.3e})"
+                            )
 
         if exists(self.discr_max_grad_norm):
             model = self.unwrapped_soundstream
@@ -2835,8 +2977,10 @@ class SoundStreamTrainer(nn.Module):
                 self.discr_max_grad_norm
             )
 
+        self.ensure_finite_optimizer_lrs('stft discriminator', self.discr_optim)
         self.discr_optim.step()
-        for _, multiscale_discr_optim in self.multiscale_discriminator_optim_iter():
+        for name, multiscale_discr_optim in self.multiscale_discriminator_optim_iter():
+            self.ensure_finite_optimizer_lrs(name, multiscale_discr_optim)
             multiscale_discr_optim.step()
 
     @contextmanager
@@ -2866,6 +3010,37 @@ class SoundStreamTrainer(nn.Module):
             ):
                 parameter.requires_grad_(requires_grad)
 
+    @contextmanager
+    def frozen_encoder_and_rvq(self):
+        """Temporarily train only the decoder side of the generator."""
+        model = self.unwrapped_soundstream
+        modules = [
+            getattr(model, name, None)
+            for name in ('encoder', 'encoder_attn', 'encoder_film', 'rq')
+        ]
+        parameters = [
+            parameter
+            for module in modules
+            if isinstance(module, nn.Module)
+            for parameter in module.parameters()
+        ]
+        original_requires_grad = [parameter.requires_grad for parameter in parameters]
+        for parameter in parameters:
+            parameter.requires_grad_(False)
+
+        try:
+            yield
+        finally:
+            for parameter, requires_grad in zip(parameters, original_requires_grad):
+                parameter.requires_grad_(requires_grad)
+
+    @staticmethod
+    def ensure_finite_optimizer_lrs(name, optimizer):
+        lrs = [float(group['lr']) for group in optimizer.optimizer.param_groups]
+        if not all(isfinite(lr) and lr >= 0. for lr in lrs):
+            raise RuntimeError(f"{name} has invalid learning rate(s): {lrs}")
+        return lrs
+
     def train_step(self):
         device = self.device
 
@@ -2881,6 +3056,10 @@ class SoundStreamTrainer(nn.Module):
             self.freeze_codebook_during_training or
             (exists(self.freeze_codebook_before_step) and steps < self.freeze_codebook_before_step) or
             (exists(self.freeze_codebook_after_step) and steps >= self.freeze_codebook_after_step)
+        )
+        freeze_encoder = (
+            exists(self.freeze_encoder_before_step) and
+            steps < self.freeze_encoder_before_step
         )
         decoder_residual_scale = self.update_decoder_residual_scale(steps)
         self.sync_ema_runtime_state()
@@ -2905,10 +3084,16 @@ class SoundStreamTrainer(nn.Module):
                 if gan_progress > 0
                 else nullcontext
             )
+            freeze_encoder_and_rvq = (
+                self.frozen_encoder_and_rvq
+                if freeze_encoder
+                else nullcontext
+            )
             with (
                 self.accelerator.autocast(),
                 context(),
-                freeze_discriminators()
+                freeze_discriminators(),
+                freeze_encoder_and_rvq()
             ):
                 loss, (
                     recon_loss,
@@ -2930,6 +3115,12 @@ class SoundStreamTrainer(nn.Module):
                     return_loss_breakdown = True,
                     freeze_codebook = freeze_codebook
                 )
+
+                if not torch.isfinite(loss).all():
+                    raise RuntimeError(
+                        f"non-finite generator loss at step {steps}: "
+                        f"{loss.detach().float().cpu().item()}"
+                    )
 
                 self.accelerator.backward(loss / self.grad_accum_every)
 
@@ -2965,6 +3156,7 @@ class SoundStreamTrainer(nn.Module):
             self.accelerator.clip_grad_norm_(self.soundstream.parameters(), self.max_grad_norm)
 
         generator_update_lr = self.cap_generator_lr_for_retention(steps)
+        self.ensure_finite_optimizer_lrs('generator', self.optim)
         self.optim.step()
         self.optim.zero_grad()
 
@@ -3005,6 +3197,7 @@ class SoundStreamTrainer(nn.Module):
             f"(w={model.noise_floor_loss_weight:.4g}) | "
             f"decoder_res_scale={decoder_residual_scale:.4f} | "
             f"rvq_frozen={int(freeze_codebook)} | "
+            f"encoder_frozen={int(freeze_encoder)} | "
             f"commit={logs['all_commitment_loss']:.6f}"
         )
 
@@ -3043,6 +3236,9 @@ class SoundStreamTrainer(nn.Module):
         discriminator_log_names = {
             'stft': 'd_stft',
             'stft_grad_penalty': 'gp_stft',
+            'stft_r1_raw': 'stft_r1_raw',
+            'stft_r1_gamma': 'stft_r1_gamma',
+            'stft_r1_weighted': 'stft_r1_weighted',
         }
         for key, value in logs.items():
             if key.startswith('scale:'):
@@ -3297,6 +3493,7 @@ class SoundStreamTrainer(nn.Module):
                 f"online_active_codes={online_score['active_code_ratio']:.3f}, "
                 f"online_perplexity={online_score['codebook_perplexity']:.1f}, "
                 f"online_q00_ok={online_score.get('q00_validation_eligible', 0.):.0f}, "
+                f"online_q00_warning={online_score.get('q00_retention_warning', 0.):.0f}, "
                 f"online_q01_ok={online_score.get('q01_validation_eligible', 0.):.0f}, "
                 f"online_rvq_ok={online_score.get('rvq_validation_eligible', 0.):.0f}, "
                 f"online_collapsed_q={int(online_score.get('codebook_collapsed_quantizers', 0))} | "

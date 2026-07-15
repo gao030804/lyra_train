@@ -11,7 +11,6 @@ from torch import nn, einsum
 from torch.nn import Module, ModuleList
 from torch.autograd import grad as torch_grad
 import torch.nn.functional as F
-from torch.linalg import vector_norm
 
 import torchaudio.transforms as T
 from torchaudio.functional import resample
@@ -68,20 +67,50 @@ def hinge_gen_loss(fake):
 def leaky_relu(p = 0.1):
     return nn.LeakyReLU(p)
 
-def gradient_penalty(wave, output, weight = 10, center = 0.):
-    batch_size, device = wave.shape[0], wave.device
+def r1_gradient_penalty(wave, logits, gamma):
+    """Real-sample R1 penalty using one scalar discriminator score per sample."""
+    if not wave.requires_grad:
+        raise ValueError('wave must require gradients for R1 penalty')
+    if gamma <= 0:
+        zero = wave.new_zeros(())
+        return zero, zero
 
+    batch_scores = rearrange(logits, 'b ... -> b (...)').mean(dim = -1)
     gradients = torch_grad(
-        outputs = output,
+        outputs = batch_scores,
         inputs = wave,
-        grad_outputs = torch.ones_like(output),
+        grad_outputs = torch.ones_like(batch_scores),
         create_graph = True,
         retain_graph = True,
         only_inputs = True
     )[0]
-
     gradients = rearrange(gradients, 'b ... -> b (...)')
-    return weight * ((vector_norm(gradients, dim = 1) - center) ** 2).mean()
+    raw_penalty = gradients.square().sum(dim = 1).mean()
+    weighted_penalty = 0.5 * gamma * raw_penalty
+    return weighted_penalty, raw_penalty.detach()
+
+def aggregate_discriminator_losses(
+    waveform_losses,
+    stft_loss = None,
+    waveform_penalties = (),
+    stft_penalty = None
+):
+    """Average discriminator branches after adding each branch's regularizer."""
+    branch_losses = []
+    for index, loss in enumerate(waveform_losses):
+        if index < len(waveform_penalties):
+            loss = loss + waveform_penalties[index]
+        branch_losses.append(loss)
+
+    if exists(stft_loss):
+        if exists(stft_penalty):
+            stft_loss = stft_loss + stft_penalty
+        branch_losses.append(stft_loss)
+
+    if not branch_losses:
+        raise RuntimeError('no discriminator branch losses were produced')
+
+    return torch.stack(branch_losses).mean()
 
 # better sequential
 
@@ -248,7 +277,24 @@ class ComplexSTFTDiscriminator(Module):
         for layer_stride, (chan_in, chan_out) in zip(strides, layer_channels_pairs):
             self.layers.append(ComplexSTFTResidualUnit(chan_in, chan_out, layer_stride))
 
-        self.final_conv = ComplexConv2d(layer_channels[-1], 1, (16, 1)) # todo: remove hardcoded 16
+        # torch.stft returns n_fft // 2 + 1 bins.  Drop Nyquist in forward so
+        # the paper's F = W / 2 convention is exact, then compute the actual
+        # post-block frequency width from the configured strides.  This avoids
+        # a hard-coded kernel that leaves multiple frequency logits behind.
+        final_frequency_bins = n_fft // 2
+        for _, frequency_stride in strides:
+            kernel_size = frequency_stride + 2
+            padding = kernel_size // 2
+            final_frequency_bins = (
+                final_frequency_bins + 2 * padding - kernel_size
+            ) // frequency_stride + 1
+
+        self.final_frequency_bins = final_frequency_bins
+        self.final_conv = ComplexConv2d(
+            layer_channels[-1],
+            1,
+            (1, final_frequency_bins)
+        )
 
         # stft settings
 
@@ -286,7 +332,11 @@ class ComplexSTFTDiscriminator(Module):
             return_complex = True
         )
 
-        x = rearrange(x, 'b ... -> b 1 ...')
+        # [batch, frequency, time] -> [batch, channel, time, frequency].
+        # The residual-unit strides are defined as (time, frequency), matching
+        # the SoundStream paper rather than accidentally swapping both axes.
+        x = x[:, :-1, :]
+        x = rearrange(x, 'b f t -> b 1 t f')
 
         intermediates = []
 
@@ -299,6 +349,13 @@ class ComplexSTFTDiscriminator(Module):
             intermediates.append(x)
 
         complex_logits = self.final_conv(x)
+        if complex_logits.shape[-1] != 1:
+            raise RuntimeError(
+                "STFT discriminator final convolution did not aggregate all "
+                f"frequency bins: output_shape={tuple(complex_logits.shape)}, "
+                f"kernel_frequency={self.final_frequency_bins}"
+            )
+        complex_logits = complex_logits.squeeze(-1)
 
         if self.logits_abs:
             # Kept only as a compatibility option.  Magnitude logits are
@@ -1514,12 +1571,22 @@ class SoundStream(Module):
             discriminator_intermediates.append((real_intermediates, fake_intermediates))
             adversarial_losses.append(hinge_gen_loss(fake_logits))
 
-        feature_losses = [
-            F.l1_loss(real_feature, fake_feature)
-            for real_features, fake_features in discriminator_intermediates
-            for real_feature, fake_feature in zip(real_features, fake_features)
-        ]
-        feature_loss = torch.stack(feature_losses).mean()
+        per_discriminator_feature_losses = []
+        for real_features, fake_features in discriminator_intermediates:
+            if len(real_features) != len(fake_features) or len(real_features) == 0:
+                raise RuntimeError(
+                    "feature-matching intermediates must be non-empty and aligned: "
+                    f"real={len(real_features)}, fake={len(fake_features)}"
+                )
+            layer_losses = [
+                F.l1_loss(real_feature, fake_feature)
+                for real_feature, fake_feature in zip(real_features, fake_features)
+            ]
+            per_discriminator_feature_losses.append(
+                torch.stack(layer_losses).mean()
+            )
+
+        feature_loss = torch.stack(per_discriminator_feature_losses).mean()
         adversarial_losses.append(hinge_gen_loss(stft_fake_logits))
         adversarial_loss = torch.stack(adversarial_losses).mean()
         return adversarial_loss, feature_loss
@@ -1592,6 +1659,30 @@ class SoundStream(Module):
         assert path.exists()
         obj = torch.load(str(path))
         self.load_state_dict(obj['model'])
+
+    @staticmethod
+    def is_discriminator_state_key(key):
+        return key.startswith(('stft_discriminator.', 'discriminators.'))
+
+    def load_generator_state_dict(self, state_dict):
+        """Strictly load generator/RVQ state while reinitializing discriminators."""
+        generator_state = {
+            key: value
+            for key, value in state_dict.items()
+            if not self.is_discriminator_state_key(key)
+        }
+        incompatible = self.load_state_dict(generator_state, strict = False)
+        unexpected = list(incompatible.unexpected_keys)
+        missing_generator = [
+            key for key in incompatible.missing_keys
+            if not self.is_discriminator_state_key(key)
+        ]
+        if unexpected or missing_generator:
+            raise RuntimeError(
+                "generator-only checkpoint load was not strict for generator "
+                f"state: missing={missing_generator}, unexpected={unexpected}"
+            )
+        return tuple(incompatible.missing_keys)
 
     def non_discr_parameters(self):
         return [
@@ -1692,6 +1783,9 @@ class SoundStream(Module):
         return_recons_only = False,
         input_sample_hz = None,
         apply_grad_penalty = False,
+        apply_stft_grad_penalty = False,
+        waveform_grad_penalty_gamma = 0.,
+        stft_grad_penalty_gamma = 1e-4,
         curtail_from_left = False,
         num_quantizers = None,
         freeze_codebook = False
@@ -1761,7 +1855,7 @@ class SoundStream(Module):
         # multi-scale discriminator loss
 
         if return_discr_loss:
-            real, fake = orig_x, recon_x.detach()
+            real, fake = orig_x.detach(), recon_x.detach()
 
             stft_discr_loss = None
             stft_grad_penalty = None
@@ -1769,37 +1863,45 @@ class SoundStream(Module):
             discr_grad_penalties = []
 
             if self.single_channel:
-                real, fake = orig_x.clone(), recon_x.detach()
-                stft_real_logits, stft_fake_logits = map(self.stft_discriminator, (real.requires_grad_(), fake.requires_grad_()))
+                real = orig_x.detach().requires_grad_(apply_stft_grad_penalty)
+                fake = recon_x.detach()
+                stft_real_logits = self.stft_discriminator(real)
+                stft_fake_logits = self.stft_discriminator(fake)
                 stft_discr_loss = hinge_discr_loss(stft_fake_logits, stft_real_logits)
 
-                if apply_grad_penalty:
-                    stft_grad_penalty = gradient_penalty(real, stft_discr_loss) + gradient_penalty(fake, stft_discr_loss)
+                if apply_stft_grad_penalty:
+                    stft_grad_penalty, _ = r1_gradient_penalty(
+                        real,
+                        stft_real_logits,
+                        stft_grad_penalty_gamma
+                    )
 
             scaled_real, scaled_fake = real, fake
             for discr, downsample in zip(self.discriminators, self.downsamples):
                 scaled_real, scaled_fake = map(downsample, (scaled_real, scaled_fake))
 
-                real_logits, fake_logits = map(discr, (scaled_real.requires_grad_(), scaled_fake.requires_grad_()))
+                if apply_grad_penalty:
+                    scaled_real.requires_grad_(True)
+                real_logits = discr(scaled_real)
+                fake_logits = discr(scaled_fake)
                 one_discr_loss = hinge_discr_loss(fake_logits, real_logits)
 
                 discr_losses.append(one_discr_loss)
                 if apply_grad_penalty:
-                    discr_grad_penalties.extend([
-                        gradient_penalty(scaled_real, one_discr_loss),
-                        gradient_penalty(scaled_fake, one_discr_loss)
-                    ])
+                    one_grad_penalty, _ = r1_gradient_penalty(
+                        scaled_real,
+                        real_logits,
+                        waveform_grad_penalty_gamma
+                    )
+                    discr_grad_penalties.append(one_grad_penalty)
 
             if not return_discr_losses_separately:
-                all_discr_losses = torch.stack(discr_losses).mean()
-
-                if exists(stft_discr_loss):
-                    all_discr_losses = all_discr_losses + stft_discr_loss
-
-                if exists(stft_grad_penalty):
-                    all_discr_losses = all_discr_losses + stft_grad_penalty
-
-                return all_discr_losses
+                return aggregate_discriminator_losses(
+                    discr_losses,
+                    stft_discr_loss,
+                    discr_grad_penalties,
+                    stft_grad_penalty
+                )
 
             # return a list of discriminator losses with List[Tuple[str, Tensor]]
 
@@ -2134,6 +2236,9 @@ class FrameStreamingSoundStream(SoundStream):
         return_recons_only = False,
         input_sample_hz = None,
         apply_grad_penalty = False,
+        apply_stft_grad_penalty = False,
+        waveform_grad_penalty_gamma = 0.,
+        stft_grad_penalty_gamma = 1e-4,
         curtail_from_left = False,
         num_quantizers = None,
         freeze_codebook = False
@@ -2168,7 +2273,7 @@ class FrameStreamingSoundStream(SoundStream):
             return recon_x
 
         if return_discr_loss:
-            real, fake = orig_x, recon_x.detach()
+            real, fake = orig_x.detach(), recon_x.detach()
 
             stft_discr_loss = None
             stft_grad_penalty = None
@@ -2176,37 +2281,45 @@ class FrameStreamingSoundStream(SoundStream):
             discr_grad_penalties = []
 
             if self.single_channel:
-                real, fake = orig_x.clone(), recon_x.detach()
-                stft_real_logits, stft_fake_logits = map(self.stft_discriminator, (real.requires_grad_(), fake.requires_grad_()))
+                real = orig_x.detach().requires_grad_(apply_stft_grad_penalty)
+                fake = recon_x.detach()
+                stft_real_logits = self.stft_discriminator(real)
+                stft_fake_logits = self.stft_discriminator(fake)
                 stft_discr_loss = hinge_discr_loss(stft_fake_logits, stft_real_logits)
 
-                if apply_grad_penalty:
-                    stft_grad_penalty = gradient_penalty(real, stft_discr_loss) + gradient_penalty(fake, stft_discr_loss)
+                if apply_stft_grad_penalty:
+                    stft_grad_penalty, _ = r1_gradient_penalty(
+                        real,
+                        stft_real_logits,
+                        stft_grad_penalty_gamma
+                    )
 
             scaled_real, scaled_fake = real, fake
             for discr, downsample in zip(self.discriminators, self.downsamples):
                 scaled_real, scaled_fake = map(downsample, (scaled_real, scaled_fake))
 
-                real_logits, fake_logits = map(discr, (scaled_real.requires_grad_(), scaled_fake.requires_grad_()))
+                if apply_grad_penalty:
+                    scaled_real.requires_grad_(True)
+                real_logits = discr(scaled_real)
+                fake_logits = discr(scaled_fake)
                 one_discr_loss = hinge_discr_loss(fake_logits, real_logits)
 
                 discr_losses.append(one_discr_loss)
                 if apply_grad_penalty:
-                    discr_grad_penalties.extend([
-                        gradient_penalty(scaled_real, one_discr_loss),
-                        gradient_penalty(scaled_fake, one_discr_loss)
-                    ])
+                    one_grad_penalty, _ = r1_gradient_penalty(
+                        scaled_real,
+                        real_logits,
+                        waveform_grad_penalty_gamma
+                    )
+                    discr_grad_penalties.append(one_grad_penalty)
 
             if not return_discr_losses_separately:
-                all_discr_losses = torch.stack(discr_losses).mean()
-
-                if exists(stft_discr_loss):
-                    all_discr_losses = all_discr_losses + stft_discr_loss
-
-                if exists(stft_grad_penalty):
-                    all_discr_losses = all_discr_losses + stft_grad_penalty
-
-                return all_discr_losses
+                return aggregate_discriminator_losses(
+                    discr_losses,
+                    stft_discr_loss,
+                    discr_grad_penalties,
+                    stft_grad_penalty
+                )
 
             discr_losses_pkg = []
 

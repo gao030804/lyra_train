@@ -195,7 +195,10 @@ def soundstream_from_checkpoint(pkg: dict, use_ema: bool) -> SoundStream:
     else:
         state_dict = pkg["model"]
 
-    model.load_state_dict(state_dict, strict=True)
+    # Inference only uses encoder, RVQ and decoder.  Loading generator state
+    # strictly keeps older checkpoints usable after discriminator-only
+    # architecture corrections, without hiding any generator mismatch.
+    model.load_generator_state_dict(state_dict)
     return model
 
 
