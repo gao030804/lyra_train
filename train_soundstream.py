@@ -79,9 +79,9 @@ STAGE_DEFAULTS = {
     # Stage 1.5 starts from the validation-selected stage-1 codec. It keeps
     # RVQ trainable and only adds a small spectral refinement objective.
     "spectral_refine": dict(
-        steps=10_000, batch_size=4, segment_seconds=4.,
+        steps=20_000, batch_size=4, segment_seconds=4.,
         save_every=1_000, eval_every=250, min_steps=5_000, patience=30,
-        lr=1e-5, discr_lr=None, ema_beta=0.999,
+        lr=2e-5, discr_lr=None, ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
         use_ema=True,
         click_loss_weight=0., jump_loss_weight=0.,
@@ -91,6 +91,13 @@ STAGE_DEFAULTS = {
         spectral_envelope_loss_start_steps=0,
         spectral_envelope_loss_warmup_steps=0,
         stft_recon_loss_weight=0.10,
+        stft_recon_loss_start_steps=0,
+        stft_recon_loss_warmup_steps=5_000,
+        frame_phase_loss_weight=0.005,
+        frame_phase_loss_start_steps=0,
+        frame_phase_loss_warmup_steps=5_000,
+        decoder_x8_residual_scale_target=0.85,
+        decoder_x8_residual_scale_ramp_steps=3_000,
         si_sdr_loss_weight=0.03,
         si_sdr_loss_start_steps=0,
         si_sdr_loss_warmup_steps=0,
@@ -652,6 +659,30 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--stft-recon-loss-weight",
+        type=float,
+        default=None,
+        help="Independent MR-STFT weight; defaults depend on --stage.",
+    )
+    parser.add_argument(
+        "--stft-recon-loss-warmup-steps",
+        type=int,
+        default=None,
+        help="Linear ramp duration for independent MR-STFT loss.",
+    )
+    parser.add_argument(
+        "--frame-phase-loss-weight",
+        type=float,
+        default=None,
+        help="Weight for the 320-sample frame-phase residual loss.",
+    )
+    parser.add_argument(
+        "--frame-phase-loss-warmup-steps",
+        type=int,
+        default=None,
+        help="Linear ramp duration for frame-phase residual loss.",
+    )
+    parser.add_argument(
         "--stage2-generator-hold-lr",
         type=float,
         default=5e-6,
@@ -671,6 +702,36 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1e-5,
         help="Discriminator LR during the initial Stage-2 GAN ramp.",
+    )
+    parser.add_argument(
+        "--stage2-recon-transition-start-steps",
+        type=int,
+        default=20_000,
+        help=(
+            "For gan_pretrain, begin linearly transitioning Stage-1 "
+            "reconstruction weights to their Stage-2 endpoint at this step."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-recon-transition-end-steps",
+        type=int,
+        default=40_000,
+        help="For gan_pretrain, finish the reconstruction-weight transition at this step.",
+    )
+    parser.add_argument(
+        "--stage2-quality-gate-start-steps",
+        type=int,
+        default=20_000,
+        help=(
+            "Record Stage-2 quality retention from initialization, but defer "
+            "quality hard-stop accumulation until this step."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-best-checkpoint-min-step",
+        type=int,
+        default=20_000,
+        help="Do not save Stage-2 best candidates before this completed step.",
     )
     parser.add_argument(
         "--decoder-residual-scale-warmup-end-steps",
@@ -737,6 +798,17 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Text file for final held-out test summary. Defaults to results/stage1_test_report.txt.",
+    )
+    parser.add_argument(
+        "--test-only",
+        action="store_true",
+        help="Skip training and evaluate only --test-checkpoint on the held-out split.",
+    )
+    parser.add_argument(
+        "--test-checkpoint",
+        type=Path,
+        default=None,
+        help="Explicit checkpoint for --test-only; accepts model-only or full trainer checkpoints.",
     )
     parser.add_argument(
         "--resume",
@@ -832,6 +904,8 @@ def load_model_weights_only(
             )
     state_dict = pkg["model"] if "model" in pkg else pkg
     model.load_state_dict(state_dict, strict=True)
+    if checkpoint_config and hasattr(model, "restore_decoder_runtime_state"):
+        model.restore_decoder_runtime_state(checkpoint_config)
     return checkpoint_config
 
 
@@ -853,6 +927,7 @@ def build_model(
     preemph_loss_weight: float,
     noise_floor_loss_weight: float,
     stft_recon_loss_weight: float,
+    frame_phase_loss_weight: float,
     gan_adversarial_max: float,
     gan_feature_max: float,
     decoder_upsample_mode: str,
@@ -897,6 +972,8 @@ def build_model(
         jump_loss_weight=jump_loss_weight,
         preemph_loss_weight=preemph_loss_weight,
         noise_floor_loss_weight=noise_floor_loss_weight,
+        frame_phase_loss_weight=frame_phase_loss_weight,
+        frame_phase_samples=320,
         commitment_loss_weight=0.1,
         adversarial_loss_weight=(gan_adversarial_max if stage in GAN_STAGES else 0.),
         feature_loss_weight=(gan_feature_max if stage in GAN_STAGES else 0.),
@@ -939,6 +1016,14 @@ def main() -> None:
         raise ValueError("--si-sdr-loss-warmup-steps cannot be negative.")
     if args.spectral_envelope_loss_weight is not None and args.spectral_envelope_loss_weight < 0:
         raise ValueError("--spectral-envelope-loss-weight cannot be negative.")
+    if args.stft_recon_loss_weight is not None and args.stft_recon_loss_weight < 0:
+        raise ValueError("--stft-recon-loss-weight cannot be negative.")
+    if args.stft_recon_loss_warmup_steps is not None and args.stft_recon_loss_warmup_steps < 0:
+        raise ValueError("--stft-recon-loss-warmup-steps cannot be negative.")
+    if args.frame_phase_loss_weight is not None and args.frame_phase_loss_weight < 0:
+        raise ValueError("--frame-phase-loss-weight cannot be negative.")
+    if args.frame_phase_loss_warmup_steps is not None and args.frame_phase_loss_warmup_steps < 0:
+        raise ValueError("--frame-phase-loss-warmup-steps cannot be negative.")
     if (
         args.spectral_envelope_loss_start_steps is not None and
         args.spectral_envelope_loss_start_steps < 0
@@ -998,6 +1083,17 @@ def main() -> None:
         raise ValueError("--stage2-discriminator-hold-steps cannot be negative.")
     if args.stage2_discriminator_hold_lr <= 0:
         raise ValueError("--stage2-discriminator-hold-lr must be positive.")
+    if args.stage2_recon_transition_start_steps < 0:
+        raise ValueError("--stage2-recon-transition-start-steps cannot be negative.")
+    if args.stage2_recon_transition_end_steps < args.stage2_recon_transition_start_steps:
+        raise ValueError(
+            "--stage2-recon-transition-end-steps must be >= "
+            "--stage2-recon-transition-start-steps."
+        )
+    if args.stage2_quality_gate_start_steps < 0:
+        raise ValueError("--stage2-quality-gate-start-steps cannot be negative.")
+    if args.stage2_best_checkpoint_min_step < 0:
+        raise ValueError("--stage2-best-checkpoint-min-step cannot be negative.")
     if args.click_loss_weight is not None and args.click_loss_weight < 0:
         raise ValueError("--click-loss-weight cannot be negative.")
     if args.jump_loss_weight is not None and args.jump_loss_weight < 0:
@@ -1161,7 +1257,26 @@ def main() -> None:
         if args.transient_loss_warmup_steps is not None
         else stage_defaults["transient_loss_warmup_steps"]
     )
-    stft_recon_loss_weight = stage_defaults["stft_recon_loss_weight"]
+    stft_recon_loss_weight = (
+        args.stft_recon_loss_weight
+        if args.stft_recon_loss_weight is not None
+        else stage_defaults["stft_recon_loss_weight"]
+    )
+    stft_recon_loss_warmup_steps = (
+        args.stft_recon_loss_warmup_steps
+        if args.stft_recon_loss_warmup_steps is not None
+        else stage_defaults.get("stft_recon_loss_warmup_steps", 0)
+    )
+    frame_phase_loss_weight = (
+        args.frame_phase_loss_weight
+        if args.frame_phase_loss_weight is not None
+        else stage_defaults.get("frame_phase_loss_weight", 0.)
+    )
+    frame_phase_loss_warmup_steps = (
+        args.frame_phase_loss_warmup_steps
+        if args.frame_phase_loss_warmup_steps is not None
+        else stage_defaults.get("frame_phase_loss_warmup_steps", 0)
+    )
     waveform_recon_loss_weight = 10.0 if args.stage in ("overfit", *RECONSTRUCTION_STAGES) else 1.0
     multi_spectral_recon_loss_weight = 1.1 if args.stage in RECONSTRUCTION_STAGES else 0.7
     correlation_loss_weight = 0.02 if args.stage in RECONSTRUCTION_STAGES else 0.0
@@ -1218,7 +1333,10 @@ def main() -> None:
                 "5.000e-05 from step 35000"
             )
     elif args.stage == "spectral_refine":
-        print("Stage-1.5 LR schedule: fixed 1.000e-05 after the standard warmup.")
+        print(
+            "Stage-1.5 LR schedule: fixed "
+            f"{stage_defaults['lr']:.3e} after the standard warmup."
+        )
     elif args.stage == "gan_pretrain":
         if stage2_plateau_lr_enabled:
             print(
@@ -1243,6 +1361,20 @@ def main() -> None:
             "discriminators update from step 0 at "
             f"{args.stage2_discriminator_hold_lr:.3e} for steps [0, "
             f"{args.stage2_discriminator_hold_steps}), then return to 2.000e-05."
+        )
+        print(
+            "Stage-2 reconstruction transition: retain Stage-1 weights "
+            "(SI-SDR=0.07, corr=0.02, envelope=0.05, noise-floor=0.03) "
+            f"through step {args.stage2_recon_transition_start_steps}, then "
+            "linearly reach Stage-2 endpoints "
+            "(SI-SDR=0.03, corr=0, envelope=0, noise-floor=0.02) by step "
+            f"{args.stage2_recon_transition_end_steps}."
+        )
+        print(
+            "Stage-2 candidate policy: quality baseline at initialization; "
+            f"best checkpoints and quality hard-stop begin at step "
+            f"{args.stage2_best_checkpoint_min_step}/"
+            f"{args.stage2_quality_gate_start_steps}."
         )
     print(f"Random seed: {args.seed}")
     print(
@@ -1306,7 +1438,12 @@ def main() -> None:
     )
     print(
         "STFT reconstruction loss weight: "
-        f"{stft_recon_loss_weight}"
+        f"max={stft_recon_loss_weight}, warmup_steps={stft_recon_loss_warmup_steps}"
+    )
+    print(
+        "Frame-phase residual loss: "
+        f"max={frame_phase_loss_weight}, warmup_steps={frame_phase_loss_warmup_steps}, "
+        "frame_samples=320"
     )
     print(f"Decoder upsample mode: {args.decoder_upsample_mode}")
     print(f"Decoder linear upsample kernel min: {args.decoder_linear_upsample_kernel_min}")
@@ -1317,6 +1454,12 @@ def main() -> None:
         f"linear to {decoder_residual_scale_end} by step "
         f"{decoder_residual_scale_warmup_end_steps}"
     )
+    if stage_defaults.get("decoder_x8_residual_scale_target") is not None:
+        print(
+            "Decoder x8 residual-scale refinement: "
+            f"inherited -> {stage_defaults['decoder_x8_residual_scale_target']} over "
+            f"{stage_defaults.get('decoder_x8_residual_scale_ramp_steps', 0)} steps"
+        )
     if args.stage == "recon_pretrain":
         print(
             "Stage-1 best-checkpoint eligibility begins at step "
@@ -1366,7 +1509,7 @@ def main() -> None:
     print(f"Codebook size: {codebook_size}")
     print(f"RVQ quantizers: {num_quantizers}")
     print("RVQ quantize dropout: False")
-    print("RVQ dead-code threshold: 5")
+    print("RVQ dead-code threshold: 2")
     print(f"RVQ codebook synchronization: {world_size > 1}")
     if args.stage in ("stream_finetune", "stream_finetune_long"):
         print("RVQ codebook training: frozen")
@@ -1415,6 +1558,7 @@ def main() -> None:
         preemph_loss_weight=preemph_loss_weight,
         noise_floor_loss_weight=noise_floor_loss_weight,
         stft_recon_loss_weight=stft_recon_loss_weight,
+        frame_phase_loss_weight=frame_phase_loss_weight,
         gan_adversarial_max=stage_defaults.get("gan_adversarial_max", 0.001),
         gan_feature_max=stage_defaults.get("gan_feature_max", 5.0),
         decoder_upsample_mode=args.decoder_upsample_mode,
@@ -1507,6 +1651,33 @@ def main() -> None:
             if args.stage == "gan_pretrain"
             else None
         ),
+        stage2_recon_transition_start_steps=(
+            args.stage2_recon_transition_start_steps
+            if args.stage == "gan_pretrain"
+            else None
+        ),
+        stage2_recon_transition_end_steps=(
+            args.stage2_recon_transition_end_steps
+            if args.stage == "gan_pretrain"
+            else None
+        ),
+        stage2_initial_si_sdr_loss_weight=(
+            0.07 if args.stage == "gan_pretrain" else 0.
+        ),
+        stage2_initial_correlation_loss_weight=(
+            0.02 if args.stage == "gan_pretrain" else 0.
+        ),
+        stage2_initial_spectral_envelope_loss_weight=(
+            0.05 if args.stage == "gan_pretrain" else 0.
+        ),
+        stage2_initial_noise_floor_loss_weight=(
+            0.03 if args.stage == "gan_pretrain" else 0.
+        ),
+        quality_retention_start_step=(
+            args.stage2_quality_gate_start_steps
+            if args.stage == "gan_pretrain"
+            else 0
+        ),
         save_results_every=args.save_results_every,
         save_model_every=save_model_every,
         best_eval_every=best_eval_every,
@@ -1533,14 +1704,33 @@ def main() -> None:
             if spectral_envelope_loss_weight > 0
             else 0
         ),
+        stft_recon_loss_start_steps=stage_defaults.get("stft_recon_loss_start_steps", 0),
+        stft_recon_loss_warmup_steps=(
+            stft_recon_loss_warmup_steps if stft_recon_loss_weight > 0 else 0
+        ),
+        frame_phase_loss_start_steps=stage_defaults.get("frame_phase_loss_start_steps", 0),
+        frame_phase_loss_warmup_steps=(
+            frame_phase_loss_warmup_steps if frame_phase_loss_weight > 0 else 0
+        ),
         decoder_residual_scale_end=decoder_residual_scale_end,
         decoder_residual_scale_warmup_start_steps=decoder_residual_scale_warmup_start_steps,
         decoder_residual_scale_warmup_end_steps=decoder_residual_scale_warmup_end_steps,
+        decoder_x8_residual_scale_target=stage_defaults.get("decoder_x8_residual_scale_target"),
+        decoder_x8_residual_scale_ramp_steps=stage_defaults.get("decoder_x8_residual_scale_ramp_steps", 0),
         best_checkpoint_min_step=(
             decoder_residual_scale_warmup_end_steps
             if args.stage == "recon_pretrain"
-            else 0
+            else (
+                args.stage2_best_checkpoint_min_step
+                if args.stage == "gan_pretrain"
+                else (
+                    stage_defaults.get("min_steps", 0)
+                    if args.stage == "spectral_refine"
+                    else 0
+                )
+            )
         ),
+        frame_leakage_checkpoint=(args.stage == "spectral_refine"),
         clean_gate=not args.disable_clean_gate,
         clean_gate_min_aligned_si_sdr=args.clean_gate_min_aligned_si_sdr,
         clean_gate_min_aligned_corr=args.clean_gate_min_aligned_corr,
@@ -1591,9 +1781,22 @@ def main() -> None:
         force_clear_prev_results=False,
     )
 
-    checkpoint = latest_checkpoint(results_dir) if args.resume else None
+    checkpoint = (
+        latest_checkpoint(results_dir)
+        if args.resume and not args.test_only
+        else None
+    )
 
-    if checkpoint is not None:
+    if args.test_only:
+        if args.test_checkpoint is None:
+            raise ValueError("--test-only requires --test-checkpoint")
+        args.test_checkpoint = args.test_checkpoint.expanduser().resolve()
+        if not args.test_checkpoint.is_file():
+            raise FileNotFoundError(
+                f"Test checkpoint not found: {args.test_checkpoint}"
+            )
+        print(f"Test-only mode; training and checkpoint writes are disabled: {args.test_checkpoint}")
+    elif checkpoint is not None:
         print(f"Resuming from checkpoint: {checkpoint}")
         trainer.load(str(checkpoint))
     else:
@@ -1640,29 +1843,47 @@ def main() -> None:
                 init_checkpoint,
             )
             if args.stage in ("spectral_refine", "gan_pretrain"):
-                if "decoder_residual_scale" not in checkpoint_config:
+                inherited_block_scales = checkpoint_config.get(
+                    "decoder_block_residual_scales"
+                )
+                if inherited_block_scales is None and "decoder_residual_scale" not in checkpoint_config:
                     raise ValueError(
-                        "Initialization checkpoint does not record decoder_residual_scale; "
+                        "Initialization checkpoint does not record decoder residual scale state; "
                         "cannot safely continue a staged run without changing decoder behavior."
                     )
-                inherited_residual_scale = float(
-                    checkpoint_config["decoder_residual_scale"]
-                )
-                if inherited_residual_scale < 0.:
-                    raise ValueError(
-                        "Initialization checkpoint has invalid decoder_residual_scale="
-                        f"{inherited_residual_scale}."
+                if "decoder_residual_scale" in checkpoint_config:
+                    inherited_residual_scale = float(
+                        checkpoint_config["decoder_residual_scale"]
                     )
-                trainer.unwrapped_soundstream.set_decoder_residual_scale(
-                    inherited_residual_scale
+                else:
+                    inherited_residual_scale = float(inherited_block_scales[0])
+                inherited_block_scales = tuple(
+                    float(scale) for scale in (
+                        inherited_block_scales or
+                        (inherited_residual_scale,) * len(strides)
+                    )
                 )
+                if any(scale < 0. for scale in inherited_block_scales):
+                    raise ValueError(
+                        "Initialization checkpoint has invalid decoder block residual scales="
+                        f"{inherited_block_scales}."
+                    )
+                trainer.unwrapped_soundstream.set_decoder_block_residual_scales(
+                    inherited_block_scales
+                )
+                trainer.decoder_x8_residual_scale_start = inherited_block_scales[0]
+                if args.stage == "gan_pretrain":
+                    # Keep every refined block scale fixed. Using the legacy
+                    # scalar scheduler here would silently reset x5/x4/x2.
+                    trainer.decoder_x8_residual_scale_target = inherited_block_scales[0]
+                    trainer.decoder_x8_residual_scale_ramp_steps = 0
                 trainer.decoder_residual_scale_start = inherited_residual_scale
                 trainer.decoder_residual_scale_end = inherited_residual_scale
                 trainer.decoder_residual_scale_warmup_start_steps = 0
                 trainer.decoder_residual_scale_warmup_end_steps = 0
                 print(
-                    f"Preserved decoder residual scale from initialization checkpoint: "
-                    f"{inherited_residual_scale:.4f} (fixed for {args.stage})."
+                    "Restored decoder block residual scales from initialization checkpoint: "
+                    f"{inherited_block_scales}."
                 )
             if trainer.use_ema:
                 trainer.copy_online_to_ema()
@@ -1671,6 +1892,7 @@ def main() -> None:
         print("Starting a new training run.")
 
     if (
+        not args.test_only and
         args.stage == "gan_pretrain" and
         trainer.quality_retention_gate and
         not trainer.has_quality_retention_baseline
@@ -1713,12 +1935,13 @@ def main() -> None:
             )
         trainer.accelerator.wait_for_everyone()
 
-    trainer.train()
-    trainer.accelerator.wait_for_everyone()
+    if not args.test_only:
+        trainer.train()
+        trainer.accelerator.wait_for_everyone()
     is_main = trainer.is_main
     test_model = trainer.unwrapped_soundstream
 
-    if is_main:
+    if is_main and not args.test_only:
         # trainer.steps points to the next step, while checkpoint filenames
         # represent the last completed step.
         next_step = int(trainer.steps.item())
@@ -1743,9 +1966,13 @@ def main() -> None:
     best_by_aligned_si_sdr = results_dir / "best_by_aligned_si_sdr.pt"
     best_selected = results_dir / "best_selected.pt"
     best_checkpoint = (
-        best_by_aligned_si_sdr
-        if best_by_aligned_si_sdr.exists()
-        else best_selected
+        args.test_checkpoint
+        if args.test_only
+        else (
+            best_by_aligned_si_sdr
+            if best_by_aligned_si_sdr.exists()
+            else best_selected
+        )
     )
 
     if best_checkpoint.exists() and trainer.test_files:
@@ -1774,7 +2001,7 @@ def main() -> None:
         )
         test_report_file = (
             (args.test_report_file or (results_dir / "stage1_test_report.txt")).resolve()
-            if args.stage == "recon_pretrain"
+            if args.stage in ("recon_pretrain", "spectral_refine")
             else None
         )
 
@@ -1789,6 +2016,11 @@ def main() -> None:
                 print(f"Writing stage-1 test report to: {test_report_file}")
 
         load_model_weights_only(test_model, best_checkpoint)
+        if is_main and hasattr(test_model, "get_decoder_block_residual_scales"):
+            print(
+                "Final-test decoder block residual scales: "
+                f"{test_model.get_decoder_block_residual_scales()}"
+            )
         local_metrics = trainer.evaluate_full_audio_files(
             rank_test_files,
             model=test_model,
@@ -1823,6 +2055,15 @@ def main() -> None:
             'jump_ratio',
             'p999_jump_ratio',
             'click_score',
+            'frame_diagnostic_valid',
+            'ac_319',
+            'ac_320',
+            'ac_321',
+            'ac_320_isolated',
+            'frame_phase_peak_db',
+            'comb_median_excess_db',
+            'comb_p90_excess_db',
+            'comb_lines_gt_6db',
         )
         local_num_samples = (
             float(local_metrics['num_samples'])
@@ -1887,13 +2128,16 @@ def main() -> None:
                 f"recon_clip={test_metrics.get('recon_clip_fraction', 0.) * 100:.6f}%, "
                 f"jump_ratio={test_metrics.get('jump_ratio', 0.):.6f}, "
                 f"click_score={test_metrics.get('click_score', 0.):.6f}, "
+                f"ac_320_isolated={test_metrics.get('ac_320_isolated', 0.):+.6f}, "
+                f"phase_peak_db={test_metrics.get('frame_phase_peak_db', 0.):+.3f}, "
+                f"comb_median_db={test_metrics.get('comb_median_excess_db', 0.):+.3f}, "
                 f"active_codes={test_metrics['active_code_ratio']:.6f}, "
                 f"perplexity={test_metrics['codebook_perplexity']:.6f}"
             )
             if test_report_file is not None:
                 test_report_file.parent.mkdir(parents=True, exist_ok=True)
                 with test_report_file.open("w", encoding="utf-8") as f:
-                    f.write("Stage-1 held-out test report\n")
+                    f.write("Stage-1/1.5 held-out test report\n")
                     f.write(f"checkpoint\t{best_checkpoint}\n")
                     f.write(f"results_dir\t{results_dir}\n")
                     f.write(f"num_test_files\t{len(selected_test_files)}\n")

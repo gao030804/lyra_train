@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import copy
+import pickle
 import random
 from math import isfinite, sqrt
 from datetime import timedelta
@@ -287,6 +288,13 @@ class SoundStreamTrainer(nn.Module):
         generator_hold_lr: float | None = None,
         discriminator_hold_steps: int = 0,
         discriminator_hold_lr: float | None = None,
+        stage2_recon_transition_start_steps: int | None = None,
+        stage2_recon_transition_end_steps: int | None = None,
+        stage2_initial_si_sdr_loss_weight: float = 0.,
+        stage2_initial_correlation_loss_weight: float = 0.,
+        stage2_initial_spectral_envelope_loss_weight: float = 0.,
+        stage2_initial_noise_floor_loss_weight: float = 0.,
+        quality_retention_start_step: int = 0,
         discr_warmup_steps: int | None = None,
         discr_scheduler: Type[LRScheduler] | None = None,
         discr_scheduler_kwargs: dict = dict(),
@@ -300,12 +308,19 @@ class SoundStreamTrainer(nn.Module):
         si_sdr_loss_warmup_steps: int = 0,
         spectral_envelope_loss_start_steps: int = 0,
         spectral_envelope_loss_warmup_steps: int = 0,
+        stft_recon_loss_start_steps: int = 0,
+        stft_recon_loss_warmup_steps: int = 0,
+        frame_phase_loss_start_steps: int = 0,
+        frame_phase_loss_warmup_steps: int = 0,
         transient_loss_warmup_steps: int = 0,
         decoder_residual_scale_start: float = 1.,
         decoder_residual_scale_end: float = 1.,
         decoder_residual_scale_warmup_start_steps: int = 0,
         decoder_residual_scale_warmup_end_steps: int = 0,
+        decoder_x8_residual_scale_target: float | None = None,
+        decoder_x8_residual_scale_ramp_steps: int = 0,
         best_checkpoint_min_step: int = 0,
+        frame_leakage_checkpoint: bool = False,
         clean_gate: bool = True,
         clean_gate_min_aligned_si_sdr: float = 0.,
         clean_gate_min_aligned_corr: float = 0.65,
@@ -408,6 +423,24 @@ class SoundStreamTrainer(nn.Module):
         )
         self.spectral_envelope_loss_start_steps = spectral_envelope_loss_start_steps
         self.spectral_envelope_loss_warmup_steps = spectral_envelope_loss_warmup_steps
+        self.stft_recon_loss_max_weight = float(
+            getattr(soundstream, 'stft_recon_loss_weight', 0.)
+        )
+        self.stft_recon_loss_start_steps = stft_recon_loss_start_steps
+        self.stft_recon_loss_warmup_steps = stft_recon_loss_warmup_steps
+        self.frame_phase_loss_max_weight = float(
+            getattr(soundstream, 'frame_phase_loss_weight', 0.)
+        )
+        self.frame_phase_loss_start_steps = frame_phase_loss_start_steps
+        self.frame_phase_loss_warmup_steps = frame_phase_loss_warmup_steps
+        # The Stage-2 reconstruction transition interpolates toward these
+        # configured endpoint values rather than hard-coding a second copy.
+        self.stage2_final_correlation_loss_weight = float(
+            getattr(soundstream, 'correlation_loss_weight', 0.)
+        )
+        self.stage2_final_noise_floor_loss_weight = float(
+            getattr(soundstream, 'noise_floor_loss_weight', 0.)
+        )
         self.click_loss_max_weight = float(
             getattr(soundstream, 'click_loss_weight', 0.)
         )
@@ -424,7 +457,17 @@ class SoundStreamTrainer(nn.Module):
         self.decoder_residual_scale_end = decoder_residual_scale_end
         self.decoder_residual_scale_warmup_start_steps = decoder_residual_scale_warmup_start_steps
         self.decoder_residual_scale_warmup_end_steps = decoder_residual_scale_warmup_end_steps
+        if exists(decoder_x8_residual_scale_target):
+            assert decoder_x8_residual_scale_target >= 0.
+        assert decoder_x8_residual_scale_ramp_steps >= 0
+        self.decoder_x8_residual_scale_target = decoder_x8_residual_scale_target
+        self.decoder_x8_residual_scale_ramp_steps = decoder_x8_residual_scale_ramp_steps
+        initial_block_scales = getattr(soundstream, 'decoder_block_residual_scales', ())
+        self.decoder_x8_residual_scale_start = (
+            float(initial_block_scales[0]) if initial_block_scales else decoder_residual_scale_end
+        )
         self.best_checkpoint_min_step = best_checkpoint_min_step
+        self.frame_leakage_checkpoint = frame_leakage_checkpoint
         self.clean_gate = clean_gate
         self.clean_gate_min_aligned_si_sdr = clean_gate_min_aligned_si_sdr
         self.clean_gate_min_aligned_corr = clean_gate_min_aligned_corr
@@ -507,6 +550,18 @@ class SoundStreamTrainer(nn.Module):
             assert discriminator_hold_lr > 0.
         self.discriminator_hold_steps = discriminator_hold_steps
         self.discriminator_hold_lr = discriminator_hold_lr
+        if exists(stage2_recon_transition_start_steps):
+            assert stage2_recon_transition_start_steps >= 0
+            assert exists(stage2_recon_transition_end_steps)
+            assert stage2_recon_transition_end_steps >= stage2_recon_transition_start_steps
+        self.stage2_recon_transition_start_steps = stage2_recon_transition_start_steps
+        self.stage2_recon_transition_end_steps = stage2_recon_transition_end_steps
+        self.stage2_initial_si_sdr_loss_weight = stage2_initial_si_sdr_loss_weight
+        self.stage2_initial_correlation_loss_weight = stage2_initial_correlation_loss_weight
+        self.stage2_initial_spectral_envelope_loss_weight = stage2_initial_spectral_envelope_loss_weight
+        self.stage2_initial_noise_floor_loss_weight = stage2_initial_noise_floor_loss_weight
+        assert quality_retention_start_step >= 0
+        self.quality_retention_start_step = quality_retention_start_step
         self.plateau_lr_unclean_checks = 0
         # Build this after the trainer modules are passed through
         # accelerator.prepare().  Otherwise the scheduler can hold a reference
@@ -786,6 +841,7 @@ class SoundStreamTrainer(nn.Module):
         self.best_checkpoint_metric = best_checkpoint_metric
         self.best_valid_score = float('inf')
         self.best_aligned_si_sdr = float('-inf')
+        self.best_frame_leakage_score = float('inf')
         assert not exists(early_stopping_patience) or early_stopping_patience > 0
         assert early_stopping_min_delta >= 0.
         assert early_stopping_min_steps >= 0
@@ -851,6 +907,13 @@ class SoundStreamTrainer(nn.Module):
         ema_model = self.ema_soundstream.ema_model
 
         if (
+            hasattr(online_model, 'get_decoder_block_residual_scales') and
+            hasattr(ema_model, 'set_decoder_block_residual_scales')
+        ):
+            ema_model.set_decoder_block_residual_scales(
+                online_model.get_decoder_block_residual_scales()
+            )
+        elif (
             hasattr(online_model, 'decoder_residual_scale') and
             hasattr(ema_model, 'set_decoder_residual_scale')
         ):
@@ -861,6 +924,8 @@ class SoundStreamTrainer(nn.Module):
         for attribute in (
             'si_sdr_loss_weight',
             'spectral_envelope_loss_weight',
+            'stft_recon_loss_weight',
+            'frame_phase_loss_weight',
             'click_loss_weight',
             'jump_loss_weight',
             'preemph_loss_weight',
@@ -886,6 +951,7 @@ class SoundStreamTrainer(nn.Module):
             discr_optim = self.discr_optim.state_dict(),
             best_valid_score = self.best_valid_score,
             best_aligned_si_sdr = self.best_aligned_si_sdr,
+            best_frame_leakage_score = self.best_frame_leakage_score,
             early_stopping_bad_evals = self.early_stopping_bad_evals,
             early_stopping_triggered = self.early_stopping_triggered,
             quality_retention_baseline = self.quality_retention_baseline,
@@ -981,6 +1047,15 @@ class SoundStreamTrainer(nn.Module):
             self.best_aligned_si_sdr = max(
                 self.best_aligned_si_sdr,
                 best_aligned_si_sdr
+            )
+
+        best_frame_leakage_score = self.saved_model_only_score(
+            self.results_folder / 'best_by_frame_leakage.pt'
+        )
+        if exists(best_frame_leakage_score):
+            self.best_frame_leakage_score = min(
+                self.best_frame_leakage_score,
+                best_frame_leakage_score
             )
 
     def codebook_metrics(self, model, indices):
@@ -1250,6 +1325,74 @@ class SoundStreamTrainer(nn.Module):
         rms_ratio = (recon_rms / target_rms).mean()
         boundary_loss = target.new_tensor(0.)
 
+        # Validation-only 50 Hz / 320-sample leakage diagnostics.  These use
+        # exactly the same full residual for every checkpoint candidate and do
+        # not alter the reconstruction passed to the ordinary quality metrics.
+        frame_samples = int(getattr(model, 'frame_phase_samples', 320))
+        usable_samples = (
+            min(target.shape[-1], recon.shape[-1]) // frame_samples
+        ) * frame_samples
+        frame_diagnostic_valid = target.new_tensor(float(usable_samples >= frame_samples * 4))
+        ac_319 = target.new_tensor(0.)
+        ac_320 = target.new_tensor(0.)
+        ac_321 = target.new_tensor(0.)
+        ac_320_isolated = target.new_tensor(0.)
+        frame_phase_peak_db = target.new_tensor(0.)
+        comb_median_excess_db = target.new_tensor(0.)
+        comb_p90_excess_db = target.new_tensor(0.)
+        comb_lines_gt_6db = target.new_tensor(0.)
+        if frame_diagnostic_valid.item() >= 0.5:
+            frame_residual = (
+                recon[..., :usable_samples] - target[..., :usable_samples]
+            ).float().reshape(-1, usable_samples)
+            residual_rms = frame_residual.square().mean(dim = -1).clamp_min(1e-12).sqrt()
+            residual_hp = frame_residual[..., 1:] - frame_residual[..., :-1]
+            residual_hp = residual_hp - residual_hp.mean(dim = -1, keepdim = True)
+
+            def normalized_ac(lag):
+                left = residual_hp[..., :-lag]
+                right = residual_hp[..., lag:]
+                numerator = (left * right).sum(dim = -1)
+                denominator = (
+                    left.square().sum(dim = -1) * right.square().sum(dim = -1)
+                ).clamp_min(1e-12).sqrt()
+                return (numerator / denominator).mean()
+
+            ac_319 = normalized_ac(frame_samples - 1)
+            ac_320 = normalized_ac(frame_samples)
+            ac_321 = normalized_ac(frame_samples + 1)
+            ac_320_isolated = ac_320 - 0.5 * (ac_319 + ac_321)
+
+            phase_pattern = frame_residual.reshape(
+                -1, usable_samples // frame_samples, frame_samples
+            ).mean(dim = 1)
+            phase_pattern = phase_pattern - phase_pattern.mean(dim = -1, keepdim = True)
+            phase_peak = phase_pattern.abs().amax(dim = -1)
+            frame_phase_peak_db = (
+                20. * torch.log10((phase_peak / residual_rms).clamp_min(1e-8))
+            ).mean()
+
+            spectrum_db = 20. * torch.log10(
+                torch.fft.rfft(frame_residual, dim = -1).abs().clamp_min(1e-8)
+            )
+            frame_count = usable_samples // frame_samples
+            harmonic_bins = torch.arange(
+                frame_count,
+                spectrum_db.shape[-1] - 1,
+                frame_count,
+                device = spectrum_db.device
+            )
+            if harmonic_bins.numel() > 0:
+                line_db = spectrum_db[:, harmonic_bins]
+                neighbor_db = 0.5 * (
+                    spectrum_db[:, harmonic_bins - 1] +
+                    spectrum_db[:, harmonic_bins + 1]
+                )
+                comb_excess = line_db - neighbor_db
+                comb_median_excess_db = comb_excess.median(dim = -1).values.mean()
+                comb_p90_excess_db = torch.quantile(comb_excess, 0.9, dim = -1).mean()
+                comb_lines_gt_6db = (comb_excess > 6.).float().sum(dim = -1).mean()
+
         target_peak = target.abs().amax(dim = -1).mean()
         recon_peak = recon.abs().amax(dim = -1).mean()
         target_clip_fraction = (target.abs() >= 0.98).float().mean()
@@ -1457,6 +1600,15 @@ class SoundStreamTrainer(nn.Module):
             si_sdr = float(si_sdr.detach().cpu()),
             aligned_correlation = float(aligned_correlation.detach().cpu()),
             aligned_si_sdr = float(aligned_si_sdr.detach().cpu()),
+            frame_diagnostic_valid = float(frame_diagnostic_valid.detach().cpu()),
+            ac_319 = float(ac_319.detach().cpu()),
+            ac_320 = float(ac_320.detach().cpu()),
+            ac_321 = float(ac_321.detach().cpu()),
+            ac_320_isolated = float(ac_320_isolated.detach().cpu()),
+            frame_phase_peak_db = float(frame_phase_peak_db.detach().cpu()),
+            comb_median_excess_db = float(comb_median_excess_db.detach().cpu()),
+            comb_p90_excess_db = float(comb_p90_excess_db.detach().cpu()),
+            comb_lines_gt_6db = float(comb_lines_gt_6db.detach().cpu()),
             validation_eligible = float(validation_eligible.detach().cpu())
         )
 
@@ -1649,12 +1801,17 @@ class SoundStreamTrainer(nn.Module):
                             (context, current_padded),
                             dim=-1
                         )
+                        # load_audio_file returns [channels, samples].  The
+                        # regular SoundStream input packs every leading axis
+                        # and restores a channel axis on output, so adding an
+                        # extra batch dimension here produced [1, 1, 1, N]
+                        # reconstructions during full-file evaluation.
                         reconstructed = model(
-                            codec_input.unsqueeze(0),
+                            codec_input,
                             return_recons_only=True
                         )
                         _, indices, commitment_loss = model(
-                            codec_input.unsqueeze(0),
+                            codec_input,
                             return_encoded=True
                         )
                         reconstructed = reconstructed[
@@ -2248,6 +2405,18 @@ class SoundStreamTrainer(nn.Module):
         # otherwise load things normally
 
         self.unwrapped_soundstream.load_state_dict(pkg['model'])
+        if (
+            'config' in pkg and
+            hasattr(self.unwrapped_soundstream, 'restore_decoder_runtime_state')
+        ):
+            checkpoint_config = pickle.loads(pkg['config'])
+            restored_scales = self.unwrapped_soundstream.restore_decoder_runtime_state(
+                checkpoint_config
+            )
+            self.print(
+                "Restored decoder runtime block scales from training checkpoint: "
+                f"{restored_scales}"
+            )
 
         if self.use_ema:
             if 'ema_model' in pkg:
@@ -2268,6 +2437,7 @@ class SoundStreamTrainer(nn.Module):
         self.discr_optim.load_state_dict(pkg['discr_optim'])
         self.best_valid_score = pkg.get('best_valid_score', float('inf'))
         self.best_aligned_si_sdr = pkg.get('best_aligned_si_sdr', float('-inf'))
+        self.best_frame_leakage_score = pkg.get('best_frame_leakage_score', float('inf'))
         self.early_stopping_bad_evals = pkg.get('early_stopping_bad_evals', 0)
         self.early_stopping_triggered = pkg.get('early_stopping_triggered', False)
         self.quality_retention_baseline = pkg.get('quality_retention_baseline')
@@ -2412,6 +2582,76 @@ class SoundStreamTrainer(nn.Module):
         model.spectral_envelope_loss_weight = self.spectral_envelope_loss_max_weight * progress
         return progress
 
+    @staticmethod
+    def scheduled_loss_weight(steps, start_steps, warmup_steps, max_weight):
+        if max_weight <= 0 or steps < start_steps:
+            return 0., 0.
+        progress = 1. if warmup_steps <= 0 else min(
+            1., max(0., (steps - start_steps) / warmup_steps)
+        )
+        return max_weight * progress, progress
+
+    def update_spectral_refinement_weights(self, steps):
+        model = self.unwrapped_soundstream
+        stft_weight, stft_progress = self.scheduled_loss_weight(
+            steps,
+            self.stft_recon_loss_start_steps,
+            self.stft_recon_loss_warmup_steps,
+            self.stft_recon_loss_max_weight
+        )
+        frame_weight, frame_progress = self.scheduled_loss_weight(
+            steps,
+            self.frame_phase_loss_start_steps,
+            self.frame_phase_loss_warmup_steps,
+            self.frame_phase_loss_max_weight
+        )
+        model.stft_recon_loss_weight = stft_weight
+        model.frame_phase_loss_weight = frame_weight
+        return stft_progress, frame_progress
+
+    def update_stage2_reconstruction_transition(self, steps):
+        """Bridge Stage-1 reconstruction constraints into the final GAN loss.
+
+        Direct Stage-1 -> Stage-2 training should not abruptly remove
+        correlation and voiced-envelope constraints while the GAN objective is
+        being introduced.  Before the transition window this restores the
+        Stage-1 values; across the window it linearly reaches the configured
+        Stage-2 endpoint values already stored on the model.
+        """
+        if not exists(self.stage2_recon_transition_start_steps):
+            return None
+
+        model = self.unwrapped_soundstream
+        start = self.stage2_recon_transition_start_steps
+        end = self.stage2_recon_transition_end_steps
+        if steps < start:
+            progress = 0.
+        elif end == start or steps >= end:
+            progress = 1.
+        else:
+            progress = (steps - start) / (end - start)
+
+        def interpolate(initial, final):
+            return initial + (final - initial) * progress
+
+        model.si_sdr_loss_weight = interpolate(
+            self.stage2_initial_si_sdr_loss_weight,
+            self.si_sdr_loss_max_weight,
+        )
+        model.correlation_loss_weight = interpolate(
+            self.stage2_initial_correlation_loss_weight,
+            self.stage2_final_correlation_loss_weight,
+        )
+        model.spectral_envelope_loss_weight = interpolate(
+            self.stage2_initial_spectral_envelope_loss_weight,
+            self.spectral_envelope_loss_max_weight,
+        )
+        model.noise_floor_loss_weight = interpolate(
+            self.stage2_initial_noise_floor_loss_weight,
+            self.stage2_final_noise_floor_loss_weight,
+        )
+        return progress
+
     def update_transient_loss_weights(self, steps):
         model = self.unwrapped_soundstream
         if (
@@ -2439,6 +2679,20 @@ class SoundStreamTrainer(nn.Module):
 
         if not hasattr(model, 'set_decoder_residual_scale'):
             return 1.
+
+        if exists(self.decoder_x8_residual_scale_target):
+            if not hasattr(model, 'set_decoder_block_residual_scales'):
+                raise RuntimeError('per-block decoder residual scaling is not supported by this model')
+            progress = 1. if self.decoder_x8_residual_scale_ramp_steps <= 0 else min(
+                1., max(0., steps / self.decoder_x8_residual_scale_ramp_steps)
+            )
+            x8_scale = self.decoder_x8_residual_scale_start + (
+                self.decoder_x8_residual_scale_target - self.decoder_x8_residual_scale_start
+            ) * progress
+            block_scales = list(model.get_decoder_block_residual_scales())
+            block_scales[0] = x8_scale
+            model.set_decoder_block_residual_scales(block_scales)
+            return x8_scale
 
         start_scale = self.decoder_residual_scale_start
         end_scale = self.decoder_residual_scale_end
@@ -2505,11 +2759,17 @@ class SoundStreamTrainer(nn.Module):
             exists(self.discriminator_hold_lr) and
             steps < self.discriminator_hold_steps
         ):
+            # Do not call ``sync_warmup_lrs_from_optimizer`` here.  During the
+            # regular warmup, the optimizer LR is deliberately a dampened
+            # value, whereas ``warmup.lrs`` must retain the undampened base LR.
+            # Synchronizing it every step makes the warmup factor compound
+            # multiplicatively (for example 1e-5 -> 4e-11 -> ...), effectively
+            # freezing every discriminator before the retention window ends.
+            applied_lr = min(current_lr, self.discriminator_hold_lr)
             for _, optimizer in optimizers:
                 for group in optimizer.optimizer.param_groups:
                     group['lr'] = min(group['lr'], self.discriminator_hold_lr)
-                optimizer.sync_warmup_lrs_from_optimizer()
-            return self.discriminator_hold_lr
+            return applied_lr
 
         if (
             exists(self.discriminator_hold_lr) and
@@ -2614,6 +2874,8 @@ class SoundStreamTrainer(nn.Module):
         gan_progress = self.update_gan_weights(steps)
         si_sdr_loss_progress = self.update_si_sdr_loss_weight(steps)
         spectral_envelope_loss_progress = self.update_spectral_envelope_loss_weight(steps)
+        stft_loss_progress, frame_phase_loss_progress = self.update_spectral_refinement_weights(steps)
+        stage2_recon_transition_progress = self.update_stage2_reconstruction_transition(steps)
         transient_loss_progress = self.update_transient_loss_weights(steps)
         freeze_codebook = (
             self.freeze_codebook_during_training or
@@ -2662,7 +2924,7 @@ class SoundStreamTrainer(nn.Module):
                     jump_loss,
                     preemph_loss,
                     noise_floor_loss,
-                    boundary_loss
+                    frame_phase_or_boundary_loss
                 ) = self.soundstream(
                     wave,
                     return_loss_breakdown = True,
@@ -2689,7 +2951,14 @@ class SoundStreamTrainer(nn.Module):
                 jump_loss = jump_loss.item() / self.grad_accum_every,
                 preemph_loss = preemph_loss.item() / self.grad_accum_every,
                 noise_floor_loss = noise_floor_loss.item() / self.grad_accum_every,
-                boundary_loss = boundary_loss.item() / self.grad_accum_every,
+                frame_phase_loss = (
+                    frame_phase_or_boundary_loss.item() / self.grad_accum_every
+                    if not hasattr(self.unwrapped_soundstream, 'frame_boundary_loss') else 0.
+                ),
+                boundary_loss = (
+                    frame_phase_or_boundary_loss.item() / self.grad_accum_every
+                    if hasattr(self.unwrapped_soundstream, 'frame_boundary_loss') else 0.
+                ),
             ))
 
         if exists(self.max_grad_norm):
@@ -2717,7 +2986,9 @@ class SoundStreamTrainer(nn.Module):
             f"mel={logs['multi_spectral_recon_loss']:.6f}"
             f"(w={model.multi_spectral_recon_loss_weight:.4g}) | "
             f"stft={logs['stft_recon_loss']:.6f}"
-            f"(w={model.stft_recon_loss_weight:.4g}) | "
+            f"(w={model.stft_recon_loss_weight:.4g},ramp={stft_loss_progress:.4f}) | "
+            f"frame_phase={logs['frame_phase_loss']:.6f}"
+            f"(w={getattr(model, 'frame_phase_loss_weight', 0.):.4g},ramp={frame_phase_loss_progress:.4f}) | "
             f"formant_env={logs['spectral_envelope_loss']:.6f}"
             f"(w={model.spectral_envelope_loss_weight:.4g},ramp={spectral_envelope_loss_progress:.4f}) | "
             f"corr_loss={logs['correlation_loss']:.6f}"
@@ -2737,6 +3008,12 @@ class SoundStreamTrainer(nn.Module):
             f"commit={logs['all_commitment_loss']:.6f}"
         )
 
+        if hasattr(model, 'get_decoder_block_residual_scales'):
+            block_scales = ','.join(
+                f'{scale:.3f}' for scale in model.get_decoder_block_residual_scales()
+            )
+            losses_str += f" | decoder_block_scales=[{block_scales}]"
+
         if hasattr(model, 'boundary_loss_weight'):
             losses_str += (
                 f" | boundary={logs['boundary_loss']:.6f}"
@@ -2754,6 +3031,11 @@ class SoundStreamTrainer(nn.Module):
             f"lr_d_update={discriminator_update_lr:.3e} | "
             f"lr_d_next={discriminator_lr:.3e}"
         )
+
+        if exists(stage2_recon_transition_progress):
+            losses_str += (
+                f" | stage2_recon_transition={stage2_recon_transition_progress:.4f}"
+            )
 
         if log_losses:
             self.log(**logs)
@@ -2932,6 +3214,20 @@ class SoundStreamTrainer(nn.Module):
                 si_sdr_selected_model = None
                 si_sdr_selected_metrics = None
 
+            leakage_candidates = [
+                candidate for candidate in eligible_candidates
+                if candidate[2].get('frame_diagnostic_valid', 0.) >= 0.5
+            ]
+            if leakage_candidates:
+                leakage_selected_name, leakage_selected_model, leakage_selected_metrics = min(
+                    leakage_candidates,
+                    key = lambda candidate: candidate[2]['ac_320_isolated']
+                )
+            else:
+                leakage_selected_name = 'none'
+                leakage_selected_model = None
+                leakage_selected_metrics = None
+
             self.sync_best_scores_from_disk()
 
             online_clean_fail = (
@@ -2989,6 +3285,9 @@ class SoundStreamTrainer(nn.Module):
                 f"online_target_dc={online_score.get('target_dc', 0.):+.5f}, "
                 f"online_recon_dc={online_score.get('recon_dc', 0.):+.5f}, "
                 f"online_lf0_50_excess_db={online_score.get('low_freq_0_50_excess_db', 0.):+.2f}, "
+                f"online_ac320_iso={online_score.get('ac_320_isolated', 0.):+.4f}, "
+                f"online_phase_peak_db={online_score.get('frame_phase_peak_db', 0.):+.2f}, "
+                f"online_comb_med_db={online_score.get('comb_median_excess_db', 0.):+.2f}, "
                 f"online_peak={online_score.get('recon_peak', 0.):.3f}, "
                 f"online_clip={online_score.get('recon_clip_fraction', 0.) * 100:.3f}%, "
                 f"online_jump_ratio={online_score.get('jump_ratio', 0.):.2f}, "
@@ -3014,7 +3313,7 @@ class SoundStreamTrainer(nn.Module):
                     f"{self.format_codebook_diagnostics(ema_score)}"
                 )
 
-            if self.quality_retention_gate:
+            if self.quality_retention_gate and steps >= self.quality_retention_start_step:
                 passing_candidates = [
                     name for name, _, _ in candidate_models
                     if not quality_reasons[name]
@@ -3050,6 +3349,11 @@ class SoundStreamTrainer(nn.Module):
                             f"{steps}: Stage-2 quality retention hard stop triggered; "
                             "the initialized reconstruction baseline was not preserved."
                         )
+            elif self.quality_retention_gate and self.is_main:
+                self.print(
+                    f"{steps}: Stage-2 quality retention monitored but hard-stop "
+                    f"is deferred until step {self.quality_retention_start_step}."
+                )
 
             if exists(self.plateau_scheduler):
                 plateau_default = (
@@ -3110,6 +3414,27 @@ class SoundStreamTrainer(nn.Module):
                 exists(si_sdr_selected_model) and
                 si_sdr_selected_metrics['aligned_si_sdr'] > self.best_aligned_si_sdr
             )
+            frame_leakage_improved = (
+                self.frame_leakage_checkpoint and
+                exists(leakage_selected_model) and
+                leakage_selected_metrics['ac_320_isolated'] < self.best_frame_leakage_score
+            )
+
+            if frame_leakage_improved:
+                self.best_frame_leakage_score = leakage_selected_metrics['ac_320_isolated']
+                self.save_model_only(
+                    self.results_folder / 'best_by_frame_leakage.pt',
+                    leakage_selected_model,
+                    score = self.best_frame_leakage_score,
+                    step = steps,
+                    weight_source = leakage_selected_name
+                )
+                self.save(str(self.results_folder / 'latest.pt'))
+                self.print(
+                    f"{steps}: saving best_by_frame_leakage.pt "
+                    f"({leakage_selected_name}, ac_320_isolated="
+                    f"{self.best_frame_leakage_score:+.5f})"
+                )
 
             if si_sdr_improved:
                 self.best_aligned_si_sdr = si_sdr_selected_metrics['aligned_si_sdr']

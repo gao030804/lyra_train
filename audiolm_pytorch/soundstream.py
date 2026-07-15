@@ -625,6 +625,7 @@ class SoundStream(Module):
         dec_cycle_dilations = (1, 3, 9),
         decoder_upsample_mode = 'convtranspose',
         decoder_residual_scale = 1.,
+        decoder_block_residual_scales: tuple[float, ...] | None = None,
         decoder_linear_upsample_kernel_min = 0,
         multi_spectral_window_powers_of_two = tuple(range(6, 12)),
         multi_spectral_n_ffts = 512,
@@ -640,6 +641,8 @@ class SoundStream(Module):
         jump_loss_weight = 0.,
         preemph_loss_weight = 0.,
         noise_floor_loss_weight = 0.,
+        frame_phase_loss_weight = 0.,
+        frame_phase_samples = 320,
         commitment_loss_weight = 0.1,
         adversarial_loss_weight = 1.,
         feature_loss_weight = 100,
@@ -678,10 +681,24 @@ class SoundStream(Module):
             raise ValueError(f'unknown decoder upsample mode: {decoder_upsample_mode}')
         if decoder_residual_scale < 0:
             raise ValueError(f'decoder_residual_scale must be >= 0, got {decoder_residual_scale}')
+        if exists(decoder_block_residual_scales):
+            if len(decoder_block_residual_scales) != len(strides):
+                raise ValueError(
+                    'decoder_block_residual_scales must contain one value per decoder block '
+                    f'({len(strides)} expected, got {len(decoder_block_residual_scales)})'
+                )
+            if any(scale < 0 for scale in decoder_block_residual_scales):
+                raise ValueError('decoder block residual scales must all be >= 0')
         if decoder_linear_upsample_kernel_min < 0:
             raise ValueError(f'decoder_linear_upsample_kernel_min must be >= 0, got {decoder_linear_upsample_kernel_min}')
         self.decoder_upsample_mode = decoder_upsample_mode
         self.decoder_residual_scale = float(decoder_residual_scale)
+        self.decoder_block_residual_scales = tuple(
+            float(scale) for scale in default(
+                decoder_block_residual_scales,
+                (decoder_residual_scale,) * len(strides)
+            )
+        )
         self.decoder_linear_upsample_kernel_min = int(decoder_linear_upsample_kernel_min)
 
         layer_channels = tuple(map(lambda t: t * channels, channel_mults))
@@ -786,7 +803,10 @@ class SoundStream(Module):
 
         decoder_blocks = []
 
-        for ((chan_in, chan_out), layer_stride) in zip(reversed(chan_in_out_pairs), reversed(strides)):
+        for ((chan_in, chan_out), layer_stride), residual_scale in zip(
+            zip(reversed(chan_in_out_pairs), reversed(strides)),
+            self.decoder_block_residual_scales
+        ):
             decoder_blocks.append(DecoderBlock(
                 chan_out,
                 chan_in,
@@ -795,7 +815,7 @@ class SoundStream(Module):
                 squeeze_excite,
                 pad_mode,
                 upsample_mode = decoder_upsample_mode,
-                residual_scale = decoder_residual_scale,
+                residual_scale = residual_scale,
                 linear_upsample_kernel_min = decoder_linear_upsample_kernel_min
             ))
 
@@ -806,6 +826,9 @@ class SoundStream(Module):
             CausalConv1d(codebook_dim, layer_channels[-1], 7, pad_mode = pad_mode),
             *decoder_blocks,
             CausalConv1d(channels, input_channels, 7, pad_mode = pad_mode)
+        )
+        self._update_config(
+            decoder_block_residual_scales = self.decoder_block_residual_scales
         )
 
         # discriminators
@@ -915,6 +938,10 @@ class SoundStream(Module):
         self.jump_loss_weight = jump_loss_weight
         self.preemph_loss_weight = preemph_loss_weight
         self.noise_floor_loss_weight = noise_floor_loss_weight
+        self.frame_phase_loss_weight = frame_phase_loss_weight
+        if frame_phase_samples <= 1:
+            raise ValueError(f'frame_phase_samples must be > 1, got {frame_phase_samples}')
+        self.frame_phase_samples = int(frame_phase_samples)
         self.commitment_loss_weight = commitment_loss_weight
         self.adversarial_loss_weight = adversarial_loss_weight
         self.feature_loss_weight = feature_loss_weight
@@ -945,7 +972,71 @@ class SoundStream(Module):
             if isinstance(module, Residual):
                 module.set_residual_scale(scale)
 
-        self._update_config(decoder_residual_scale = scale)
+        block_count = len(self.get_decoder_residual_blocks())
+        self.decoder_block_residual_scales = (scale,) * block_count
+        self._update_config(
+            decoder_residual_scale = scale,
+            decoder_block_residual_scales = self.decoder_block_residual_scales
+        )
+
+    def get_decoder_residual_blocks(self):
+        """Return decoder upsampling blocks in temporal order (x8, x5, x4, x2)."""
+        return tuple(
+            module for module in self.decoder
+            if isinstance(module, nn.Sequential) and
+            any(isinstance(child, Residual) for child in module.modules())
+        )
+
+    def get_decoder_block_residual_scales(self):
+        scales = []
+        for block in self.get_decoder_residual_blocks():
+            residuals = [module for module in block.modules() if isinstance(module, Residual)]
+            scales.append(residuals[0].residual_scale if residuals else 1.)
+        return tuple(scales)
+
+    def set_decoder_block_residual_scales(self, scales):
+        blocks = self.get_decoder_residual_blocks()
+        scales = tuple(float(scale) for scale in scales)
+        if len(scales) != len(blocks):
+            raise ValueError(f'expected {len(blocks)} decoder block scales, got {len(scales)}')
+        if any(scale < 0 for scale in scales):
+            raise ValueError('decoder block residual scales must all be >= 0')
+
+        for block, scale in zip(blocks, scales):
+            for module in block.modules():
+                if isinstance(module, Residual):
+                    module.set_residual_scale(scale)
+
+        self.decoder_block_residual_scales = scales
+        self._update_config(decoder_block_residual_scales = scales)
+
+    def restore_decoder_runtime_state(self, config):
+        """Restore non-parameter decoder controls stored in a checkpoint config."""
+        block_scales = config.get('decoder_block_residual_scales')
+        if exists(block_scales):
+            self.set_decoder_block_residual_scales(block_scales)
+            return self.decoder_block_residual_scales
+
+        if 'decoder_residual_scale' in config:
+            self.set_decoder_residual_scale(config['decoder_residual_scale'])
+            return self.decoder_block_residual_scales
+
+        return self.get_decoder_block_residual_scales()
+
+    def frame_phase_residual_loss(self, target, recon):
+        """Penalize residual energy that is phase-locked to the codec frame period."""
+        frame_samples = self.frame_phase_samples
+        usable_samples = (min(target.shape[-1], recon.shape[-1]) // frame_samples) * frame_samples
+        if usable_samples < frame_samples * 2:
+            return self.zero
+
+        residual = (recon[..., :usable_samples] - target[..., :usable_samples]).float()
+        residual_frames = residual.reshape(*residual.shape[:-1], -1, frame_samples)
+        phase_pattern = residual_frames.mean(dim = -2)
+        phase_pattern = phase_pattern - phase_pattern.mean(dim = -1, keepdim = True)
+        phase_rms = phase_pattern.square().mean(dim = -1).clamp_min(1e-12).sqrt()
+        target_rms = target[..., :usable_samples].float().square().mean(dim = -1).clamp_min(1e-8).sqrt()
+        return (phase_rms / target_rms).mean()
 
     def reconstruction_losses(self, target, recon):
         wave_l1 = F.l1_loss(recon, target)
@@ -1751,6 +1842,11 @@ class SoundStream(Module):
             else self.zero
         )
         preemph_loss, noise_floor_loss = self.background_noise_losses(target, recon_x)
+        frame_phase_loss = (
+            self.frame_phase_residual_loss(target, recon_x)
+            if self.frame_phase_loss_weight > 0
+            else self.zero
+        )
         adversarial_loss, feature_loss = self.generator_perceptual_losses(
             orig_x,
             recon_x
@@ -1771,6 +1867,7 @@ class SoundStream(Module):
             jump_loss * self.jump_loss_weight +
             preemph_loss * self.preemph_loss_weight +
             noise_floor_loss * self.noise_floor_loss_weight +
+            frame_phase_loss * self.frame_phase_loss_weight +
             adversarial_loss * self.adversarial_loss_weight +
             feature_loss * self.feature_loss_weight +
             all_commitment_loss * self.commitment_loss_weight
@@ -1791,7 +1888,7 @@ class SoundStream(Module):
                 jump_loss,
                 preemph_loss,
                 noise_floor_loss,
-                self.zero
+                frame_phase_loss
             )
 
         return total_loss
