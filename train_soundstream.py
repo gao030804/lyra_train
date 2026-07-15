@@ -107,7 +107,7 @@ STAGE_DEFAULTS = {
     "gan_pretrain": dict(
         steps=200_000, batch_size=4, segment_seconds=4.,
         save_every=5_000, eval_every=500, min_steps=30_000, patience=30,
-        lr=5e-6, discr_lr=5e-6, ema_beta=0.999,
+        lr=5e-6, discr_lr=5e-6, stft_discr_lr=1e-6, ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
         use_ema=False,
         click_loss_weight=0., jump_loss_weight=0.,
@@ -458,6 +458,15 @@ def parse_args() -> argparse.Namespace:
         help="Minimum Stage-2 discriminator LR.",
     )
     parser.add_argument(
+        "--stage2-plateau-stft-discr-min-lr",
+        type=float,
+        default=8e-7,
+        help=(
+            "Minimum Stage-2 STFT-discriminator LR. Kept separate so plateau "
+            "cannot raise the lower STFT-D LR to the waveform-D minimum."
+        ),
+    )
+    parser.add_argument(
         "--click-loss-weight",
         type=float,
         default=None,
@@ -626,14 +635,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stft-r1-every",
         type=int,
-        default=16,
+        default=32,
         help="STFT-discriminator real-only R1 interval.",
     )
     parser.add_argument(
         "--stft-r1-gamma",
         type=float,
-        default=1e-4,
-        help="STFT-discriminator R1 gamma; no lazy-interval multiplication is applied.",
+        default=5e-3,
+        help=(
+            "Length-normalized STFT-discriminator R1 gamma; no lazy-interval "
+            "multiplication is applied. Recalibrate from raw_mean diagnostics."
+        ),
+    )
+    parser.add_argument(
+        "--stft-discr-lr",
+        type=float,
+        default=None,
+        help="Independent STFT-discriminator LR; Stage 2 defaults to 1e-6.",
+    )
+    parser.add_argument(
+        "--stage2-unfreeze-encoder-rvq-step",
+        type=int,
+        default=-1,
+        help=(
+            "Joint Encoder/RVQ unfreeze step in Stage 2; -1 keeps both frozen "
+            "for conservative decoder-only training and the 10k diagnostic."
+        ),
     )
     parser.add_argument(
         "--stream-context-frames",
@@ -1115,6 +1142,12 @@ def main() -> None:
         raise ValueError("--stage2-plateau-min-lr cannot be negative.")
     if args.stage2_plateau_discr_min_lr < 0:
         raise ValueError("--stage2-plateau-discr-min-lr cannot be negative.")
+    if args.stage2_plateau_stft_discr_min_lr < 0:
+        raise ValueError("--stage2-plateau-stft-discr-min-lr cannot be negative.")
+    if args.stft_discr_lr is not None and args.stft_discr_lr <= 0:
+        raise ValueError("--stft-discr-lr must be positive.")
+    if args.stage2_unfreeze_encoder_rvq_step < -1:
+        raise ValueError("--stage2-unfreeze-encoder-rvq-step must be -1 or non-negative.")
     if args.stage2_generator_hold_steps < 0:
         raise ValueError("--stage2-generator-hold-steps cannot be negative.")
     if args.stage2_generator_hold_lr <= 0:
@@ -1193,6 +1226,11 @@ def main() -> None:
         args.segment_seconds
         if args.segment_seconds is not None
         else stage_defaults["segment_seconds"]
+    )
+    stft_discr_lr = (
+        args.stft_discr_lr
+        if args.stft_discr_lr is not None
+        else stage_defaults.get("stft_discr_lr", stage_defaults["discr_lr"])
     )
     if batch_size <= 0:
         raise ValueError("--batch-size must be greater than zero.")
@@ -1390,7 +1428,8 @@ def main() -> None:
         if stage2_plateau_lr_enabled:
             print(
                 "Stage-2 LR schedule: standard warmup, then generator=5.000e-06 / "
-                "discriminator=5.000e-06 until step "
+                "waveform discriminator=5.000e-06 / STFT discriminator="
+                f"{stft_discr_lr:.3e} until step "
                 f"{args.stage2_plateau_start_steps}; validation ReduceLROnPlateau "
                 "then lowers both together on quality-retained reconstruction score "
                 "(10*wave + 1.1*Mel; lower is better) "
@@ -1399,14 +1438,24 @@ def main() -> None:
                 f"threshold={args.stage2_plateau_threshold}, "
                 f"cooldown={args.stage2_plateau_cooldown}, "
                 f"min_g_lr={args.stage2_plateau_min_lr}, "
-                f"min_d_lr={args.stage2_plateau_discr_min_lr})"
+                f"min_wave_d_lr={args.stage2_plateau_discr_min_lr}, "
+                f"min_stft_d_lr={args.stage2_plateau_stft_discr_min_lr})"
             )
         else:
-            print("Stage-2 LR schedule: fixed generator=5.000e-06, discriminator=5.000e-06 after the standard warmup.")
+            print(
+                "Stage-2 LR schedule: fixed generator=5.000e-06, "
+                "waveform discriminator=5.000e-06, STFT discriminator="
+                f"{stft_discr_lr:.3e} after the standard warmup."
+            )
         print(
             "Stage-2 retention phase: LR hold disabled; standard 1k warmup is "
-            "preserved at fixed low base LR. Encoder and RVQ are frozen for "
-            "steps [0, 5000); GAN discriminators begin after step "
+            "preserved at fixed low base LR. Encoder and RVQ are "
+            + (
+                "frozen throughout decoder-only training"
+                if args.stage2_unfreeze_encoder_rvq_step < 0
+                else f"jointly frozen through step {args.stage2_unfreeze_encoder_rvq_step}"
+            )
+            + "; GAN discriminators begin after step "
             f"{stage_defaults['gan_start']}."
         )
         print(
@@ -1471,6 +1520,13 @@ def main() -> None:
             f"hard_stop=(quality={args.stage2_quality_retention_patience}, "
             f"rvq={args.stage2_rvq_retention_patience}) validation checks"
         )
+        print(
+            "Stage-2 effective click checkpoint gate: "
+            f"max(absolute={args.clean_gate_max_click_score:.4f}, "
+            "initialization_baseline_click+"
+            f"{args.stage2_max_click_score_rise:.4f}); "
+            "validation logs report the resolved threshold and signed margin"
+        )
     print(
         "Signed correlation loss weight: "
         f"{correlation_loss_weight}"
@@ -1513,7 +1569,9 @@ def main() -> None:
             f"{decoder_residual_scale_warmup_end_steps}, after decoder residual "
             f"scale reaches {decoder_residual_scale_end}."
         )
-    print(f"Discriminator learning rate: {stage_defaults['discr_lr']}")
+    print(f"Waveform discriminator learning rate: {stage_defaults['discr_lr']}")
+    if args.stage == "gan_pretrain":
+        print(f"STFT discriminator learning rate: {stft_discr_lr}")
     use_ema = stage_defaults.get("use_ema", True)
     print(f"EMA enabled: {use_ema}")
     if use_ema:
@@ -1569,10 +1627,23 @@ def main() -> None:
     if args.stage in ("stream_finetune", "stream_finetune_long"):
         print("RVQ codebook training: frozen")
     elif args.stage == "gan_pretrain":
-        print(
-            "RVQ codebook training: frozen for steps [0, 5000), then enabled "
-            "(including EMA statistics and dead-code replacement)"
-        )
+        if args.stage2_unfreeze_encoder_rvq_step < 0:
+            print(
+                "RVQ codebook training: frozen throughout Stage 2 "
+                "(EMA statistics and dead-code replacement disabled)"
+            )
+        elif args.stage2_unfreeze_encoder_rvq_step == 0:
+            print(
+                "RVQ codebook training: enabled throughout Stage 2 "
+                "(including EMA statistics and dead-code replacement)"
+            )
+        else:
+            print(
+                "RVQ codebook training: frozen for steps [0, "
+                f"{args.stage2_unfreeze_encoder_rvq_step}), then enabled "
+                "jointly with the Encoder (including EMA statistics and "
+                "dead-code replacement)"
+            )
     elif stage_defaults.get("freeze_codebook_after_step") is not None:
         print(
             "RVQ codebook training: enabled until step "
@@ -1645,6 +1716,7 @@ def main() -> None:
         num_train_steps=num_train_steps,
         lr=stage_defaults["lr"],
         discr_lr=stage_defaults["discr_lr"],
+        stft_discr_lr=stft_discr_lr,
         discr_max_grad_norm=0.5,
         warmup_steps=warmup_steps,
         scheduler=scheduler,
@@ -1683,6 +1755,11 @@ def main() -> None:
         plateau_lr_update_discriminator=stage2_plateau_lr_enabled,
         plateau_lr_discr_min_lr=(
             args.stage2_plateau_discr_min_lr if stage2_plateau_lr_enabled
+            else None
+        ),
+        plateau_lr_stft_discr_min_lr=(
+            args.stage2_plateau_stft_discr_min_lr
+            if stage2_plateau_lr_enabled
             else None
         ),
         plateau_lr_require_quality_retention=stage2_plateau_lr_enabled,
@@ -1816,14 +1893,28 @@ def main() -> None:
         quality_retention_rvq_patience=args.stage2_rvq_retention_patience,
         freeze_codebook_after_step=stage_defaults.get("freeze_codebook_after_step"),
         freeze_codebook_before_step=(
-            5_000 if args.stage == "gan_pretrain" else None
+            args.stage2_unfreeze_encoder_rvq_step
+            if (
+                args.stage == "gan_pretrain" and
+                args.stage2_unfreeze_encoder_rvq_step >= 0
+            )
+            else None
         ),
         freeze_encoder_before_step=(
-            5_000 if args.stage == "gan_pretrain" else None
+            (
+                num_train_steps + 1
+                if args.stage2_unfreeze_encoder_rvq_step < 0
+                else args.stage2_unfreeze_encoder_rvq_step
+            )
+            if args.stage == "gan_pretrain"
+            else None
         ),
-        freeze_codebook_during_training=args.stage in (
-            "stream_finetune",
-            "stream_finetune_long",
+        freeze_codebook_during_training=(
+            args.stage in ("stream_finetune", "stream_finetune_long") or
+            (
+                args.stage == "gan_pretrain" and
+                args.stage2_unfreeze_encoder_rvq_step < 0
+            )
         ),
         use_ema=use_ema,
         ema_beta=stage_defaults["ema_beta"],

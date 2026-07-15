@@ -68,7 +68,12 @@ def leaky_relu(p = 0.1):
     return nn.LeakyReLU(p)
 
 def r1_gradient_penalty(wave, logits, gamma):
-    """Real-sample R1 penalty using one scalar discriminator score per sample."""
+    """Length-normalized real-sample R1 using one score per sample.
+
+    The conventional squared-gradient sum grows with the waveform length.  For
+    audio segments of different duration, use the per-input-element mean as the
+    optimization penalty and return the sum as a diagnostic only.
+    """
     if not wave.requires_grad:
         raise ValueError('wave must require gradients for R1 penalty')
     if gamma <= 0:
@@ -85,9 +90,11 @@ def r1_gradient_penalty(wave, logits, gamma):
         only_inputs = True
     )[0]
     gradients = rearrange(gradients, 'b ... -> b (...)')
-    raw_penalty = gradients.square().sum(dim = 1).mean()
-    weighted_penalty = 0.5 * gamma * raw_penalty
-    return weighted_penalty, raw_penalty.detach()
+    squared_gradients = gradients.square()
+    raw_sum = squared_gradients.sum(dim = 1).mean()
+    raw_mean = squared_gradients.mean()
+    weighted_penalty = 0.5 * gamma * raw_mean
+    return weighted_penalty, raw_mean.detach(), raw_sum.detach()
 
 def aggregate_discriminator_losses(
     waveform_losses,
@@ -198,64 +205,35 @@ class SqueezeExcite(Module):
 
         return x * gate
 
-# complex stft discriminator
+# real-valued STFT discriminator with real / imaginary input channels
 
-class ModReLU(Module):
-    """
-    https://arxiv.org/abs/1705.09792
-    https://github.com/pytorch/pytorch/issues/47052#issuecomment-718948801
-    """
-    def __init__(self):
-        super().__init__()
-        self.b = nn.Parameter(torch.tensor(0.))
-
-    def forward(self, x):
-        return F.relu(torch.abs(x) + self.b) * torch.exp(1.j * torch.angle(x))
-
-class ComplexConv2d(Module):
-    def __init__(
-        self,
-        dim,
-        dim_out,
-        kernel_size,
-        stride = 1,
-        padding = 0
-    ):
-        super().__init__()
-        conv = nn.Conv2d(dim, dim_out, kernel_size, dtype = torch.complex64)
-        self.weight = nn.Parameter(torch.view_as_real(conv.weight))
-        self.bias = nn.Parameter(torch.view_as_real(conv.bias))
-
-        self.stride = stride
-        self.padding = padding
-
-    def forward(self, x):
-        weight, bias = map(torch.view_as_complex, (self.weight, self.bias))
-
-        x = x.to(weight.dtype)
-        return F.conv2d(x, weight, bias, stride = self.stride, padding = self.padding)
-
-def ComplexSTFTResidualUnit(chan_in, chan_out, strides):
+def STFTResidualUnit(chan_in, chan_out, strides):
     kernel_sizes = tuple(map(lambda t: t + 2, strides))
     paddings = tuple(map(lambda t: t // 2, kernel_sizes))
 
     return nn.Sequential(
         Residual(Sequential(
-            ComplexConv2d(chan_in, chan_in, 3, padding = 1),
-            ModReLU(),
-            ComplexConv2d(chan_in, chan_in, 3, padding = 1)
+            nn.Conv2d(chan_in, chan_in, 3, padding = 1),
+            leaky_relu(),
+            nn.Conv2d(chan_in, chan_in, 3, padding = 1)
         )),
-        ComplexConv2d(chan_in, chan_out, kernel_sizes, stride = strides, padding = paddings)
+        nn.Conv2d(
+            chan_in,
+            chan_out,
+            kernel_sizes,
+            stride = strides,
+            padding = paddings
+        )
     )
 
-class ComplexSTFTDiscriminator(Module):
+class STFTDiscriminator(Module):
     def __init__(
         self,
         *,
         channels = 32,
         strides = ((1, 2), (2, 2), (1, 2), (2, 2), (1, 2), (2, 2)),
         chan_mults = (1, 2, 4, 4, 8, 8),
-        input_channels = 1,
+        input_channels = 2,
         n_fft = 1024,
         hop_length = 256,
         win_length = 1024,
@@ -264,7 +242,18 @@ class ComplexSTFTDiscriminator(Module):
         logits_abs = False
     ):
         super().__init__()
-        self.init_conv = ComplexConv2d(input_channels, channels, 7, padding = 3)
+        if input_channels != 2:
+            raise ValueError(
+                "STFTDiscriminator expects two real-valued channels "
+                "containing the STFT real and imaginary parts"
+            )
+        if logits_abs:
+            raise ValueError(
+                "STFTDiscriminator requires signed logits for hinge loss; "
+                "logits_abs=True is unsupported"
+            )
+
+        self.init_conv = nn.Conv2d(input_channels, channels, 7, padding = 3)
 
         layer_channels = tuple(map(lambda mult: mult * channels, chan_mults))
         layer_channels = (channels, *layer_channels)
@@ -275,7 +264,7 @@ class ComplexSTFTDiscriminator(Module):
         self.layers = ModuleList([])
 
         for layer_stride, (chan_in, chan_out) in zip(strides, layer_channels_pairs):
-            self.layers.append(ComplexSTFTResidualUnit(chan_in, chan_out, layer_stride))
+            self.layers.append(STFTResidualUnit(chan_in, chan_out, layer_stride))
 
         # torch.stft returns n_fft // 2 + 1 bins.  Drop Nyquist in forward so
         # the paper's F = W / 2 convention is exact, then compute the actual
@@ -290,7 +279,7 @@ class ComplexSTFTDiscriminator(Module):
             ) // frequency_stride + 1
 
         self.final_frequency_bins = final_frequency_bins
-        self.final_conv = ComplexConv2d(
+        self.final_conv = nn.Conv2d(
             layer_channels[-1],
             1,
             (1, final_frequency_bins)
@@ -305,10 +294,6 @@ class ComplexSTFTDiscriminator(Module):
         self.hop_length = hop_length
         self.win_length = win_length
 
-        # how to output the logits into real space
-
-        self.logits_abs = logits_abs
-
     def forward(self, x, return_intermediates = False):
         x = rearrange(x, 'b 1 n -> b n')
 
@@ -320,23 +305,32 @@ class ComplexSTFTDiscriminator(Module):
         H = 256 samples
         '''
 
-        stft_window = self.stft_window_fn(self.win_length, device = x.device)
+        # Always compute the complex STFT in float32.  Complex autocast support
+        # varies across PyTorch versions and previously made this discriminator
+        # unnecessarily fragile under mixed precision.
+        with torch.autocast(device_type = x.device.type, enabled = False):
+            x = x.float()
+            stft_window = self.stft_window_fn(
+                self.win_length,
+                device = x.device,
+                dtype = torch.float32
+            )
+            x = torch.stft(
+                x,
+                self.n_fft,
+                hop_length = self.hop_length,
+                win_length = self.win_length,
+                window = stft_window,
+                normalized = self.stft_normalized,
+                return_complex = True
+            )
 
-        x = torch.stft(
-            x,
-            self.n_fft,
-            hop_length = self.hop_length,
-            win_length = self.win_length,
-            window = stft_window,
-            normalized = self.stft_normalized,
-            return_complex = True
-        )
-
-        # [batch, frequency, time] -> [batch, channel, time, frequency].
+        # [batch, frequency, time] -> [batch, real_or_imag, time, frequency].
         # The residual-unit strides are defined as (time, frequency), matching
         # the SoundStream paper rather than accidentally swapping both axes.
         x = x[:, :-1, :]
-        x = rearrange(x, 'b f t -> b 1 t f')
+        x = torch.view_as_real(x)
+        x = rearrange(x, 'b f t c -> b c t f').contiguous()
 
         intermediates = []
 
@@ -348,31 +342,23 @@ class ComplexSTFTDiscriminator(Module):
             x = layer(x)
             intermediates.append(x)
 
-        complex_logits = self.final_conv(x)
-        if complex_logits.shape[-1] != 1:
+        logits = self.final_conv(x)
+        if logits.shape[-1] != 1:
             raise RuntimeError(
                 "STFT discriminator final convolution did not aggregate all "
-                f"frequency bins: output_shape={tuple(complex_logits.shape)}, "
+                f"frequency bins: output_shape={tuple(logits.shape)}, "
                 f"kernel_frequency={self.final_frequency_bins}"
             )
-        complex_logits = complex_logits.squeeze(-1)
-
-        if self.logits_abs:
-            # Kept only as a compatibility option.  Magnitude logits are
-            # non-negative and therefore cannot satisfy the fake branch of a
-            # hinge discriminator (which requires D(fake) <= -1).
-            complex_logits = complex_logits.abs()
-        else:
-            # Hinge GAN needs one signed real-valued score per logit.  Do not
-            # use view_as_real here: treating real and imaginary parts as two
-            # independent logits gives the imaginary component an unrelated
-            # hinge target.
-            complex_logits = complex_logits.real
+        logits = logits.squeeze(-1)
 
         if not return_intermediates:
-            return complex_logits
+            return logits
 
-        return complex_logits, intermediates
+        return logits, intermediates
+
+# Backward-compatible import name.  The implementation is intentionally real
+# valued; "Complex" now only describes its STFT source representation.
+ComplexSTFTDiscriminator = STFTDiscriminator
 
 # sound stream
 
@@ -1785,7 +1771,7 @@ class SoundStream(Module):
         apply_grad_penalty = False,
         apply_stft_grad_penalty = False,
         waveform_grad_penalty_gamma = 0.,
-        stft_grad_penalty_gamma = 1e-4,
+        stft_grad_penalty_gamma = 5e-3,
         curtail_from_left = False,
         num_quantizers = None,
         freeze_codebook = False
@@ -1870,7 +1856,11 @@ class SoundStream(Module):
                 stft_discr_loss = hinge_discr_loss(stft_fake_logits, stft_real_logits)
 
                 if apply_stft_grad_penalty:
-                    stft_grad_penalty, _ = r1_gradient_penalty(
+                    (
+                        stft_grad_penalty,
+                        stft_grad_penalty_raw_mean,
+                        stft_grad_penalty_raw_sum
+                    ) = r1_gradient_penalty(
                         real,
                         stft_real_logits,
                         stft_grad_penalty_gamma
@@ -1888,7 +1878,7 @@ class SoundStream(Module):
 
                 discr_losses.append(one_discr_loss)
                 if apply_grad_penalty:
-                    one_grad_penalty, _ = r1_gradient_penalty(
+                    one_grad_penalty, _, _ = r1_gradient_penalty(
                         scaled_real,
                         real_logits,
                         waveform_grad_penalty_gamma
@@ -1912,10 +1902,23 @@ class SoundStream(Module):
             discr_losses_pkg.extend([(f'scale_grad_penalty:{scale}', discr_grad_penalty) for scale, discr_grad_penalty in zip(self.discr_multi_scales, discr_grad_penalties)])
 
             if exists(stft_discr_loss):
-                discr_losses_pkg.append(('stft', stft_discr_loss))
+                stft_total_loss = stft_discr_loss
+                if exists(stft_grad_penalty):
+                    stft_total_loss = stft_total_loss + stft_grad_penalty
+                discr_losses_pkg.extend((
+                    ('stft_total', stft_total_loss),
+                    ('stft', stft_discr_loss.detach()),
+                    ('stft_real_logits_mean', stft_real_logits.detach().mean()),
+                    ('stft_fake_logits_mean', stft_fake_logits.detach().mean()),
+                    ('stft_saturated', (stft_discr_loss.detach() < 1e-4).float()),
+                ))
 
             if exists(stft_grad_penalty):
-                discr_losses_pkg.append(('stft_grad_penalty', stft_grad_penalty))
+                discr_losses_pkg.extend((
+                    ('stft_r1_raw_mean', stft_grad_penalty_raw_mean),
+                    ('stft_r1_raw_sum', stft_grad_penalty_raw_sum),
+                    ('stft_r1_weighted', stft_grad_penalty.detach()),
+                ))
 
             return discr_losses_pkg
 
@@ -2238,7 +2241,7 @@ class FrameStreamingSoundStream(SoundStream):
         apply_grad_penalty = False,
         apply_stft_grad_penalty = False,
         waveform_grad_penalty_gamma = 0.,
-        stft_grad_penalty_gamma = 1e-4,
+        stft_grad_penalty_gamma = 5e-3,
         curtail_from_left = False,
         num_quantizers = None,
         freeze_codebook = False
@@ -2288,7 +2291,11 @@ class FrameStreamingSoundStream(SoundStream):
                 stft_discr_loss = hinge_discr_loss(stft_fake_logits, stft_real_logits)
 
                 if apply_stft_grad_penalty:
-                    stft_grad_penalty, _ = r1_gradient_penalty(
+                    (
+                        stft_grad_penalty,
+                        stft_grad_penalty_raw_mean,
+                        stft_grad_penalty_raw_sum
+                    ) = r1_gradient_penalty(
                         real,
                         stft_real_logits,
                         stft_grad_penalty_gamma
@@ -2306,7 +2313,7 @@ class FrameStreamingSoundStream(SoundStream):
 
                 discr_losses.append(one_discr_loss)
                 if apply_grad_penalty:
-                    one_grad_penalty, _ = r1_gradient_penalty(
+                    one_grad_penalty, _, _ = r1_gradient_penalty(
                         scaled_real,
                         real_logits,
                         waveform_grad_penalty_gamma
@@ -2328,10 +2335,23 @@ class FrameStreamingSoundStream(SoundStream):
             discr_losses_pkg.extend([(f'scale_grad_penalty:{scale}', discr_grad_penalty) for scale, discr_grad_penalty in zip(self.discr_multi_scales, discr_grad_penalties)])
 
             if exists(stft_discr_loss):
-                discr_losses_pkg.append(('stft', stft_discr_loss))
+                stft_total_loss = stft_discr_loss
+                if exists(stft_grad_penalty):
+                    stft_total_loss = stft_total_loss + stft_grad_penalty
+                discr_losses_pkg.extend((
+                    ('stft_total', stft_total_loss),
+                    ('stft', stft_discr_loss.detach()),
+                    ('stft_real_logits_mean', stft_real_logits.detach().mean()),
+                    ('stft_fake_logits_mean', stft_fake_logits.detach().mean()),
+                    ('stft_saturated', (stft_discr_loss.detach() < 1e-4).float()),
+                ))
 
             if exists(stft_grad_penalty):
-                discr_losses_pkg.append(('stft_grad_penalty', stft_grad_penalty))
+                discr_losses_pkg.extend((
+                    ('stft_r1_raw_mean', stft_grad_penalty_raw_mean),
+                    ('stft_r1_raw_sum', stft_grad_penalty_raw_sum),
+                    ('stft_r1_weighted', stft_grad_penalty.detach()),
+                ))
 
             return discr_losses_pkg
 

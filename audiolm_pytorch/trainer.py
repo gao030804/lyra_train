@@ -10,7 +10,7 @@ from random import choice
 from pathlib import Path
 from shutil import rmtree
 from functools import partial
-from collections import Counter
+from collections import Counter, deque
 from contextlib import contextmanager, nullcontext
 
 from beartype.typing import Type
@@ -267,6 +267,7 @@ class SoundStreamTrainer(nn.Module):
         val_dataloader: DataLoader | None = None,
         lr: float = 2e-4,
         discr_lr: float | None = None,
+        stft_discr_lr: float | None = None,
         grad_accum_every: int = 4,
         wd: float = 0.,
         warmup_steps: int = 1000,
@@ -283,6 +284,7 @@ class SoundStreamTrainer(nn.Module):
         plateau_lr_metric: str = 'aligned_si_sdr',
         plateau_lr_update_discriminator: bool = False,
         plateau_lr_discr_min_lr: float | None = None,
+        plateau_lr_stft_discr_min_lr: float | None = None,
         plateau_lr_require_quality_retention: bool = False,
         generator_hold_steps: int = 0,
         generator_hold_lr: float | None = None,
@@ -369,8 +371,8 @@ class SoundStreamTrainer(nn.Module):
         ema_update_every: int = 10,
         apply_grad_penalty_every: int = 4,
         waveform_grad_penalty_gamma: float = 0.,
-        stft_grad_penalty_every: int = 16,
-        stft_grad_penalty_gamma: float = 1e-4,
+        stft_grad_penalty_every: int = 32,
+        stft_grad_penalty_gamma: float = 5e-3,
         dl_num_workers: int = 0,
         accelerator: Accelerator | None = None,
         accelerate_kwargs: dict = dict(),
@@ -512,6 +514,7 @@ class SoundStreamTrainer(nn.Module):
         self.quality_retention_baseline = None
         self.quality_retention_bad_evals = 0
         self.quality_retention_rvq_bad_evals = 0
+        self.stft_saturation_history = deque(maxlen = 1000)
 
         hyperparameters = {
             "num_train_steps": num_train_steps,
@@ -519,6 +522,7 @@ class SoundStreamTrainer(nn.Module):
             "gradient_accum_every": grad_accum_every,
             "learning_rate": lr,
             "discriminator_learning_rate": discr_lr,
+            "stft_discriminator_learning_rate": stft_discr_lr,
             "target_sample_hz": soundstream.target_sample_hz,
         }
 
@@ -547,7 +551,12 @@ class SoundStreamTrainer(nn.Module):
             plateau_lr_discr_min_lr,
             plateau_lr_min_lr
         )
+        plateau_lr_stft_discr_min_lr = default(
+            plateau_lr_stft_discr_min_lr,
+            plateau_lr_discr_min_lr
+        )
         assert plateau_lr_discr_min_lr >= 0.
+        assert plateau_lr_stft_discr_min_lr >= 0.
         assert generator_hold_steps >= 0
         if exists(generator_hold_lr):
             assert generator_hold_lr > 0.
@@ -562,6 +571,7 @@ class SoundStreamTrainer(nn.Module):
         self.plateau_lr_unclean_grace_checks = plateau_lr_unclean_grace_checks
         self.plateau_lr_update_discriminator = plateau_lr_update_discriminator
         self.plateau_lr_discr_min_lr = plateau_lr_discr_min_lr
+        self.plateau_lr_stft_discr_min_lr = plateau_lr_stft_discr_min_lr
         self.plateau_lr_require_quality_retention = plateau_lr_require_quality_retention
         self.generator_hold_steps = generator_hold_steps
         self.generator_hold_lr = generator_hold_lr
@@ -589,6 +599,9 @@ class SoundStreamTrainer(nn.Module):
         self.plateau_scheduler = None
 
         discr_lr = default(discr_lr, lr)
+        stft_discr_lr = default(stft_discr_lr, discr_lr)
+        assert discr_lr > 0.
+        assert stft_discr_lr > 0.
         discr_warmup_steps = default(discr_warmup_steps, warmup_steps)
 
         for discr_optimizer_key, discr in self.multiscale_discriminator_iter():
@@ -603,7 +616,7 @@ class SoundStreamTrainer(nn.Module):
 
         self.discr_optim = OptimizerWithWarmupSchedule(
             self.accelerator,
-            get_optimizer(soundstream.stft_discriminator.parameters(), lr = discr_lr, wd = wd),
+            get_optimizer(soundstream.stft_discriminator.parameters(), lr = stft_discr_lr, wd = wd),
             scheduler = discr_scheduler,
             scheduler_kwargs = discr_scheduler_kwargs,
             warmup_steps = discr_warmup_steps
@@ -2184,6 +2197,21 @@ class SoundStreamTrainer(nn.Module):
         self.fixed_best_valid_waves = waves
         return waves
 
+    def effective_clean_gate_max_click_score(self):
+        """Resolve the Stage-2 absolute/relative click gates consistently."""
+        allowed = self.clean_gate_max_click_score
+        if (
+            self.best_checkpoint_metric == 'gan_pretrain' and
+            self.quality_retention_gate and
+            self.has_quality_retention_baseline
+        ):
+            allowed = max(
+                allowed,
+                self.quality_retention_baseline['click_score'] +
+                self.quality_retention_max_click_score_rise
+            )
+        return float(allowed)
+
     def clean_gate_passes(self, metrics):
         if not self.clean_gate:
             return True
@@ -2194,7 +2222,7 @@ class SoundStreamTrainer(nn.Module):
             self.clean_gate_min_rms_ratio <= metrics.get('rms_ratio', float('inf')) <= self.clean_gate_max_rms_ratio and
             metrics.get('recon_peak', float('inf')) <= self.clean_gate_max_recon_peak and
             metrics.get('recon_clip_fraction', float('inf')) <= self.clean_gate_max_recon_clip_fraction and
-            metrics.get('click_score', float('inf')) <= self.clean_gate_max_click_score and
+            metrics.get('click_score', float('inf')) <= self.effective_clean_gate_max_click_score() and
             metrics.get('jump_ratio', float('inf')) <= self.clean_gate_max_jump_ratio and
             metrics.get('p999_jump_ratio', float('inf')) <= self.clean_gate_max_p999_jump_ratio
         )
@@ -2221,7 +2249,7 @@ class SoundStreamTrainer(nn.Module):
         if metrics.get('recon_clip_fraction', float('inf')) > self.clean_gate_max_recon_clip_fraction:
             reasons.append('clip')
 
-        if metrics.get('click_score', float('inf')) > self.clean_gate_max_click_score:
+        if metrics.get('click_score', float('inf')) > self.effective_clean_gate_max_click_score():
             reasons.append('click')
 
         if metrics.get('jump_ratio', float('inf')) > self.clean_gate_max_jump_ratio:
@@ -2348,6 +2376,11 @@ class SoundStreamTrainer(nn.Module):
         averaged_metrics['q00_validation_eligible'] = float(q00_eligible)
         averaged_metrics['q01_validation_eligible'] = float(q01_eligible)
         averaged_metrics['rvq_validation_eligible'] = float(rvq_eligible)
+        click_allowed = self.effective_clean_gate_max_click_score()
+        averaged_metrics['click_allowed'] = click_allowed
+        averaged_metrics['click_fail_margin'] = (
+            averaged_metrics.get('click_score', float('inf')) - click_allowed
+        )
         clean_eligible = self.clean_gate_passes(averaged_metrics)
         averaged_metrics['clean_validation_eligible'] = float(clean_eligible)
         if self.best_checkpoint_metric in ('recon_pretrain', 'spectral_refine', 'gan_pretrain'):
@@ -2423,10 +2456,15 @@ class SoundStreamTrainer(nn.Module):
                 group['lr']
                 for group in discriminator_optim.optimizer.param_groups
             ]
+            min_lr = (
+                self.plateau_lr_stft_discr_min_lr
+                if name == 'stft'
+                else self.plateau_lr_discr_min_lr
+            )
             for group in discriminator_optim.optimizer.param_groups:
                 group['lr'] = max(
                     group['lr'] * factor,
-                    self.plateau_lr_discr_min_lr
+                    min_lr
                 )
             discriminator_optim.sync_warmup_lrs_from_optimizer()
             new_lrs = [
@@ -2937,45 +2975,93 @@ class SoundStreamTrainer(nn.Module):
                     return_discr_losses_separately = True,
                     freeze_codebook = True
                 )
+                diagnostic_names = {
+                    'stft',
+                    'stft_real_logits_mean',
+                    'stft_fake_logits_mean',
+                    'stft_saturated',
+                    'stft_r1_raw_mean',
+                    'stft_r1_raw_sum',
+                    'stft_r1_weighted',
+                }
+                optimization_losses = []
                 for name, discr_loss in discr_losses:
                     if not torch.isfinite(discr_loss).all():
                         raise RuntimeError(
                             f"non-finite discriminator loss at step {steps}: "
                             f"{name}={discr_loss.detach().float().cpu().item()}"
                         )
-                    self.accelerator.backward(
-                        discr_loss / self.grad_accum_every,
-                        retain_graph = True
-                    )
+                    if name not in diagnostic_names:
+                        optimization_losses.append(discr_loss)
                     accum_log(
                         logs,
                         {name: discr_loss.item() / self.grad_accum_every}
                     )
-                    if name == 'stft_grad_penalty':
-                        weighted = float(discr_loss.detach().float().cpu().item())
-                        raw = weighted / max(0.5 * self.stft_grad_penalty_gamma, 1e-30)
-                        accum_log(logs, {
-                            'stft_r1_raw': raw / self.grad_accum_every,
-                            'stft_r1_gamma': self.stft_grad_penalty_gamma / self.grad_accum_every,
-                            'stft_r1_weighted': weighted / self.grad_accum_every,
-                        })
-                        if weighted > 1.:
-                            self.print(
-                                f"{steps}: warning: STFT R1 weighted penalty "
-                                f"is unusually high ({weighted:.6f} > 1.0; "
-                                f"raw={raw:.6f}, gamma={self.stft_grad_penalty_gamma:.3e})"
-                            )
+                if not optimization_losses:
+                    raise RuntimeError('no discriminator optimization losses were returned')
+
+                # The STFT branch already packages hinge + R1 as stft_total.
+                # Backpropagate the complete D objective once; never backward
+                # the R1 diagnostic as a second graph branch.
+                total_discriminator_loss = torch.stack(optimization_losses).sum()
+                self.accelerator.backward(
+                    total_discriminator_loss / self.grad_accum_every
+                )
+
+                discr_loss_map = dict(discr_losses)
+                if 'stft_r1_weighted' in discr_loss_map:
+                    weighted = float(
+                        discr_loss_map['stft_r1_weighted'].float().cpu().item()
+                    )
+                    raw_mean = float(
+                        discr_loss_map['stft_r1_raw_mean'].float().cpu().item()
+                    )
+                    stft_hinge = float(discr_loss_map['stft'].float().cpu().item())
+                    ratio = weighted / max(stft_hinge, 0.1)
+                    accum_log(logs, {
+                        'stft_r1_gamma': self.stft_grad_penalty_gamma / self.grad_accum_every,
+                        'stft_r1_effective_per_step': (
+                            weighted /
+                            max(self.stft_grad_penalty_every, 1) /
+                            self.grad_accum_every
+                        ),
+                        'stft_r1_to_hinge_ratio': ratio / self.grad_accum_every,
+                    })
+                    if weighted > 1.:
+                        self.print(
+                            f"{steps}: warning: normalized STFT R1 weighted "
+                            f"penalty is unusually high ({weighted:.6f} > 1.0; "
+                            f"raw_mean={raw_mean:.6f}, "
+                            f"gamma={self.stft_grad_penalty_gamma:.3e})"
+                        )
+
+        if 'stft_saturated' in logs:
+            self.stft_saturation_history.append(float(logs['stft_saturated']))
+            logs['stft_saturated_fraction_1000'] = (
+                sum(self.stft_saturation_history) /
+                len(self.stft_saturation_history)
+            )
 
         if exists(self.discr_max_grad_norm):
             model = self.unwrapped_soundstream
-            self.accelerator.clip_grad_norm_(
+            waveform_grad_norm = self.accelerator.clip_grad_norm_(
                 model.discriminators.parameters(),
                 self.discr_max_grad_norm
             )
-            self.accelerator.clip_grad_norm_(
+            stft_grad_norm = self.accelerator.clip_grad_norm_(
                 model.stft_discriminator.parameters(),
                 self.discr_max_grad_norm
             )
+            accum_log(logs, {
+                'waveform_d_grad_norm_pre_clip': float(waveform_grad_norm),
+                'stft_d_grad_norm_pre_clip': float(stft_grad_norm),
+                'waveform_d_grad_norm_post_clip_upper_bound': min(
+                    float(waveform_grad_norm), self.discr_max_grad_norm
+                ),
+                'stft_d_grad_norm_post_clip_upper_bound': min(
+                    float(stft_grad_norm), self.discr_max_grad_norm
+                ),
+            })
 
         self.ensure_finite_optimizer_lrs('stft discriminator', self.discr_optim)
         self.discr_optim.step()
@@ -3170,7 +3256,19 @@ class SoundStreamTrainer(nn.Module):
 
         model = self.unwrapped_soundstream
         generator_lr = self.optim.optimizer.param_groups[0]['lr']
-        discriminator_lr = self.discr_optim.optimizer.param_groups[0]['lr']
+        stft_discriminator_lr = self.discr_optim.optimizer.param_groups[0]['lr']
+        waveform_discriminator_lrs = {
+            name: optimizer.optimizer.param_groups[0]['lr']
+            for name, optimizer in self.multiscale_discriminator_optim_iter()
+        }
+        waveform_discriminator_lr = next(
+            iter(waveform_discriminator_lrs.values()),
+            stft_discriminator_lr
+        )
+        logs['lr_g'] = generator_lr
+        logs['lr_d_stft'] = stft_discriminator_lr
+        for index, lr in enumerate(waveform_discriminator_lrs.values()):
+            logs[f'lr_d_wave_{index}'] = lr
         losses_str = (
             f"{steps}: "
             f"g_total={logs['loss']:.6f} | "
@@ -3221,8 +3319,9 @@ class SoundStreamTrainer(nn.Module):
             f"gan_ramp={gan_progress:.4f} | "
             f"lr_g_update={generator_update_lr:.3e} | "
             f"lr_g_next={generator_lr:.3e} | "
-            f"lr_d_update={discriminator_update_lr:.3e} | "
-            f"lr_d_next={discriminator_lr:.3e}"
+            f"lr_d_stft_update={discriminator_update_lr:.3e} | "
+            f"lr_d_stft_next={stft_discriminator_lr:.3e} | "
+            f"lr_d_wave_next={waveform_discriminator_lr:.3e}"
         )
 
         if exists(stage2_recon_transition_progress):
@@ -3235,10 +3334,21 @@ class SoundStreamTrainer(nn.Module):
 
         discriminator_log_names = {
             'stft': 'd_stft',
-            'stft_grad_penalty': 'gp_stft',
-            'stft_r1_raw': 'stft_r1_raw',
+            'stft_total': 'd_stft_total',
+            'stft_real_logits_mean': 'd_stft_real_mean',
+            'stft_fake_logits_mean': 'd_stft_fake_mean',
+            'stft_saturated': 'd_stft_saturated',
+            'stft_saturated_fraction_1000': 'd_stft_saturated_fraction_1000',
+            'stft_r1_raw_mean': 'stft_r1_raw_mean',
+            'stft_r1_raw_sum': 'stft_r1_raw_sum',
             'stft_r1_gamma': 'stft_r1_gamma',
             'stft_r1_weighted': 'stft_r1_weighted',
+            'stft_r1_effective_per_step': 'stft_r1_effective_per_step',
+            'stft_r1_to_hinge_ratio': 'stft_r1_to_hinge_ratio',
+            'waveform_d_grad_norm_pre_clip': 'waveform_d_grad_norm_pre_clip',
+            'stft_d_grad_norm_pre_clip': 'stft_d_grad_norm_pre_clip',
+            'waveform_d_grad_norm_post_clip_upper_bound': 'waveform_d_grad_norm_post_clip_upper_bound',
+            'stft_d_grad_norm_post_clip_upper_bound': 'stft_d_grad_norm_post_clip_upper_bound',
         }
         for key, value in logs.items():
             if key.startswith('scale:'):
@@ -3453,7 +3563,9 @@ class SoundStreamTrainer(nn.Module):
                 f"ema_peak={ema_score.get('recon_peak', 0.):.3f}, "
                 f"ema_clip={ema_score.get('recon_clip_fraction', 0.) * 100:.3f}%, "
                 f"ema_jump_ratio={ema_score.get('jump_ratio', 0.):.2f}, "
-                f"ema_click={ema_score.get('click_score', 0.):.1f}, "
+                f"ema_click={ema_score.get('click_score', 0.):.4f}, "
+                f"ema_click_allowed={ema_score.get('click_allowed', self.effective_clean_gate_max_click_score()):.4f}, "
+                f"ema_click_fail_margin={ema_score.get('click_fail_margin', 0.):+.4f}, "
                 f"ema_clean_ok={ema_score.get('clean_validation_eligible', 0.):.0f}, "
                 f"ema_clean_fail={ema_clean_fail}, "
                 f"ema_active_codes={ema_score['active_code_ratio']:.3f}, "
@@ -3487,7 +3599,9 @@ class SoundStreamTrainer(nn.Module):
                 f"online_peak={online_score.get('recon_peak', 0.):.3f}, "
                 f"online_clip={online_score.get('recon_clip_fraction', 0.) * 100:.3f}%, "
                 f"online_jump_ratio={online_score.get('jump_ratio', 0.):.2f}, "
-                f"online_click={online_score.get('click_score', 0.):.1f}, "
+                f"online_click={online_score.get('click_score', 0.):.4f}, "
+                f"online_click_allowed={online_score.get('click_allowed', self.effective_clean_gate_max_click_score()):.4f}, "
+                f"online_click_fail_margin={online_score.get('click_fail_margin', 0.):+.4f}, "
                 f"online_clean_ok={online_score.get('clean_validation_eligible', 0.):.0f}, "
                 f"online_clean_fail={online_clean_fail}, "
                 f"online_active_codes={online_score['active_code_ratio']:.3f}, "
