@@ -106,7 +106,7 @@ STAGE_DEFAULTS = {
     ),
     "gan_pretrain": dict(
         steps=200_000, batch_size=4, segment_seconds=4.,
-        save_every=5_000, eval_every=500, min_steps=30_000, patience=30,
+        save_every=5_000, eval_every=500, min_steps=90_000, patience=60,
         lr=5e-6, discr_lr=5e-6, stft_discr_lr=1e-6, ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
         use_ema=False,
@@ -454,13 +454,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage2-plateau-discr-min-lr",
         type=float,
-        default=4e-6,
-        help="Minimum Stage-2 discriminator LR.",
+        default=2e-6,
+        help="Minimum Stage-2 waveform-discriminator LR; preserves the initial G:D ratio.",
     )
     parser.add_argument(
         "--stage2-plateau-stft-discr-min-lr",
         type=float,
-        default=8e-7,
+        default=4e-7,
         help=(
             "Minimum Stage-2 STFT-discriminator LR. Kept separate so plateau "
             "cannot raise the lower STFT-D LR to the waveform-D minimum."
@@ -871,6 +871,16 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument(
+        "--reset-early-stopping-on-resume",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "When resuming a full trainer checkpoint, preserve model/optimizer/"
+            "scheduler/best-score state but clear an already-triggered early stop "
+            "and its bad-validation counter."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -1246,11 +1256,24 @@ def main() -> None:
         if args.early_stopping_min_steps is not None
         else stage_defaults["min_steps"]
     )
+    effective_early_stopping_min_steps = early_stopping_min_steps
+    if args.stage == "gan_pretrain":
+        effective_early_stopping_min_steps = max(
+            effective_early_stopping_min_steps,
+            args.stage2_plateau_start_steps if args.stage2_plateau_lr else 0,
+            args.stage2_recon_transition_end_steps,
+            stage_defaults["gan_start"] + stage_defaults["gan_ramp"],
+        )
     if early_stopping_min_steps < 0:
         raise ValueError("--early-stopping-min-steps cannot be negative.")
     if early_stopping_min_steps > num_train_steps:
         raise ValueError(
             "--early-stopping-min-steps cannot exceed --num-train-steps."
+        )
+    if effective_early_stopping_min_steps > num_train_steps:
+        raise ValueError(
+            "The effective early-stopping start step exceeds --num-train-steps. "
+            "Increase the training length or shorten the Stage-2 schedule."
         )
 
     audio_files = [
@@ -1608,7 +1631,8 @@ def main() -> None:
         "Early stopping: "
         f"patience={early_stopping_patience} validation checks, "
         f"min_delta={args.early_stopping_min_delta}, "
-        f"min_steps={early_stopping_min_steps}"
+        f"configured_min_steps={early_stopping_min_steps}, "
+        f"effective_min_steps={effective_early_stopping_min_steps}"
     )
     print(f"Fixed validation batches: {args.best_eval_batches}")
     print(f"Dataset split: train {1 - args.valid_frac - args.test_frac:.2%}, valid {args.valid_frac:.2%}, test {args.test_frac:.2%}")
@@ -1961,8 +1985,16 @@ def main() -> None:
         print(f"Test-only mode; training and checkpoint writes are disabled: {args.test_checkpoint}")
     elif checkpoint is not None:
         print(f"Resuming from checkpoint: {checkpoint}")
-        trainer.load(str(checkpoint))
+        trainer.load(
+            str(checkpoint),
+            reset_early_stopping=args.reset_early_stopping_on_resume,
+        )
     else:
+        if args.reset_early_stopping_on_resume:
+            raise FileNotFoundError(
+                "--reset-early-stopping-on-resume requires an existing resume "
+                f"checkpoint under: {results_dir}"
+            )
         predecessor_stage = {
             "spectral_refine": "recon_pretrain",
             "gan_pretrain": "recon_pretrain",

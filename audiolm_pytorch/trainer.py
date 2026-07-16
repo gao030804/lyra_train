@@ -515,6 +515,10 @@ class SoundStreamTrainer(nn.Module):
         self.quality_retention_bad_evals = 0
         self.quality_retention_rvq_bad_evals = 0
         self.stft_saturation_history = deque(maxlen = 1000)
+        self.waveform_grad_clip_histories = {
+            float(scale): deque(maxlen = 1000)
+            for scale in soundstream.discr_multi_scales
+        }
 
         hyperparameters = {
             "num_train_steps": num_train_steps,
@@ -879,6 +883,17 @@ class SoundStreamTrainer(nn.Module):
         self.early_stopping_patience = early_stopping_patience
         self.early_stopping_min_delta = early_stopping_min_delta
         self.early_stopping_min_steps = early_stopping_min_steps
+        stage2_schedule_floor = 0
+        if best_checkpoint_metric == 'gan_pretrain':
+            stage2_schedule_floor = max(
+                plateau_lr_start_steps if plateau_lr_enabled else 0,
+                stage2_recon_transition_end_steps or 0,
+                gan_start_step + gan_ramp_steps,
+            )
+        self.early_stopping_start_steps = max(
+            early_stopping_min_steps,
+            stage2_schedule_floor,
+        )
         self.early_stopping_bad_evals = 0
         self.early_stopping_triggered = False
         self.enable_gan = enable_gan
@@ -2440,8 +2455,8 @@ class SoundStreamTrainer(nn.Module):
         """Apply a generator plateau reduction to every Stage-2 discriminator.
 
         The discriminator has no independent validation target. Scaling it by
-        the actual generator LR ratio preserves the intended 1:2 G:D schedule,
-        including a final partial reduction when either minimum LR is reached.
+        the actual generator LR ratio preserves the configured initial G:D
+        ratios, including a final partial reduction at a minimum LR.
         """
         if not self.plateau_lr_update_discriminator:
             return []
@@ -2474,7 +2489,7 @@ class SoundStreamTrainer(nn.Module):
             changes.append((name, old_lrs, new_lrs))
         return changes
 
-    def load(self, path):
+    def load(self, path, *, reset_early_stopping = False):
         path = Path(path)
         assert path.exists()
         pkg = torch.load(str(path), map_location = 'cpu')
@@ -2605,6 +2620,17 @@ class SoundStreamTrainer(nn.Module):
             else pkg.get('trainer_step', -1)
         )
         self.steps = torch.tensor([completed_step + 1], device=self.device)
+
+        if reset_early_stopping:
+            restored_bad_evals = self.early_stopping_bad_evals
+            restored_triggered = self.early_stopping_triggered
+            self.early_stopping_bad_evals = 0
+            self.early_stopping_triggered = False
+            self.print(
+                "Reset restored early-stopping state for continued training: "
+                f"triggered={restored_triggered}, bad_evals={restored_bad_evals} "
+                f"-> triggered=False, bad_evals=0; resume_step={completed_step + 1}."
+            )
 
     def multiscale_discriminator_iter(self):
         for ind, discr in enumerate(self.unwrapped_soundstream.discriminators):
@@ -3003,7 +3029,10 @@ class SoundStreamTrainer(nn.Module):
                 # The STFT branch already packages hinge + R1 as stft_total.
                 # Backpropagate the complete D objective once; never backward
                 # the R1 diagnostic as a second graph branch.
-                total_discriminator_loss = torch.stack(optimization_losses).sum()
+                # Treat the three waveform discriminators and the packaged
+                # STFT (hinge + R1) branch as equal objectives. Averaging keeps
+                # the overall gradient scale independent of discriminator count.
+                total_discriminator_loss = torch.stack(optimization_losses).mean()
                 self.accelerator.backward(
                     total_discriminator_loss / self.grad_accum_every
                 )
@@ -3044,19 +3073,57 @@ class SoundStreamTrainer(nn.Module):
 
         if exists(self.discr_max_grad_norm):
             model = self.unwrapped_soundstream
-            waveform_grad_norm = self.accelerator.clip_grad_norm_(
-                model.discriminators.parameters(),
-                self.discr_max_grad_norm
+            # Unscale once before clipping multiple independently optimized
+            # discriminator branches. Repeated Accelerator clip calls can
+            # attempt to unscale the same AMP optimizer more than once.
+            discriminator_optimizers = [
+                self.discr_optim.optimizer,
+                *(
+                    optimizer.optimizer
+                    for _, optimizer in self.multiscale_discriminator_optim_iter()
+                ),
+            ]
+            self.accelerator.unscale_gradients(
+                optimizer=discriminator_optimizers
             )
-            stft_grad_norm = self.accelerator.clip_grad_norm_(
+            waveform_grad_norms = []
+            for scale, discriminator in zip(
+                model.discr_multi_scales,
+                model.discriminators,
+            ):
+                waveform_grad_norm = nn.utils.clip_grad_norm_(
+                    discriminator.parameters(),
+                    self.discr_max_grad_norm,
+                )
+                waveform_grad_norm = float(waveform_grad_norm)
+                waveform_grad_norms.append(waveform_grad_norm)
+
+                scale = float(scale)
+                history = self.waveform_grad_clip_histories.setdefault(
+                    scale,
+                    deque(maxlen = 1000),
+                )
+                history.append(float(waveform_grad_norm > self.discr_max_grad_norm))
+                clip_fraction = sum(history) / len(history)
+                scale_label = f'{scale:g}'
+                accum_log(logs, {
+                    f'waveform_d_grad_norm_pre_clip:{scale_label}': waveform_grad_norm,
+                    f'waveform_d_clip_fraction_1000:{scale_label}': clip_fraction,
+                })
+
+            stft_grad_norm = nn.utils.clip_grad_norm_(
                 model.stft_discriminator.parameters(),
                 self.discr_max_grad_norm
             )
+            waveform_grad_norm_combined = sqrt(sum(
+                grad_norm ** 2 for grad_norm in waveform_grad_norms
+            ))
             accum_log(logs, {
-                'waveform_d_grad_norm_pre_clip': float(waveform_grad_norm),
+                'waveform_d_grad_norm_pre_clip': waveform_grad_norm_combined,
                 'stft_d_grad_norm_pre_clip': float(stft_grad_norm),
                 'waveform_d_grad_norm_post_clip_upper_bound': min(
-                    float(waveform_grad_norm), self.discr_max_grad_norm
+                    waveform_grad_norm_combined,
+                    self.discr_max_grad_norm * sqrt(len(waveform_grad_norms)),
                 ),
                 'stft_d_grad_norm_post_clip_upper_bound': min(
                     float(stft_grad_norm), self.discr_max_grad_norm
@@ -3355,6 +3422,10 @@ class SoundStreamTrainer(nn.Module):
                 log_name = f"d_scale_{key.split(':', 1)[1]}"
             elif key.startswith('scale_grad_penalty:'):
                 log_name = f"gp_scale_{key.split(':', 1)[1]}"
+            elif key.startswith('waveform_d_grad_norm_pre_clip:'):
+                log_name = f"waveform_d_grad_norm_scale_{key.split(':', 1)[1]}"
+            elif key.startswith('waveform_d_clip_fraction_1000:'):
+                log_name = f"waveform_d_clip_fraction_1000_scale_{key.split(':', 1)[1]}"
             elif key in discriminator_log_names:
                 log_name = discriminator_log_names[key]
             else:
@@ -3469,6 +3540,7 @@ class SoundStreamTrainer(nn.Module):
             not (steps % self.best_eval_every)
         )
         plateau_metric_tensor = None
+        early_stopping_triggered_by_patience = False
         if should_eval_best and exists(self.plateau_scheduler):
             plateau_metric_tensor = torch.zeros(3, device = device)
 
@@ -3797,7 +3869,7 @@ class SoundStreamTrainer(nn.Module):
                 )
             elif (
                 exists(self.early_stopping_patience) and
-                steps >= self.early_stopping_min_steps
+                steps >= self.early_stopping_start_steps
             ):
                 self.early_stopping_bad_evals += 1
                 self.print(
@@ -3809,6 +3881,7 @@ class SoundStreamTrainer(nn.Module):
 
                 if self.early_stopping_bad_evals >= self.early_stopping_patience:
                     self.early_stopping_triggered = True
+                    early_stopping_triggered_by_patience = True
                     self.save(str(self.results_folder / 'latest.pt'))
                     self.print(
                         f"{steps}: early stopping triggered; "
@@ -3818,7 +3891,7 @@ class SoundStreamTrainer(nn.Module):
                 self.early_stopping_bad_evals = 0
                 self.print(
                     f"{steps}: early stopping is inactive until "
-                    f"step {self.early_stopping_min_steps}"
+                    f"step {self.early_stopping_start_steps}"
                 )
 
         if should_eval_best and exists(self.plateau_scheduler):
@@ -3852,6 +3925,10 @@ class SoundStreamTrainer(nn.Module):
                     discr_lr_changes = self.scale_discriminator_lrs_from_plateau(
                         new_lrs[0] / old_lrs[0]
                     )
+                    previous_bad_evals = self.early_stopping_bad_evals
+                    self.early_stopping_bad_evals = 0
+                    if early_stopping_triggered_by_patience:
+                        self.early_stopping_triggered = False
                 if self.is_main:
                     old_lr = old_lrs[0]
                     new_lr = new_lrs[0]
@@ -3880,6 +3957,11 @@ class SoundStreamTrainer(nn.Module):
                             f"({metric_name}={metric_value}, "
                             f"source={source})"
                         )
+                        self.print(
+                            f"{steps}: reset early-stopping patience after LR "
+                            f"reduction ({previous_bad_evals} -> 0)"
+                        )
+                        self.save(str(self.results_folder / 'latest.pt'))
                     else:
                         self.print(
                             f"{steps}: ReduceLROnPlateau observed "
