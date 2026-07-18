@@ -677,6 +677,9 @@ class SoundStream(Module):
         multi_spectral_recon_loss_weight = 1.,
         stft_recon_loss_weight = 0.,
         spectral_envelope_loss_weight = 0.,
+        voiced_highband_loss_weight = 0.,
+        voiced_highband_energy_deficit_weight = 0.2,
+        voiced_highband_energy_margin_db = 0.25,
         si_sdr_loss_weight = 0.,
         correlation_loss_weight = 0.,
         energy_loss_weight = 0.1,
@@ -909,6 +912,20 @@ class SoundStream(Module):
         self.spectral_envelope_max_hz = 4500.
         self.spectral_envelope_relative_rms_db = -35.
         self.spectral_envelope_absolute_rms = 0.003
+        self.voiced_highband_min_hz = 3000.
+        self.voiced_highband_max_hz = min(7000., target_sample_hz / 2.)
+        self.voiced_highband_reference_min_hz = 200.
+        self.voiced_highband_slope_min_hz = 1000.
+        if voiced_highband_energy_deficit_weight < 0:
+            raise ValueError('voiced_highband_energy_deficit_weight must be >= 0')
+        if voiced_highband_energy_margin_db < 0:
+            raise ValueError('voiced_highband_energy_margin_db must be >= 0')
+        self.voiced_highband_energy_deficit_weight = float(
+            voiced_highband_energy_deficit_weight
+        )
+        self.voiced_highband_energy_margin_db = float(
+            voiced_highband_energy_margin_db
+        )
         self.register_buffer(
             'spectral_envelope_window',
             torch.hann_window(self.spectral_envelope_win_length),
@@ -974,6 +991,7 @@ class SoundStream(Module):
         self.multi_spectral_recon_loss_weight = multi_spectral_recon_loss_weight
         self.stft_recon_loss_weight = stft_recon_loss_weight
         self.spectral_envelope_loss_weight = spectral_envelope_loss_weight
+        self.voiced_highband_loss_weight = voiced_highband_loss_weight
         self.si_sdr_loss_weight = si_sdr_loss_weight
         self.correlation_loss_weight = correlation_loss_weight
         self.energy_loss_weight = energy_loss_weight
@@ -1078,7 +1096,17 @@ class SoundStream(Module):
         phase_pattern = residual_frames.mean(dim = -2)
         phase_pattern = phase_pattern - phase_pattern.mean(dim = -1, keepdim = True)
         phase_rms = phase_pattern.square().mean(dim = -1).clamp_min(1e-12).sqrt()
-        target_rms = target[..., :usable_samples].float().square().mean(dim = -1).clamp_min(1e-8).sqrt()
+        # Quiet segments must not turn a tiny absolute phase residual into an
+        # unbounded relative loss.  -60 dBFS is a conservative denominator
+        # floor; the separate quiet-noise loss still supervises those regions.
+        target_rms = (
+            target[..., :usable_samples]
+            .float()
+            .square()
+            .mean(dim = -1)
+            .sqrt()
+            .clamp_min(1e-3)
+        )
         return (phase_rms / target_rms).mean()
 
     def reconstruction_losses(self, target, recon):
@@ -1354,6 +1382,172 @@ class SoundStream(Module):
         )
         voiced_fraction = voiced_mask.float().mean()
         return total_loss, low_loss, mid_loss, high_loss, voiced_fraction
+
+    def voiced_highband_metrics(self, target, recon):
+        """Measure voiced 3-7 kHz spectral detail without rewarding noise.
+
+        Voicing is selected only from target-frame RMS.  Per-frame log spectra
+        are normalized by their 200-7000 Hz mean before the high-band error is
+        computed, so this objective follows harmonic/formant detail rather than
+        encouraging a broadband gain increase.  A small one-sided term only
+        penalizes high-band power that remains more than the configured margin
+        below the target; excess high-frequency power receives no reward.  The
+        remaining values are diagnostics and do not participate in checkpoint
+        gates by default.
+        """
+        target_rows = target.float()
+        recon_rows = recon.float()
+        if target_rows.ndim == 3:
+            target_rows = rearrange(target_rows, 'b c n -> (b c) n')
+        if recon_rows.ndim == 3:
+            recon_rows = rearrange(recon_rows, 'b c n -> (b c) n')
+
+        num_samples = min(target_rows.shape[-1], recon_rows.shape[-1])
+        target_rows = target_rows[..., :num_samples]
+        recon_rows = recon_rows[..., :num_samples]
+        if num_samples < self.spectral_envelope_n_fft:
+            padding = self.spectral_envelope_n_fft - num_samples
+            target_rows = F.pad(target_rows, (0, padding))
+            recon_rows = F.pad(recon_rows, (0, padding))
+
+        window = self.spectral_envelope_window.to(
+            device = target_rows.device,
+            dtype = target_rows.dtype
+        )
+        stft_kwargs = dict(
+            n_fft = self.spectral_envelope_n_fft,
+            hop_length = self.spectral_envelope_hop_length,
+            win_length = self.spectral_envelope_win_length,
+            window = window,
+            center = True,
+            pad_mode = 'constant',
+            return_complex = True
+        )
+        target_mag = torch.stft(target_rows, **stft_kwargs).abs()
+        recon_mag = torch.stft(recon_rows, **stft_kwargs).abs()
+        target_log_mag = log(target_mag, eps = 1e-5)
+        recon_log_mag = log(recon_mag, eps = 1e-5)
+
+        frequencies = torch.fft.rfftfreq(
+            self.spectral_envelope_n_fft,
+            d = 1. / self.target_sample_hz,
+            device = target_rows.device
+        )
+        reference_band = (
+            (frequencies >= self.voiced_highband_reference_min_hz) &
+            (frequencies <= self.voiced_highband_max_hz)
+        )
+        highband = (
+            (frequencies >= self.voiced_highband_min_hz) &
+            (frequencies <= self.voiced_highband_max_hz)
+        )
+        slope_band = (
+            (frequencies >= self.voiced_highband_slope_min_hz) &
+            (frequencies <= self.voiced_highband_max_hz)
+        )
+        if not reference_band.any() or not highband.any() or not slope_band.any():
+            return (
+                self.zero, self.zero, self.zero,
+                self.zero, self.zero, self.zero
+            )
+
+        frame_rms = F.avg_pool1d(
+            target_rows.square().unsqueeze(1),
+            kernel_size = self.spectral_envelope_win_length,
+            stride = self.spectral_envelope_hop_length,
+            padding = self.spectral_envelope_win_length // 2,
+            count_include_pad = False
+        ).squeeze(1).clamp_min(1e-12).sqrt()
+        num_frames = min(frame_rms.shape[-1], target_mag.shape[-1], recon_mag.shape[-1])
+        frame_rms = frame_rms[..., :num_frames]
+        target_mag = target_mag[..., :num_frames]
+        recon_mag = recon_mag[..., :num_frames]
+        target_log_mag = target_log_mag[..., :num_frames]
+        recon_log_mag = recon_log_mag[..., :num_frames]
+        relative_floor = (
+            frame_rms.amax(dim = -1, keepdim = True) *
+            (10. ** (self.spectral_envelope_relative_rms_db / 20.))
+        )
+        voiced_mask = (
+            (frame_rms >= relative_floor) &
+            (frame_rms >= self.spectral_envelope_absolute_rms)
+        )
+        voiced_weight = voiced_mask.to(target_mag.dtype)
+        voiced_count = voiced_weight.sum().clamp_min(1.)
+
+        # Normalize each frame with the same broad speech-band statistic.  A
+        # lower loss therefore requires structured high-band agreement rather
+        # than merely adding energy above 3 kHz.
+        target_frame_gain = target_log_mag[:, reference_band].mean(dim = 1, keepdim = True)
+        recon_frame_gain = recon_log_mag[:, reference_band].mean(dim = 1, keepdim = True)
+        target_highband = target_log_mag[:, highband] - target_frame_gain
+        recon_highband = recon_log_mag[:, highband] - recon_frame_gain
+        highband_error = (recon_highband - target_highband).abs()
+        highband_bin_count = max(highband_error.shape[1], 1)
+        voiced_highband_logmag_error = (
+            highband_error * voiced_weight.unsqueeze(1)
+        ).sum() / (voiced_count * highband_bin_count)
+
+        target_hf_power = target_mag[:, highband].square().mean(dim = 1)
+        recon_hf_power = recon_mag[:, highband].square().mean(dim = 1)
+        log_power_deficit = F.relu(
+            torch.log(target_hf_power + 1e-10) -
+            torch.log(recon_hf_power + 1e-10) -
+            self.voiced_highband_energy_margin_db * math.log(10.) / 10.
+        )
+        voiced_hf_energy_deficit = (
+            log_power_deficit * voiced_weight
+        ).sum() / voiced_count
+        voiced_highband_loss = (
+            voiced_highband_logmag_error +
+            self.voiced_highband_energy_deficit_weight *
+            voiced_hf_energy_deficit
+        )
+        hf_ratio_db = 10. * torch.log10(
+            (recon_hf_power + 1e-10) / (target_hf_power + 1e-10)
+        )
+        voiced_hf_energy_ratio_db = (
+            hf_ratio_db.clamp(-40., 40.) * voiced_weight
+        ).sum() / voiced_count
+
+        reference_frequencies = frequencies[reference_band]
+        target_reference_mag = target_mag[:, reference_band]
+        recon_reference_mag = recon_mag[:, reference_band]
+        target_centroid = (
+            target_reference_mag * reference_frequencies[None, :, None]
+        ).sum(dim = 1) / target_reference_mag.sum(dim = 1).clamp_min(1e-8)
+        recon_centroid = (
+            recon_reference_mag * reference_frequencies[None, :, None]
+        ).sum(dim = 1) / recon_reference_mag.sum(dim = 1).clamp_min(1e-8)
+        spectral_centroid_delta_hz = (
+            (recon_centroid - target_centroid) * voiced_weight
+        ).sum() / voiced_count
+
+        slope_frequency_khz = frequencies[slope_band] / 1000.
+        slope_frequency_khz = slope_frequency_khz - slope_frequency_khz.mean()
+        slope_denominator = slope_frequency_khz.square().sum().clamp_min(1e-8)
+        db_scale = 20. / math.log(10.)
+        target_slope = (
+            target_log_mag[:, slope_band] *
+            slope_frequency_khz[None, :, None]
+        ).sum(dim = 1) * db_scale / slope_denominator
+        recon_slope = (
+            recon_log_mag[:, slope_band] *
+            slope_frequency_khz[None, :, None]
+        ).sum(dim = 1) * db_scale / slope_denominator
+        spectral_slope_delta = (
+            (recon_slope - target_slope) * voiced_weight
+        ).sum() / voiced_count
+
+        return (
+            voiced_highband_loss,
+            voiced_hf_energy_ratio_db,
+            voiced_highband_logmag_error,
+            voiced_hf_energy_deficit,
+            spectral_centroid_delta_hz,
+            spectral_slope_delta
+        )
+
     def transient_noise_losses(self, target, recon):
         if (
             self.click_loss_weight <= 0 and
@@ -1847,6 +2041,8 @@ class SoundStream(Module):
             stft_grad_penalty = None
             discr_losses = []
             discr_grad_penalties = []
+            discr_real_active_fractions = []
+            discr_fake_active_fractions = []
 
             if self.single_channel:
                 real = orig_x.detach().requires_grad_(apply_stft_grad_penalty)
@@ -1877,6 +2073,8 @@ class SoundStream(Module):
                 one_discr_loss = hinge_discr_loss(fake_logits, real_logits)
 
                 discr_losses.append(one_discr_loss)
+                discr_real_active_fractions.append((real_logits < 1.).float().mean().detach())
+                discr_fake_active_fractions.append((fake_logits > -1.).float().mean().detach())
                 if apply_grad_penalty:
                     one_grad_penalty, _, _ = r1_gradient_penalty(
                         scaled_real,
@@ -1898,6 +2096,21 @@ class SoundStream(Module):
             discr_losses_pkg = []
 
             discr_losses_pkg.extend([(f'scale:{scale}', multi_scale_loss) for scale, multi_scale_loss in zip(self.discr_multi_scales, discr_losses)])
+
+            discr_losses_pkg.extend([
+                (f'scale_real_hinge_active:{scale}', active_fraction)
+                for scale, active_fraction in zip(
+                    self.discr_multi_scales,
+                    discr_real_active_fractions,
+                )
+            ])
+            discr_losses_pkg.extend([
+                (f'scale_fake_hinge_active:{scale}', active_fraction)
+                for scale, active_fraction in zip(
+                    self.discr_multi_scales,
+                    discr_fake_active_fractions,
+                )
+            ])
 
             discr_losses_pkg.extend([(f'scale_grad_penalty:{scale}', discr_grad_penalty) for scale, discr_grad_penalty in zip(self.discr_multi_scales, discr_grad_penalties)])
 
@@ -1946,6 +2159,11 @@ class SoundStream(Module):
             if self.spectral_envelope_loss_weight > 0
             else self.zero
         )
+        voiced_highband_loss = (
+            self.voiced_highband_metrics(target, recon_x)[0]
+            if self.voiced_highband_loss_weight > 0
+            else self.zero
+        )
         preemph_loss, noise_floor_loss = self.background_noise_losses(target, recon_x)
         frame_phase_loss = (
             self.frame_phase_residual_loss(target, recon_x)
@@ -1967,6 +2185,7 @@ class SoundStream(Module):
             stft_recon_loss * self.stft_recon_loss_weight +
             si_sdr_loss * self.si_sdr_loss_weight +
             spectral_envelope_loss * self.spectral_envelope_loss_weight +
+            voiced_highband_loss * self.voiced_highband_loss_weight +
             correlation_loss * self.correlation_loss_weight +
             click_loss * self.click_loss_weight +
             jump_loss * self.jump_loss_weight +
@@ -1984,6 +2203,7 @@ class SoundStream(Module):
                 multi_spectral_recon_loss,
                 stft_recon_loss,
                 spectral_envelope_loss,
+                voiced_highband_loss,
                 adversarial_loss,
                 feature_loss,
                 all_commitment_loss,
@@ -2282,6 +2502,8 @@ class FrameStreamingSoundStream(SoundStream):
             stft_grad_penalty = None
             discr_losses = []
             discr_grad_penalties = []
+            discr_real_active_fractions = []
+            discr_fake_active_fractions = []
 
             if self.single_channel:
                 real = orig_x.detach().requires_grad_(apply_stft_grad_penalty)
@@ -2312,6 +2534,8 @@ class FrameStreamingSoundStream(SoundStream):
                 one_discr_loss = hinge_discr_loss(fake_logits, real_logits)
 
                 discr_losses.append(one_discr_loss)
+                discr_real_active_fractions.append((real_logits < 1.).float().mean().detach())
+                discr_fake_active_fractions.append((fake_logits > -1.).float().mean().detach())
                 if apply_grad_penalty:
                     one_grad_penalty, _, _ = r1_gradient_penalty(
                         scaled_real,
@@ -2331,6 +2555,21 @@ class FrameStreamingSoundStream(SoundStream):
             discr_losses_pkg = []
 
             discr_losses_pkg.extend([(f'scale:{scale}', multi_scale_loss) for scale, multi_scale_loss in zip(self.discr_multi_scales, discr_losses)])
+
+            discr_losses_pkg.extend([
+                (f'scale_real_hinge_active:{scale}', active_fraction)
+                for scale, active_fraction in zip(
+                    self.discr_multi_scales,
+                    discr_real_active_fractions,
+                )
+            ])
+            discr_losses_pkg.extend([
+                (f'scale_fake_hinge_active:{scale}', active_fraction)
+                for scale, active_fraction in zip(
+                    self.discr_multi_scales,
+                    discr_fake_active_fractions,
+                )
+            ])
 
             discr_losses_pkg.extend([(f'scale_grad_penalty:{scale}', discr_grad_penalty) for scale, discr_grad_penalty in zip(self.discr_multi_scales, discr_grad_penalties)])
 
@@ -2378,6 +2617,11 @@ class FrameStreamingSoundStream(SoundStream):
             if self.spectral_envelope_loss_weight > 0
             else self.zero
         )
+        voiced_highband_loss = (
+            self.voiced_highband_metrics(target, recon_x)[0]
+            if self.voiced_highband_loss_weight > 0
+            else self.zero
+        )
         adversarial_loss, feature_loss = self.generator_perceptual_losses(
             orig_x,
             recon_x
@@ -2391,6 +2635,7 @@ class FrameStreamingSoundStream(SoundStream):
             stft_recon_loss * self.stft_recon_loss_weight +
             si_sdr_loss * self.si_sdr_loss_weight +
             spectral_envelope_loss * self.spectral_envelope_loss_weight +
+            voiced_highband_loss * self.voiced_highband_loss_weight +
             correlation_loss * self.correlation_loss_weight +
             click_loss * self.click_loss_weight +
             jump_loss * self.jump_loss_weight +
@@ -2408,6 +2653,7 @@ class FrameStreamingSoundStream(SoundStream):
                 multi_spectral_recon_loss,
                 stft_recon_loss,
                 spectral_envelope_loss,
+                voiced_highband_loss,
                 adversarial_loss,
                 feature_loss,
                 all_commitment_loss,

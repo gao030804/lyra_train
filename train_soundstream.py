@@ -54,12 +54,13 @@ STAGE_DEFAULTS = {
         click_loss_weight=0., jump_loss_weight=0.,
         transient_loss_warmup_steps=0,
         spectral_envelope_loss_weight=0.,
+        voiced_highband_loss_weight=0.,
         stft_recon_loss_weight=0.,
         gan_start=0, gan_ramp=0,
     ),
     "recon_pretrain": dict(
         steps=150_000, batch_size=4, segment_seconds=4.,
-        save_every=2_000, eval_every=250, min_steps=10_000, patience=40,
+        save_every=2_000, eval_every=250, min_steps=60_000, patience=40,
         lr=2e-4, discr_lr=None, ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
         use_ema=True,
@@ -69,6 +70,9 @@ STAGE_DEFAULTS = {
         spectral_envelope_loss_weight=0.05,
         spectral_envelope_loss_start_steps=5_000,
         spectral_envelope_loss_warmup_steps=10_000,
+        voiced_highband_loss_weight=0.04,
+        voiced_highband_loss_start_steps=5_000,
+        voiced_highband_loss_warmup_steps=15_000,
         stft_recon_loss_weight=0.,
         si_sdr_loss_weight=0.07,
         si_sdr_loss_start_steps=5_000,
@@ -90,6 +94,9 @@ STAGE_DEFAULTS = {
         spectral_envelope_loss_weight=0.05,
         spectral_envelope_loss_start_steps=0,
         spectral_envelope_loss_warmup_steps=0,
+        voiced_highband_loss_weight=0.02,
+        voiced_highband_loss_start_steps=0,
+        voiced_highband_loss_warmup_steps=5_000,
         stft_recon_loss_weight=0.10,
         stft_recon_loss_start_steps=0,
         stft_recon_loss_warmup_steps=5_000,
@@ -106,24 +113,39 @@ STAGE_DEFAULTS = {
     ),
     "gan_pretrain": dict(
         steps=200_000, batch_size=4, segment_seconds=4.,
-        save_every=5_000, eval_every=500, min_steps=90_000, patience=60,
-        lr=5e-6, discr_lr=5e-6, stft_discr_lr=1e-6, ema_beta=0.999,
+        save_every=5_000, eval_every=500, min_steps=90_000, patience=30,
+        early_stopping_min_delta=0.003,
+        # Keep Stage-2 decoder updates smaller than discriminator updates so a
+        # freshly initialized GAN cannot quickly displace the selected codec.
+        lr=2e-7, discr_lr=1e-6, stft_discr_lr=5e-7,
+        waveform_discr_lrs=(1e-6, 2e-6, 2e-6),
+        waveform_discr_update_every=(1, 1, 1),
+        stft_discr_update_every=2,
+        ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
         use_ema=False,
         click_loss_weight=0., jump_loss_weight=0.,
-        preemph_loss_weight=0., noise_floor_loss_weight=0.02,
+        preemph_loss_weight=0., noise_floor_loss_weight=0.03,
         transient_loss_warmup_steps=0,
-        spectral_envelope_loss_weight=0.015,
+        spectral_envelope_loss_weight=0.05,
         spectral_envelope_loss_start_steps=0,
         spectral_envelope_loss_warmup_steps=0,
+        voiced_highband_loss_weight=0.02,
+        voiced_highband_loss_start_steps=0,
+        voiced_highband_loss_warmup_steps=10_000,
         stft_recon_loss_weight=0.,
-        si_sdr_loss_weight=0.04,
+        # Keep frame-leakage validation diagnostics, but disable the training
+        # loss because the latest diagnostic run increased ac_320.
+        frame_phase_loss_weight=0.,
+        frame_phase_loss_start_steps=0,
+        frame_phase_loss_warmup_steps=0,
+        si_sdr_loss_weight=0.07,
         si_sdr_loss_start_steps=0,
         si_sdr_loss_warmup_steps=0,
-        # Stage 2 starts from a validation-selected Stage-1 codec.  The first
-        # 2k steps are reconstruction-only, then a slow GAN ramp protects it.
-        gan_start=2_000, gan_ramp=30_000,
-        gan_adversarial_max=0.0002, gan_feature_max=0.5,
+        # Warm up fresh discriminators against a frozen Stage-1 generator for
+        # 1k steps.  Then let GAN gradients enter gradually over 10k steps.
+        gan_start=1_000, gan_ramp=10_000,
+        gan_adversarial_max=2e-4, gan_feature_max=5.0,
     ),
     "stream_finetune": dict(
         steps=20_000, batch_size=4, segment_seconds=2.,
@@ -134,6 +156,7 @@ STAGE_DEFAULTS = {
         preemph_loss_weight=0., noise_floor_loss_weight=0.,
         transient_loss_warmup_steps=0,
         spectral_envelope_loss_weight=0.,
+        voiced_highband_loss_weight=0.,
         stft_recon_loss_weight=0.,
         gan_start=5_000, gan_ramp=10_000,
     ),
@@ -146,6 +169,7 @@ STAGE_DEFAULTS = {
         preemph_loss_weight=0., noise_floor_loss_weight=0.,
         transient_loss_warmup_steps=0,
         spectral_envelope_loss_weight=0.,
+        voiced_highband_loss_weight=0.,
         stft_recon_loss_weight=0.,
         gan_start=1_000, gan_ramp=2_000,
     ),
@@ -272,7 +296,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--early-stopping-min-delta",
         type=float,
-        default=0.0,
+        default=None,
         help="Minimum validation-score decrease required to reset early-stopping patience.",
     )
     parser.add_argument(
@@ -345,6 +369,46 @@ def parse_args() -> argparse.Namespace:
             "loss to its maximum weight; defaults depend on --stage."
         ),
     )
+    parser.add_argument(
+        "--voiced-highband-loss-weight",
+        type=float,
+        default=None,
+        help=(
+            "Maximum target-voiced, frame-gain-normalized 3-7 kHz log-spectrum "
+            "loss weight; defaults depend on --stage."
+        ),
+    )
+    parser.add_argument(
+        "--voiced-highband-loss-start-steps",
+        type=int,
+        default=None,
+        help="Initial disabled steps for the voiced high-band objective.",
+    )
+    parser.add_argument(
+        "--voiced-highband-loss-warmup-steps",
+        type=int,
+        default=None,
+        help="Linear ramp duration for the voiced high-band objective.",
+    )
+    parser.add_argument(
+        "--voiced-highband-energy-deficit-weight",
+        type=float,
+        default=0.20,
+        help=(
+            "Internal one-sided high-band energy-deficit weight. This "
+            "penalizes missing voiced 3-7 kHz energy without rewarding "
+            "high-frequency excess."
+        ),
+    )
+    parser.add_argument(
+        "--voiced-highband-energy-margin-db",
+        type=float,
+        default=0.25,
+        help=(
+            "Allowed voiced high-band energy deficit before the one-sided "
+            "penalty activates."
+        ),
+    )
 
     parser.add_argument(
         "--stage1-plateau-lr",
@@ -411,7 +475,7 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "For gan_pretrain, lower generator and discriminator LR together "
+            "For gan_pretrain, lower generator LR "
             "only after post-ramp validation plateaus while quality retention holds."
         ),
     )
@@ -425,7 +489,7 @@ def parse_args() -> argparse.Namespace:
         "--stage2-plateau-factor",
         type=float,
         default=0.5,
-        help="Stage-2 G/D LR multiplier for each validation-plateau reduction.",
+        help="Stage-2 generator-LR multiplier for each validation-plateau reduction.",
     )
     parser.add_argument(
         "--stage2-plateau-patience",
@@ -448,7 +512,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage2-plateau-min-lr",
         type=float,
-        default=2e-6,
+        default=1e-7,
         help="Minimum Stage-2 generator LR.",
     )
     parser.add_argument(
@@ -576,6 +640,24 @@ def parse_args() -> argparse.Namespace:
         help="Maximum p99.9 jump ratio for best checkpoint eligibility.",
     )
     parser.add_argument(
+        "--clean-gate-min-voiced-hf-ratio-db",
+        type=float,
+        default=-1.5,
+        help=(
+            "Stage-1 minimum voiced 3-7 kHz reconstruction/target energy "
+            "ratio for best-checkpoint eligibility."
+        ),
+    )
+    parser.add_argument(
+        "--clean-gate-max-voiced-hf-ratio-db",
+        type=float,
+        default=1.0,
+        help=(
+            "Stage-1 maximum voiced 3-7 kHz reconstruction/target energy "
+            "ratio, used to reject high-frequency over-generation."
+        ),
+    )
+    parser.add_argument(
         "--stage2-quality-retention-gate",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -587,7 +669,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage2-max-aligned-si-sdr-drop",
         type=float,
-        default=0.30,
+        default=0.15,
         help="Maximum Stage-2 aligned SI-SDR drop from its initialization baseline in dB.",
     )
     parser.add_argument(
@@ -621,6 +703,24 @@ def parse_args() -> argparse.Namespace:
         help="Maximum Stage-2 click-score rise above its initialization baseline.",
     )
     parser.add_argument(
+        "--stage2-max-ac320-isolated-rise",
+        type=float,
+        default=0.005,
+        help=(
+            "Maximum Stage-2 ac_320_isolated rise above its initialization "
+            "baseline before rejecting checkpoints and counting a quality failure."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-max-comb-median-excess-db-rise",
+        type=float,
+        default=0.25,
+        help=(
+            "Maximum Stage-2 comb_median_excess_db rise above its "
+            "initialization baseline."
+        ),
+    )
+    parser.add_argument(
         "--waveform-r1-every",
         type=int,
         default=0,
@@ -651,7 +751,38 @@ def parse_args() -> argparse.Namespace:
         "--stft-discr-lr",
         type=float,
         default=None,
-        help="Independent STFT-discriminator LR; Stage 2 defaults to 1e-6.",
+        help="Independent STFT-discriminator LR; Stage 2 defaults to 5e-7.",
+    )
+    parser.add_argument(
+        "--waveform-discr-lrs",
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=("SCALE1", "SCALE05", "SCALE025"),
+        help="Per-scale waveform-D LRs in the order 1.0, 0.5, 0.25.",
+    )
+    parser.add_argument(
+        "--waveform-discr-update-every",
+        type=int,
+        nargs=3,
+        default=None,
+        metavar=("SCALE1", "SCALE05", "SCALE025"),
+        help="Update intervals for waveform D scales 1.0, 0.5, 0.25.",
+    )
+    parser.add_argument(
+        "--stft-discr-update-every",
+        type=int,
+        default=None,
+        help="Update the STFT discriminator once per this many generator steps.",
+    )
+    parser.add_argument(
+        "--gan-grad-diagnostics-every",
+        type=int,
+        default=500,
+        help=(
+            "For Stage 2, measure decoder gradient norms from reconstruction "
+            "and GAN objectives every N steps; 0 disables this diagnostic."
+        ),
     )
     parser.add_argument(
         "--stage2-unfreeze-encoder-rvq-step",
@@ -660,6 +791,14 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Joint Encoder/RVQ unfreeze step in Stage 2; -1 keeps both frozen "
             "for conservative decoder-only training and the 10k diagnostic."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-targeted-refine",
+        action="store_true",
+        help=(
+            "Use the conservative 10k decoder-only Stage-2 diagnostic preset: "
+            "fresh discriminators, balanced per-D update rates, and no plateau scheduler."
         ),
     )
     parser.add_argument(
@@ -680,10 +819,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--decoder-linear-upsample-kernel-min",
         type=int,
-        default=7,
+        default=5,
         help=(
             "Minimum kernel size for decoder linear-upsample CausalConv1d. "
-            "With the default 7, large-stride layers keep 2*stride while the "
+            "With the default 5, large-stride layers keep 2*stride while the "
             "final small-stride layer is lightly smoothed."
         ),
     )
@@ -712,6 +851,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "For gan_pretrain, keep the generator at a conservative LR during "
             "the initial GAN ramp so the Stage-1 reconstruction baseline is retained."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-generator-freeze-steps",
+        type=int,
+        default=1_000,
+        help=(
+            "For gan_pretrain, keep all generator parameters unchanged for "
+            "this many initial steps while optionally pretraining discriminators."
         ),
     )
     parser.add_argument(
@@ -754,6 +902,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--stage2-discriminator-start-steps",
+        type=int,
+        default=0,
+        help=(
+            "First Stage-2 step that updates discriminators. Defaults to GAN "
+            "start; targeted refinement uses step 0 for discriminator warmup."
+        ),
+    )
+    parser.add_argument(
         "--stage2-discriminator-hold-lr",
         type=float,
         default=5e-6,
@@ -762,17 +919,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage2-recon-transition-start-steps",
         type=int,
-        default=40_000,
+        default=None,
         help=(
-            "For gan_pretrain, begin linearly transitioning Stage-1 "
-            "reconstruction weights to their Stage-2 endpoint at this step."
+            "Optional legacy Stage-2 reconstruction-weight transition start. "
+            "Disabled by default so retention weights remain fixed."
         ),
     )
     parser.add_argument(
         "--stage2-recon-transition-end-steps",
         type=int,
-        default=60_000,
-        help="For gan_pretrain, finish the reconstruction-weight transition at this step.",
+        default=None,
+        help=(
+            "Optional legacy Stage-2 reconstruction-weight transition end; "
+            "must be supplied together with its start."
+        ),
     )
     parser.add_argument(
         "--stage2-quality-gate-start-steps",
@@ -999,6 +1159,9 @@ def build_model(
     num_quantizers: int,
     si_sdr_loss_weight: float,
     spectral_envelope_loss_weight: float,
+    voiced_highband_loss_weight: float,
+    voiced_highband_energy_deficit_weight: float,
+    voiced_highband_energy_margin_db: float,
     click_loss_weight: float,
     jump_loss_weight: float,
     preemph_loss_weight: float,
@@ -1010,6 +1173,7 @@ def build_model(
     decoder_upsample_mode: str,
     decoder_residual_scale: float,
     decoder_linear_upsample_kernel_min: int,
+    commitment_loss_weight: float | None = None,
     sync_codebook: bool | None = None,
 ) -> SoundStream:
     if sync_codebook is None:
@@ -1018,9 +1182,7 @@ def build_model(
     if stage in RECONSTRUCTION_STAGES:
         recon_loss_weight = 10.
         multi_spectral_recon_loss_weight = 1.1
-        correlation_loss_weight = (
-            0.01 if stage == "gan_pretrain" else 0.02
-        )
+        correlation_loss_weight = 0.02
     else:
         recon_loss_weight = 10. if stage == "overfit" else 1.
         multi_spectral_recon_loss_weight = 0.7
@@ -1042,6 +1204,9 @@ def build_model(
         multi_spectral_recon_loss_weight=multi_spectral_recon_loss_weight,
         stft_recon_loss_weight=stft_recon_loss_weight,
         spectral_envelope_loss_weight=spectral_envelope_loss_weight,
+        voiced_highband_loss_weight=voiced_highband_loss_weight,
+        voiced_highband_energy_deficit_weight=voiced_highband_energy_deficit_weight,
+        voiced_highband_energy_margin_db=voiced_highband_energy_margin_db,
         si_sdr_loss_weight=si_sdr_loss_weight,
         correlation_loss_weight=correlation_loss_weight,
         energy_loss_weight=0.1,
@@ -1051,7 +1216,11 @@ def build_model(
         noise_floor_loss_weight=noise_floor_loss_weight,
         frame_phase_loss_weight=frame_phase_loss_weight,
         frame_phase_samples=320,
-        commitment_loss_weight=0.1,
+        commitment_loss_weight=(
+            commitment_loss_weight
+            if commitment_loss_weight is not None
+            else (0. if stage == "gan_pretrain" else 0.1)
+        ),
         adversarial_loss_weight=(gan_adversarial_max if stage in GAN_STAGES else 0.),
         feature_loss_weight=(gan_feature_max if stage in GAN_STAGES else 0.),
         rq_quantize_dropout=False,
@@ -1081,7 +1250,51 @@ def build_model(
 
 def main() -> None:
     args = parse_args()
-    stage_defaults = STAGE_DEFAULTS[args.stage]
+    stage_defaults = dict(STAGE_DEFAULTS[args.stage])
+    if args.stage2_targeted_refine:
+        if args.stage != "gan_pretrain":
+            raise ValueError("--stage2-targeted-refine is only valid with --stage gan_pretrain.")
+        stage_defaults.update(
+            steps=10_000,
+            save_every=1_000,
+            eval_every=500,
+            min_steps=10_000,
+            patience=20,
+            early_stopping_min_delta=0.003,
+            lr=2e-7,
+            discr_lr=1e-6,
+            stft_discr_lr=5e-7,
+            waveform_discr_lrs=(1e-6, 2e-6, 2e-6),
+            waveform_discr_update_every=(1, 1, 1),
+            stft_discr_update_every=2,
+            gan_start=1_000,
+            gan_ramp=10_000,
+            gan_adversarial_max=2e-4,
+            gan_feature_max=5.0,
+            noise_floor_loss_weight=0.03,
+            spectral_envelope_loss_weight=0.05,
+            voiced_highband_loss_weight=0.04,
+            frame_phase_loss_weight=0.,
+            frame_phase_loss_warmup_steps=0,
+            si_sdr_loss_weight=0.07,
+        )
+        # The targeted preset is decoder-only by design.  Ignore an old launch
+        # argument that would otherwise unfreeze Encoder/RVQ mid-run.
+        args.stage2_unfreeze_encoder_rvq_step = -1
+        args.stage2_generator_freeze_steps = 1_000
+        args.stage2_discriminator_start_steps = 0
+        args.stage2_max_aligned_si_sdr_drop = min(
+            args.stage2_max_aligned_si_sdr_drop,
+            0.05,
+        )
+        # Keep checkpoint eligibility strict from the beginning, but allow the
+        # diagnostic to reach GAN ramp >= 0.5 before hard-stop patience can end
+        # the whole run.  The trainer's candidate gate remains unchanged.
+        args.stage2_quality_gate_start_steps = 6_000
+        args.stage2_best_checkpoint_min_step = min(
+            args.stage2_best_checkpoint_min_step,
+            1_000,
+        )
 
     if args.seed < 0:
         raise ValueError("--seed must be non-negative.")
@@ -1093,6 +1306,16 @@ def main() -> None:
         raise ValueError("--si-sdr-loss-warmup-steps cannot be negative.")
     if args.spectral_envelope_loss_weight is not None and args.spectral_envelope_loss_weight < 0:
         raise ValueError("--spectral-envelope-loss-weight cannot be negative.")
+    if args.voiced_highband_loss_weight is not None and args.voiced_highband_loss_weight < 0:
+        raise ValueError("--voiced-highband-loss-weight cannot be negative.")
+    if args.voiced_highband_loss_start_steps is not None and args.voiced_highband_loss_start_steps < 0:
+        raise ValueError("--voiced-highband-loss-start-steps cannot be negative.")
+    if args.voiced_highband_loss_warmup_steps is not None and args.voiced_highband_loss_warmup_steps < 0:
+        raise ValueError("--voiced-highband-loss-warmup-steps cannot be negative.")
+    if args.voiced_highband_energy_deficit_weight < 0:
+        raise ValueError("--voiced-highband-energy-deficit-weight cannot be negative.")
+    if args.voiced_highband_energy_margin_db < 0:
+        raise ValueError("--voiced-highband-energy-margin-db cannot be negative.")
     if args.stft_recon_loss_weight is not None and args.stft_recon_loss_weight < 0:
         raise ValueError("--stft-recon-loss-weight cannot be negative.")
     if args.stft_recon_loss_warmup_steps is not None and args.stft_recon_loss_warmup_steps < 0:
@@ -1156,29 +1379,60 @@ def main() -> None:
         raise ValueError("--stage2-plateau-stft-discr-min-lr cannot be negative.")
     if args.stft_discr_lr is not None and args.stft_discr_lr <= 0:
         raise ValueError("--stft-discr-lr must be positive.")
+    if args.waveform_discr_lrs is not None and any(lr <= 0 for lr in args.waveform_discr_lrs):
+        raise ValueError("--waveform-discr-lrs values must all be positive.")
+    if (
+        args.waveform_discr_update_every is not None and
+        any(interval <= 0 for interval in args.waveform_discr_update_every)
+    ):
+        raise ValueError("--waveform-discr-update-every values must all be positive.")
+    if args.stft_discr_update_every is not None and args.stft_discr_update_every <= 0:
+        raise ValueError("--stft-discr-update-every must be positive.")
+    if args.gan_grad_diagnostics_every < 0:
+        raise ValueError("--gan-grad-diagnostics-every cannot be negative.")
     if args.stage2_unfreeze_encoder_rvq_step < -1:
         raise ValueError("--stage2-unfreeze-encoder-rvq-step must be -1 or non-negative.")
     if args.stage2_generator_hold_steps < 0:
         raise ValueError("--stage2-generator-hold-steps cannot be negative.")
     if args.stage2_generator_hold_lr <= 0:
         raise ValueError("--stage2-generator-hold-lr must be positive.")
+    if args.stage2_generator_freeze_steps < 0:
+        raise ValueError("--stage2-generator-freeze-steps cannot be negative.")
     if args.stage2_discriminator_hold_steps < 0:
         raise ValueError("--stage2-discriminator-hold-steps cannot be negative.")
     if args.stage2_discriminator_hold_lr <= 0:
         raise ValueError("--stage2-discriminator-hold-lr must be positive.")
-    if args.stage2_recon_transition_start_steps < 0:
-        raise ValueError("--stage2-recon-transition-start-steps cannot be negative.")
-    if args.stage2_recon_transition_end_steps < args.stage2_recon_transition_start_steps:
+    if (
+        args.stage2_discriminator_start_steps is not None and
+        args.stage2_discriminator_start_steps < 0
+    ):
+        raise ValueError("--stage2-discriminator-start-steps cannot be negative.")
+    transition_start = args.stage2_recon_transition_start_steps
+    transition_end = args.stage2_recon_transition_end_steps
+    if (transition_start is None) != (transition_end is None):
         raise ValueError(
-            "--stage2-recon-transition-end-steps must be >= "
-            "--stage2-recon-transition-start-steps."
+            "--stage2-recon-transition-start-steps and "
+            "--stage2-recon-transition-end-steps must be supplied together."
         )
+    if transition_start is not None:
+        if transition_start < 0:
+            raise ValueError("--stage2-recon-transition-start-steps cannot be negative.")
+        if transition_end < transition_start:
+            raise ValueError(
+                "--stage2-recon-transition-end-steps must be >= "
+                "--stage2-recon-transition-start-steps."
+            )
     if args.stage2_quality_gate_start_steps < 0:
         raise ValueError("--stage2-quality-gate-start-steps cannot be negative.")
     if args.stage2_best_checkpoint_min_step < 0:
         raise ValueError("--stage2-best-checkpoint-min-step cannot be negative.")
-    if args.stage2_max_click_score_rise < 0:
-        raise ValueError("--stage2-max-click-score-rise cannot be negative.")
+    for name in (
+        "stage2_max_click_score_rise",
+        "stage2_max_ac320_isolated_rise",
+        "stage2_max_comb_median_excess_db_rise",
+    ):
+        if getattr(args, name) < 0:
+            raise ValueError(f"--{name.replace('_', '-')} cannot be negative.")
     if args.waveform_r1_every < 0 or args.stft_r1_every < 0:
         raise ValueError("R1 intervals cannot be negative.")
     if args.waveform_r1_gamma < 0 or args.stft_r1_gamma < 0:
@@ -1202,6 +1456,11 @@ def main() -> None:
         raise ValueError("--clean-gate-min-rms-ratio must be positive.")
     if args.clean_gate_max_rms_ratio < args.clean_gate_min_rms_ratio:
         raise ValueError("--clean-gate-max-rms-ratio must be >= --clean-gate-min-rms-ratio.")
+    if args.clean_gate_max_voiced_hf_ratio_db < args.clean_gate_min_voiced_hf_ratio_db:
+        raise ValueError(
+            "--clean-gate-max-voiced-hf-ratio-db must be >= "
+            "--clean-gate-min-voiced-hf-ratio-db."
+        )
     for name in (
         "clean_gate_max_recon_peak",
         "clean_gate_max_recon_clip_fraction",
@@ -1231,6 +1490,27 @@ def main() -> None:
     save_model_every = args.save_model_every or stage_defaults["save_every"]
     best_eval_every = args.best_eval_every or stage_defaults["eval_every"]
     num_train_steps = args.num_train_steps or stage_defaults["steps"]
+    if (
+        args.stage == "gan_pretrain" and
+        args.stage2_plateau_lr and
+        not args.stage2_targeted_refine and
+        args.stage2_plateau_min_lr > stage_defaults["lr"]
+    ):
+        raise ValueError(
+            "--stage2-plateau-min-lr cannot exceed the Stage-2 generator LR "
+            f"({stage_defaults['lr']:.3e})."
+        )
+    if args.stage2_targeted_refine:
+        first_gan_candidate_step = (
+            stage_defaults["gan_start"] +
+            (stage_defaults["gan_ramp"] + 1) // 2
+        )
+        if num_train_steps <= first_gan_candidate_step:
+            raise ValueError(
+                "--stage2-targeted-refine must run beyond step "
+                f"{first_gan_candidate_step} so GAN ramp can reach 0.5 and "
+                "best_gan_balanced.pt can become eligible."
+            )
     batch_size = args.batch_size or stage_defaults["batch_size"]
     segment_seconds = (
         args.segment_seconds
@@ -1241,6 +1521,24 @@ def main() -> None:
         args.stft_discr_lr
         if args.stft_discr_lr is not None
         else stage_defaults.get("stft_discr_lr", stage_defaults["discr_lr"])
+    )
+    waveform_discr_lrs = tuple(
+        args.waveform_discr_lrs
+        if args.waveform_discr_lrs is not None
+        else stage_defaults.get(
+            "waveform_discr_lrs",
+            (stage_defaults["discr_lr"],) * 3,
+        )
+    ) if stage_defaults["discr_lr"] is not None else None
+    waveform_discr_update_every = tuple(
+        args.waveform_discr_update_every
+        if args.waveform_discr_update_every is not None
+        else stage_defaults.get("waveform_discr_update_every", (1, 1, 1))
+    )
+    stft_discr_update_every = (
+        args.stft_discr_update_every
+        if args.stft_discr_update_every is not None
+        else stage_defaults.get("stft_discr_update_every", 1)
     )
     if batch_size <= 0:
         raise ValueError("--batch-size must be greater than zero.")
@@ -1256,13 +1554,30 @@ def main() -> None:
         if args.early_stopping_min_steps is not None
         else stage_defaults["min_steps"]
     )
+    early_stopping_min_delta = (
+        args.early_stopping_min_delta
+        if args.early_stopping_min_delta is not None
+        else stage_defaults.get("early_stopping_min_delta", 0.)
+    )
     effective_early_stopping_min_steps = early_stopping_min_steps
     if args.stage == "gan_pretrain":
+        gan_schedule_end = stage_defaults["gan_start"] + stage_defaults["gan_ramp"]
+        if args.stage2_targeted_refine:
+            # A short targeted run is a bounded diagnostic and may
+            # intentionally end before the slow GAN ramp is complete.  Keep
+            # the quality-retention hard stop active, but do not reject the
+            # launch merely because ordinary patience-based early stopping
+            # would only become eligible after the diagnostic has ended.
+            gan_schedule_end = min(gan_schedule_end, num_train_steps)
         effective_early_stopping_min_steps = max(
             effective_early_stopping_min_steps,
-            args.stage2_plateau_start_steps if args.stage2_plateau_lr else 0,
-            args.stage2_recon_transition_end_steps,
-            stage_defaults["gan_start"] + stage_defaults["gan_ramp"],
+            (
+                args.stage2_plateau_start_steps
+                if args.stage2_plateau_lr and not args.stage2_targeted_refine
+                else 0
+            ),
+            args.stage2_recon_transition_end_steps or 0,
+            gan_schedule_end,
         )
     if early_stopping_min_steps < 0:
         raise ValueError("--early-stopping-min-steps cannot be negative.")
@@ -1359,6 +1674,21 @@ def main() -> None:
         if args.spectral_envelope_loss_warmup_steps is not None
         else stage_defaults.get("spectral_envelope_loss_warmup_steps", 0)
     )
+    voiced_highband_loss_weight = (
+        args.voiced_highband_loss_weight
+        if args.voiced_highband_loss_weight is not None
+        else stage_defaults.get("voiced_highband_loss_weight", 0.)
+    )
+    voiced_highband_loss_start_steps = (
+        args.voiced_highband_loss_start_steps
+        if args.voiced_highband_loss_start_steps is not None
+        else stage_defaults.get("voiced_highband_loss_start_steps", 0)
+    )
+    voiced_highband_loss_warmup_steps = (
+        args.voiced_highband_loss_warmup_steps
+        if args.voiced_highband_loss_warmup_steps is not None
+        else stage_defaults.get("voiced_highband_loss_warmup_steps", 0)
+    )
     transient_loss_warmup_steps = (
         args.transient_loss_warmup_steps
         if args.transient_loss_warmup_steps is not None
@@ -1387,8 +1717,7 @@ def main() -> None:
     waveform_recon_loss_weight = 10.0 if args.stage in ("overfit", *RECONSTRUCTION_STAGES) else 1.0
     multi_spectral_recon_loss_weight = 1.1 if args.stage in RECONSTRUCTION_STAGES else 0.7
     correlation_loss_weight = (
-        0.01 if args.stage == "gan_pretrain"
-        else (0.02 if args.stage in RECONSTRUCTION_STAGES else 0.0)
+        0.02 if args.stage in RECONSTRUCTION_STAGES else 0.0
     )
     decoder_residual_scale_start = args.decoder_residual_scale_start
     decoder_residual_scale_end = args.decoder_residual_scale_end
@@ -1400,7 +1729,8 @@ def main() -> None:
     )
     stage2_plateau_lr_enabled = (
         args.stage == "gan_pretrain" and
-        args.stage2_plateau_lr
+        args.stage2_plateau_lr and
+        not args.stage2_targeted_refine
     )
 
     bitrate = calculate_bitrate(
@@ -1448,52 +1778,69 @@ def main() -> None:
             f"{stage_defaults['lr']:.3e} after the standard warmup."
         )
     elif args.stage == "gan_pretrain":
+        waveform_lr_text = "/".join(f"{lr:.3e}" for lr in waveform_discr_lrs)
+        waveform_update_text = "/".join(str(value) for value in waveform_discr_update_every)
         if stage2_plateau_lr_enabled:
             print(
-                "Stage-2 LR schedule: standard warmup, then generator=5.000e-06 / "
-                "waveform discriminator=5.000e-06 / STFT discriminator="
+                f"Stage-2 LR schedule: standard warmup, then generator={stage_defaults['lr']:.3e} / "
+                f"waveform discriminators={waveform_lr_text} / STFT discriminator="
                 f"{stft_discr_lr:.3e} until step "
                 f"{args.stage2_plateau_start_steps}; validation ReduceLROnPlateau "
-                "then lowers both together on quality-retained reconstruction score "
+                "then lowers the generator only on quality-retained reconstruction score "
                 "(10*wave + 1.1*Mel; lower is better) "
                 f"(factor={args.stage2_plateau_factor}, "
                 f"patience={args.stage2_plateau_patience}, "
                 f"threshold={args.stage2_plateau_threshold}, "
                 f"cooldown={args.stage2_plateau_cooldown}, "
-                f"min_g_lr={args.stage2_plateau_min_lr}, "
-                f"min_wave_d_lr={args.stage2_plateau_discr_min_lr}, "
-                f"min_stft_d_lr={args.stage2_plateau_stft_discr_min_lr})"
+                f"min_g_lr={args.stage2_plateau_min_lr})"
             )
         else:
             print(
-                "Stage-2 LR schedule: fixed generator=5.000e-06, "
-                "waveform discriminator=5.000e-06, STFT discriminator="
+                f"Stage-2 LR schedule: fixed generator={stage_defaults['lr']:.3e}, "
+                f"waveform discriminators={waveform_lr_text}, STFT discriminator="
                 f"{stft_discr_lr:.3e} after the standard warmup."
             )
         print(
-            "Stage-2 retention phase: LR hold disabled; standard 1k warmup is "
-            "preserved at fixed low base LR. Encoder and RVQ are "
+            "Stage-2 discriminator update intervals (scale1/scale0.5/scale0.25/STFT): "
+            f"{waveform_update_text}/{stft_discr_update_every}."
+        )
+        print(
+            "Stage-2 retention phase: Generator frozen through step "
+            f"{args.stage2_generator_freeze_steps}; discriminator updates begin at step "
+            f"{args.stage2_discriminator_start_steps if args.stage2_discriminator_start_steps is not None else stage_defaults['gan_start']}. "
+            "Encoder and RVQ are "
             + (
                 "frozen throughout decoder-only training"
                 if args.stage2_unfreeze_encoder_rvq_step < 0
                 else f"jointly frozen through step {args.stage2_unfreeze_encoder_rvq_step}"
             )
-            + "; GAN discriminators begin after step "
+            + "; generator adversarial/feature losses begin after step "
             f"{stage_defaults['gan_start']}."
         )
-        print(
-            "Stage-2 reconstruction transition: retain Stage-1 weights "
-            "(SI-SDR=0.07, corr=0.02, envelope=0.05, noise-floor=0.03) "
-            f"through step {args.stage2_recon_transition_start_steps}, then "
-            "linearly reach Stage-2 endpoints "
-            "(SI-SDR=0.04, corr=0.01, envelope=0.015, noise-floor=0.02) by step "
-            f"{args.stage2_recon_transition_end_steps}."
-        )
+        if args.stage2_recon_transition_start_steps is None:
+            print(
+                "Stage-2 reconstruction weights: fixed for the full run "
+                "(wave=10.0, mel=1.1, SI-SDR=0.07, corr=0.02, "
+                "envelope=0.05, voiced-highband<=0.02, noise-floor=0.03, "
+                "STFT=0, frame-phase=0)."
+            )
+        else:
+            print(
+                "Stage-2 legacy reconstruction transition: start="
+                f"{args.stage2_recon_transition_start_steps}, end="
+                f"{args.stage2_recon_transition_end_steps}."
+            )
         print(
             "Stage-2 candidate policy: quality baseline at initialization; "
             f"best checkpoints and quality hard-stop begin at step "
             f"{args.stage2_best_checkpoint_min_step}/"
-            f"{args.stage2_quality_gate_start_steps}."
+            f"{args.stage2_quality_gate_start_steps}; best_gan_balanced.pt "
+            "additionally requires GAN ramp >= 0.5."
+        )
+        print(
+            "Stage-2 generator gradient diagnostics: every "
+            f"{args.gan_grad_diagnostics_every} step(s) "
+            "(0 disables; decoder GAN/reconstruction gradient ratio)."
         )
     print(f"Random seed: {args.seed}")
     print(
@@ -1508,6 +1855,16 @@ def main() -> None:
         f"start_steps={spectral_envelope_loss_start_steps if spectral_envelope_loss_weight > 0 else 0}, "
         f"warmup_steps={spectral_envelope_loss_warmup_steps if spectral_envelope_loss_weight > 0 else 0}, "
         "band=200-4500 Hz, smoothing_bins=9"
+    )
+    print(
+        "Voiced high-band detail loss: "
+        f"max_weight={voiced_highband_loss_weight}, "
+        f"start_steps={voiced_highband_loss_start_steps if voiced_highband_loss_weight > 0 else 0}, "
+        f"warmup_steps={voiced_highband_loss_warmup_steps if voiced_highband_loss_weight > 0 else 0}, "
+        "band=3000-7000 Hz, target-voiced and frame-gain-normalized, "
+        f"energy_deficit_weight={args.voiced_highband_energy_deficit_weight}, "
+        f"allowed_deficit={args.voiced_highband_energy_margin_db} dB, "
+        "excess_not_rewarded"
     )
     print(
         "Transient noise loss: "
@@ -1530,7 +1887,9 @@ def main() -> None:
         f"clip<={args.clean_gate_max_recon_clip_fraction}, "
         f"click<={args.clean_gate_max_click_score}, "
         f"jump<={args.clean_gate_max_jump_ratio}, "
-        f"p999_jump<={args.clean_gate_max_p999_jump_ratio}"
+        f"p999_jump<={args.clean_gate_max_p999_jump_ratio}, "
+        f"stage1_voiced_hf_ratio_db=[{args.clean_gate_min_voiced_hf_ratio_db}, "
+        f"{args.clean_gate_max_voiced_hf_ratio_db}]"
     )
     if args.stage == "gan_pretrain":
         print(
@@ -1539,6 +1898,9 @@ def main() -> None:
             f"aligned_si_sdr_drop<={args.stage2_max_aligned_si_sdr_drop:.2f} dB, "
             f"aligned_corr_drop<={args.stage2_max_aligned_corr_drop:.3f}, "
             f"quiet_hf_excess_rise<={args.stage2_max_quiet_hf_excess_db_rise:.2f} dB, "
+            f"ac320_rise<={args.stage2_max_ac320_isolated_rise:.4f}, "
+            "comb_median_excess_rise<="
+            f"{args.stage2_max_comb_median_excess_db_rise:.2f} dB, "
             "q00/q01=(active>=0.30, perplexity>=16), "
             f"hard_stop=(quality={args.stage2_quality_retention_patience}, "
             f"rvq={args.stage2_rvq_retention_patience}) validation checks"
@@ -1629,8 +1991,9 @@ def main() -> None:
     print(f"DataLoader workers per GPU: {args.dl_num_workers}")
     print(
         "Early stopping: "
+        f"metric={'aligned_si_sdr' if args.stage == 'recon_pretrain' else 'score'}, "
         f"patience={early_stopping_patience} validation checks, "
-        f"min_delta={args.early_stopping_min_delta}, "
+        f"min_delta={early_stopping_min_delta}, "
         f"configured_min_steps={early_stopping_min_steps}, "
         f"effective_min_steps={effective_early_stopping_min_steps}"
     )
@@ -1705,6 +2068,9 @@ def main() -> None:
         click_loss_weight=click_loss_weight,
         jump_loss_weight=jump_loss_weight,
         spectral_envelope_loss_weight=spectral_envelope_loss_weight,
+        voiced_highband_loss_weight=voiced_highband_loss_weight,
+        voiced_highband_energy_deficit_weight=args.voiced_highband_energy_deficit_weight,
+        voiced_highband_energy_margin_db=args.voiced_highband_energy_margin_db,
         preemph_loss_weight=preemph_loss_weight,
         noise_floor_loss_weight=noise_floor_loss_weight,
         stft_recon_loss_weight=stft_recon_loss_weight,
@@ -1714,6 +2080,13 @@ def main() -> None:
         decoder_upsample_mode=args.decoder_upsample_mode,
         decoder_residual_scale=decoder_residual_scale_start,
         decoder_linear_upsample_kernel_min=args.decoder_linear_upsample_kernel_min,
+        # With frozen Encoder/RVQ the commitment term has no trainable target.
+        # Restore it automatically if the user explicitly unfreezes that path.
+        commitment_loss_weight=(
+            0.
+            if args.stage == "gan_pretrain" and args.stage2_unfreeze_encoder_rvq_step < 0
+            else 0.1
+        ),
         sync_codebook=(world_size > 1),
     )
 
@@ -1741,6 +2114,14 @@ def main() -> None:
         lr=stage_defaults["lr"],
         discr_lr=stage_defaults["discr_lr"],
         stft_discr_lr=stft_discr_lr,
+        waveform_discr_lrs=waveform_discr_lrs,
+        waveform_discr_update_every=waveform_discr_update_every,
+        stft_discr_update_every=stft_discr_update_every,
+        gan_grad_diagnostics_every=(
+            args.gan_grad_diagnostics_every
+            if args.stage == "gan_pretrain"
+            else 0
+        ),
         discr_max_grad_norm=0.5,
         warmup_steps=warmup_steps,
         scheduler=scheduler,
@@ -1776,7 +2157,9 @@ def main() -> None:
         plateau_lr_metric=(
             'score' if stage2_plateau_lr_enabled else 'aligned_si_sdr'
         ),
-        plateau_lr_update_discriminator=stage2_plateau_lr_enabled,
+        # Different D branches now have independent LRs and update rates.
+        # A generator plateau must not silently destroy that balance.
+        plateau_lr_update_discriminator=False,
         plateau_lr_discr_min_lr=(
             args.stage2_plateau_discr_min_lr if stage2_plateau_lr_enabled
             else None
@@ -1797,6 +2180,11 @@ def main() -> None:
             if args.stage == "gan_pretrain" and args.stage2_generator_hold_steps > 0
             else None
         ),
+        generator_freeze_steps=(
+            args.stage2_generator_freeze_steps
+            if args.stage == "gan_pretrain"
+            else 0
+        ),
         discriminator_hold_steps=(
             args.stage2_discriminator_hold_steps
             if args.stage == "gan_pretrain"
@@ -1805,6 +2193,11 @@ def main() -> None:
         discriminator_hold_lr=(
             args.stage2_discriminator_hold_lr
             if args.stage == "gan_pretrain" and args.stage2_discriminator_hold_steps > 0
+            else None
+        ),
+        discriminator_start_step=(
+            args.stage2_discriminator_start_steps
+            if args.stage == "gan_pretrain"
             else None
         ),
         stage2_recon_transition_start_steps=(
@@ -1825,6 +2218,9 @@ def main() -> None:
         ),
         stage2_initial_spectral_envelope_loss_weight=(
             0.05 if args.stage == "gan_pretrain" else 0.
+        ),
+        stage2_initial_voiced_highband_loss_weight=(
+            0.02 if args.stage == "gan_pretrain" else 0.
         ),
         stage2_initial_noise_floor_loss_weight=(
             0.03 if args.stage == "gan_pretrain" else 0.
@@ -1858,6 +2254,16 @@ def main() -> None:
         spectral_envelope_loss_warmup_steps=(
             spectral_envelope_loss_warmup_steps
             if spectral_envelope_loss_weight > 0
+            else 0
+        ),
+        voiced_highband_loss_start_steps=(
+            voiced_highband_loss_start_steps
+            if voiced_highband_loss_weight > 0
+            else 0
+        ),
+        voiced_highband_loss_warmup_steps=(
+            voiced_highband_loss_warmup_steps
+            if voiced_highband_loss_weight > 0
             else 0
         ),
         stft_recon_loss_start_steps=stage_defaults.get("stft_recon_loss_start_steps", 0),
@@ -1897,9 +2303,22 @@ def main() -> None:
         clean_gate_max_click_score=args.clean_gate_max_click_score,
         clean_gate_max_jump_ratio=args.clean_gate_max_jump_ratio,
         clean_gate_max_p999_jump_ratio=args.clean_gate_max_p999_jump_ratio,
+        clean_gate_min_voiced_hf_ratio_db=(
+            args.clean_gate_min_voiced_hf_ratio_db
+            if args.stage == "recon_pretrain"
+            else None
+        ),
+        clean_gate_max_voiced_hf_ratio_db=(
+            args.clean_gate_max_voiced_hf_ratio_db
+            if args.stage == "recon_pretrain"
+            else None
+        ),
         early_stopping_patience=early_stopping_patience,
-        early_stopping_min_delta=args.early_stopping_min_delta,
+        early_stopping_min_delta=early_stopping_min_delta,
         early_stopping_min_steps=early_stopping_min_steps,
+        early_stopping_metric=(
+            'aligned_si_sdr' if args.stage == 'recon_pretrain' else 'score'
+        ),
         enable_gan=args.stage in GAN_STAGES,
         allow_discriminator_reinitialization=args.test_only,
         gan_start_step=stage_defaults["gan_start"],
@@ -1913,6 +2332,10 @@ def main() -> None:
         quality_retention_max_aligned_corr_drop=args.stage2_max_aligned_corr_drop,
         quality_retention_max_quiet_hf_excess_db_rise=args.stage2_max_quiet_hf_excess_db_rise,
         quality_retention_max_click_score_rise=args.stage2_max_click_score_rise,
+        quality_retention_max_ac320_isolated_rise=args.stage2_max_ac320_isolated_rise,
+        quality_retention_max_comb_median_excess_db_rise=(
+            args.stage2_max_comb_median_excess_db_rise
+        ),
         quality_retention_patience=args.stage2_quality_retention_patience,
         quality_retention_rvq_patience=args.stage2_rvq_retention_patience,
         freeze_codebook_after_step=stage_defaults.get("freeze_codebook_after_step"),
@@ -2096,10 +2519,13 @@ def main() -> None:
         # Evaluate once on rank 0, then distribute the numerical baseline so
         # resumed / distributed workers carry identical retention state.
         baseline_keys = (
+            "score",
             "aligned_si_sdr",
             "aligned_correlation",
             "quiet_hf_excess_db",
             "click_score",
+            "ac_320_isolated",
+            "comb_median_excess_db",
         )
         baseline_values = torch.zeros(
             len(baseline_keys),
@@ -2122,6 +2548,30 @@ def main() -> None:
             (float(value) for value in baseline_values.cpu().tolist()),
         ))
         trainer.set_quality_retention_baseline(baseline_metrics)
+        if checkpoint is None:
+            # The initialization point is a real candidate, not merely a gate
+            # reference.  Seed every best-score tracker with it so later
+            # checkpoints must genuinely beat the model we started from.
+            trainer.best_valid_score = min(
+                trainer.best_valid_score,
+                baseline_metrics["score"],
+            )
+            trainer.early_stopping_best_score = min(
+                trainer.early_stopping_best_score,
+                baseline_metrics["score"],
+            )
+            trainer.best_aligned_si_sdr = max(
+                trainer.best_aligned_si_sdr,
+                baseline_metrics["aligned_si_sdr"],
+            )
+            trainer.best_frame_leakage_score = min(
+                trainer.best_frame_leakage_score,
+                baseline_metrics["ac_320_isolated"],
+            )
+            trainer.best_balanced_score = min(
+                trainer.best_balanced_score,
+                baseline_metrics["score"],
+            )
         if trainer.is_main:
             print(
                 "Stage-2 quality retention baseline recorded from initialized "
@@ -2129,8 +2579,52 @@ def main() -> None:
                 f"aligned_si_sdr={baseline_metrics['aligned_si_sdr']:.3f}, "
                 f"aligned_corr={baseline_metrics['aligned_correlation']:.3f}, "
                 f"quiet_hf_excess_db={baseline_metrics['quiet_hf_excess_db']:.3f}, "
-                f"click_score={baseline_metrics['click_score']:.3f}"
+                f"click_score={baseline_metrics['click_score']:.3f}, "
+                f"ac_320_isolated={baseline_metrics['ac_320_isolated']:.4f}, "
+                f"comb_median_excess_db={baseline_metrics['comb_median_excess_db']:.3f}"
             )
+            if checkpoint is None:
+                baseline_candidates = (
+                    (
+                        results_dir / "baseline_init.pt",
+                        baseline_metrics["score"],
+                    ),
+                    (
+                        results_dir / "best_selected.pt",
+                        baseline_metrics["score"],
+                    ),
+                    (
+                        results_dir / "best_by_aligned_si_sdr.pt",
+                        baseline_metrics["aligned_si_sdr"],
+                    ),
+                    (
+                        results_dir / "best_by_frame_leakage.pt",
+                        baseline_metrics["ac_320_isolated"],
+                    ),
+                    (
+                        results_dir / "best_balanced.pt",
+                        baseline_metrics["score"],
+                    ),
+                )
+                for baseline_path, baseline_score in baseline_candidates:
+                    if baseline_path.exists():
+                        print(
+                            "Keeping existing checkpoint instead of overwriting "
+                            f"the initialization candidate: {baseline_path}"
+                        )
+                        continue
+                    trainer.save_model_only(
+                        baseline_path,
+                        trainer.unwrapped_soundstream,
+                        score=baseline_score,
+                        step=-1,
+                        weight_source="initialization",
+                    )
+                print(
+                    "Saved Stage-2 initialization candidate as baseline_init.pt "
+                    "and seeded reconstruction, SI-SDR, frame-leakage, and "
+                    "balanced checkpoint comparisons from its metrics."
+                )
         trainer.accelerator.wait_for_everyone()
 
     if not args.test_only:
@@ -2161,15 +2655,25 @@ def main() -> None:
         print(f"Parameters saved to: {final_checkpoint}")
 
     trainer.accelerator.wait_for_everyone()
+    best_gan_balanced = results_dir / "best_gan_balanced.pt"
+    best_balanced = results_dir / "best_balanced.pt"
     best_by_aligned_si_sdr = results_dir / "best_by_aligned_si_sdr.pt"
     best_selected = results_dir / "best_selected.pt"
     best_checkpoint = (
         args.test_checkpoint
         if args.test_only
         else (
-            best_by_aligned_si_sdr
-            if best_by_aligned_si_sdr.exists()
-            else best_selected
+            best_gan_balanced
+            if args.stage == "gan_pretrain" and best_gan_balanced.exists()
+            else (
+                best_balanced
+                if best_balanced.exists()
+                else (
+                    best_by_aligned_si_sdr
+                    if best_by_aligned_si_sdr.exists()
+                    else best_selected
+                )
+            )
         )
     )
 
@@ -2253,6 +2757,12 @@ def main() -> None:
             'jump_ratio',
             'p999_jump_ratio',
             'click_score',
+            'voiced_highband_loss',
+            'voiced_hf_energy_ratio_db',
+            'voiced_hf_logmag_error',
+            'voiced_hf_energy_deficit',
+            'spectral_centroid_delta_hz',
+            'spectral_slope_delta',
             'frame_diagnostic_valid',
             'ac_319',
             'ac_320',
@@ -2326,6 +2836,11 @@ def main() -> None:
                 f"recon_clip={test_metrics.get('recon_clip_fraction', 0.) * 100:.6f}%, "
                 f"jump_ratio={test_metrics.get('jump_ratio', 0.):.6f}, "
                 f"click_score={test_metrics.get('click_score', 0.):.6f}, "
+                f"voiced_hf_ratio_db={test_metrics.get('voiced_hf_energy_ratio_db', 0.):+.3f}, "
+                f"voiced_hf_error={test_metrics.get('voiced_hf_logmag_error', 0.):.4f}, "
+                f"voiced_hf_deficit={test_metrics.get('voiced_hf_energy_deficit', 0.):.4f}, "
+                f"centroid_delta_hz={test_metrics.get('spectral_centroid_delta_hz', 0.):+.1f}, "
+                f"slope_delta={test_metrics.get('spectral_slope_delta', 0.):+.3f}, "
                 f"ac_320_isolated={test_metrics.get('ac_320_isolated', 0.):+.6f}, "
                 f"phase_peak_db={test_metrics.get('frame_phase_peak_db', 0.):+.3f}, "
                 f"comb_median_db={test_metrics.get('comb_median_excess_db', 0.):+.3f}, "
