@@ -34,7 +34,7 @@
 !tools/
 !tools/checkpoint_decoder_config.py
 !tools/select_stage1_checkpoint.py
-
+!tools/validate_stage2_init.py
 # ============================================================
 # Keep source code directories
 # ============================================================
