@@ -678,8 +678,8 @@ class SoundStream(Module):
         stft_recon_loss_weight = 0.,
         spectral_envelope_loss_weight = 0.,
         voiced_highband_loss_weight = 0.,
-        voiced_highband_energy_deficit_weight = 0.2,
-        voiced_highband_energy_margin_db = 0.25,
+        voiced_highband_energy_deficit_weight = 0.35,
+        voiced_highband_energy_margin_db = 0.10,
         si_sdr_loss_weight = 0.,
         correlation_loss_weight = 0.,
         energy_loss_weight = 0.1,
@@ -912,6 +912,15 @@ class SoundStream(Module):
         self.spectral_envelope_max_hz = 4500.
         self.spectral_envelope_relative_rms_db = -35.
         self.spectral_envelope_absolute_rms = 0.003
+        # Optimize the band that carries speech presence and consonant detail
+        # more strongly than the upper "air" band.  A flat 3-7 kHz objective
+        # left the k4-online checkpoint measurably dull, while uniformly
+        # increasing the whole band risks learning broadband hiss.
+        self.voiced_highband_loss_min_hz = 2500.
+        self.voiced_highband_core_max_hz = 5500.
+        self.voiced_highband_upper_weight = 0.35
+        # Keep the original 3-7 kHz diagnostic definition so new validation
+        # numbers remain comparable with earlier runs.
         self.voiced_highband_min_hz = 3000.
         self.voiced_highband_max_hz = min(7000., target_sample_hz / 2.)
         self.voiced_highband_reference_min_hz = 200.
@@ -1441,11 +1450,20 @@ class SoundStream(Module):
             (frequencies >= self.voiced_highband_min_hz) &
             (frequencies <= self.voiced_highband_max_hz)
         )
+        loss_highband = (
+            (frequencies >= self.voiced_highband_loss_min_hz) &
+            (frequencies <= self.voiced_highband_max_hz)
+        )
         slope_band = (
             (frequencies >= self.voiced_highband_slope_min_hz) &
             (frequencies <= self.voiced_highband_max_hz)
         )
-        if not reference_band.any() or not highband.any() or not slope_band.any():
+        if (
+            not reference_band.any() or
+            not highband.any() or
+            not loss_highband.any() or
+            not slope_band.any()
+        ):
             return (
                 self.zero, self.zero, self.zero,
                 self.zero, self.zero, self.zero
@@ -1480,19 +1498,41 @@ class SoundStream(Module):
         # than merely adding energy above 3 kHz.
         target_frame_gain = target_log_mag[:, reference_band].mean(dim = 1, keepdim = True)
         recon_frame_gain = recon_log_mag[:, reference_band].mean(dim = 1, keepdim = True)
-        target_highband = target_log_mag[:, highband] - target_frame_gain
-        recon_highband = recon_log_mag[:, highband] - recon_frame_gain
+        target_highband = target_log_mag[:, loss_highband] - target_frame_gain
+        recon_highband = recon_log_mag[:, loss_highband] - recon_frame_gain
         highband_error = (recon_highband - target_highband).abs()
-        highband_bin_count = max(highband_error.shape[1], 1)
+        loss_highband_frequencies = frequencies[loss_highband]
+        highband_bin_weights = torch.where(
+            loss_highband_frequencies <= self.voiced_highband_core_max_hz,
+            torch.ones_like(loss_highband_frequencies),
+            torch.full_like(
+                loss_highband_frequencies,
+                self.voiced_highband_upper_weight
+            )
+        )
+        highband_weight_sum = highband_bin_weights.sum().clamp_min(1e-8)
         voiced_highband_logmag_error = (
-            highband_error * voiced_weight.unsqueeze(1)
-        ).sum() / (voiced_count * highband_bin_count)
+            highband_error *
+            highband_bin_weights[None, :, None] *
+            voiced_weight.unsqueeze(1)
+        ).sum() / (voiced_count * highband_weight_sum)
 
+        # The one-sided training penalty follows the same clarity weighting.
+        # Diagnostics below deliberately retain the historical flat 3-7 kHz
+        # definition for apples-to-apples comparisons.
+        target_loss_hf_power = (
+            target_mag[:, loss_highband].square() *
+            highband_bin_weights[None, :, None]
+        ).sum(dim = 1) / highband_weight_sum
+        recon_loss_hf_power = (
+            recon_mag[:, loss_highband].square() *
+            highband_bin_weights[None, :, None]
+        ).sum(dim = 1) / highband_weight_sum
         target_hf_power = target_mag[:, highband].square().mean(dim = 1)
         recon_hf_power = recon_mag[:, highband].square().mean(dim = 1)
         log_power_deficit = F.relu(
-            torch.log(target_hf_power + 1e-10) -
-            torch.log(recon_hf_power + 1e-10) -
+            torch.log(target_loss_hf_power + 1e-10) -
+            torch.log(recon_loss_hf_power + 1e-10) -
             self.voiced_highband_energy_margin_db * math.log(10.) / 10.
         )
         voiced_hf_energy_deficit = (

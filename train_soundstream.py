@@ -63,14 +63,22 @@ STAGE_DEFAULTS = {
         save_every=2_000, eval_every=250, min_steps=60_000, patience=40,
         lr=2e-4, discr_lr=None, ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
-        use_ema=True,
+        # The highband-k5 run showed sustained EMA lag followed by multi-layer
+        # EMA codebook collapse while the online codec remained healthy near
+        # its validation peak.  Stage 1 therefore selects and exports online
+        # weights only; later stages may still opt into EMA independently.
+        use_ema=False,
         click_loss_weight=0., jump_loss_weight=0.,
         preemph_loss_weight=0., noise_floor_loss_weight=0.03,
         transient_loss_warmup_steps=15_000,
         spectral_envelope_loss_weight=0.05,
         spectral_envelope_loss_start_steps=5_000,
         spectral_envelope_loss_warmup_steps=10_000,
-        voiced_highband_loss_weight=0.04,
+        # The k4-online run retained a -2.2 dB voiced high-band deficit even
+        # though SI-SDR and frame leakage improved.  Give the speech-clarity
+        # band a little more influence without turning this into a broadband
+        # high-frequency boost.
+        voiced_highband_loss_weight=0.06,
         voiced_highband_loss_start_steps=5_000,
         voiced_highband_loss_warmup_steps=15_000,
         stft_recon_loss_weight=0.,
@@ -117,9 +125,9 @@ STAGE_DEFAULTS = {
         early_stopping_min_delta=0.003,
         # Keep Stage-2 decoder updates smaller than discriminator updates so a
         # freshly initialized GAN cannot quickly displace the selected codec.
-        lr=2e-7, discr_lr=1e-6, stft_discr_lr=5e-7,
+        lr=5e-7, discr_lr=1e-6, stft_discr_lr=5e-7,
         waveform_discr_lrs=(1e-6, 2e-6, 2e-6),
-        waveform_discr_update_every=(1, 1, 1),
+        waveform_discr_update_every=(1, 2, 2),
         stft_discr_update_every=2,
         ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
@@ -130,9 +138,12 @@ STAGE_DEFAULTS = {
         spectral_envelope_loss_weight=0.05,
         spectral_envelope_loss_start_steps=0,
         spectral_envelope_loss_warmup_steps=0,
-        voiced_highband_loss_weight=0.02,
+        # Preserve the deterministic clarity learned in Stage 1.  Stage 2 GAN
+        # gradients may add natural detail, but must not replace the paired
+        # voiced high-band objective entirely.
+        voiced_highband_loss_weight=0.04,
         voiced_highband_loss_start_steps=0,
-        voiced_highband_loss_warmup_steps=10_000,
+        voiced_highband_loss_warmup_steps=0,
         stft_recon_loss_weight=0.,
         # Keep frame-leakage validation diagnostics, but disable the training
         # loss because the latest diagnostic run increased ac_320.
@@ -143,9 +154,9 @@ STAGE_DEFAULTS = {
         si_sdr_loss_start_steps=0,
         si_sdr_loss_warmup_steps=0,
         # Warm up fresh discriminators against a frozen Stage-1 generator for
-        # 1k steps.  Then let GAN gradients enter gradually over 10k steps.
-        gan_start=1_000, gan_ramp=10_000,
-        gan_adversarial_max=2e-4, gan_feature_max=5.0,
+        # 1k steps. Then introduce GAN gradients slowly over 20k steps.
+        gan_start=1_000, gan_ramp=20_000,
+        gan_adversarial_max=2e-4, gan_feature_max=2.5,
     ),
     "stream_finetune": dict(
         steps=20_000, batch_size=4, segment_seconds=2.,
@@ -257,6 +268,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Defaults depend on --stage.",
+    )
+    parser.add_argument(
+        "--generator-lr",
+        type=float,
+        default=None,
+        help=(
+            "Optional generator learning-rate override. Useful for a fresh "
+            "low-LR refinement initialized from a model-only checkpoint."
+        ),
     )
     parser.add_argument(
         "--batch-size",
@@ -374,7 +394,8 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help=(
-            "Maximum target-voiced, frame-gain-normalized 3-7 kHz log-spectrum "
+            "Maximum target-voiced, frame-gain-normalized high-band log-spectrum "
+            "loss weight (2.5-5.5 kHz primary, 5.5-7 kHz auxiliary); "
             "loss weight; defaults depend on --stage."
         ),
     )
@@ -393,17 +414,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--voiced-highband-energy-deficit-weight",
         type=float,
-        default=0.20,
+        default=0.35,
         help=(
             "Internal one-sided high-band energy-deficit weight. This "
-            "penalizes missing voiced 3-7 kHz energy without rewarding "
+            "penalizes missing voiced high-band energy without rewarding "
             "high-frequency excess."
         ),
     )
     parser.add_argument(
         "--voiced-highband-energy-margin-db",
         type=float,
-        default=0.25,
+        default=0.10,
         help=(
             "Allowed voiced high-band energy deficit before the one-sided "
             "penalty activates."
@@ -456,8 +477,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--plateau-min-lr",
         type=float,
-        default=2e-5,
+        default=1e-5,
         help="Lower bound for stage-1 ReduceLROnPlateau generator LR.",
+    )
+
+    parser.add_argument(
+        "--stage1-rvq-retention-patience",
+        type=int,
+        default=8,
+        help=(
+            "Consecutive fixed-validation checks with an unhealthy online q00/RVQ "
+            "after the stage-1 minimum-step floor before a protective hard stop."
+        ),
     )
     parser.add_argument(
         "--plateau-unclean-grace-checks",
@@ -518,13 +549,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage2-plateau-discr-min-lr",
         type=float,
-        default=2e-6,
+        default=2e-7,
         help="Minimum Stage-2 waveform-discriminator LR; preserves the initial G:D ratio.",
     )
     parser.add_argument(
         "--stage2-plateau-stft-discr-min-lr",
         type=float,
-        default=4e-7,
+        default=1e-7,
         help=(
             "Minimum Stage-2 STFT-discriminator LR. Kept separate so plateau "
             "cannot raise the lower STFT-D LR to the waveform-D minimum."
@@ -628,6 +659,15 @@ def parse_args() -> argparse.Namespace:
         help="Maximum click score for best checkpoint eligibility.",
     )
     parser.add_argument(
+        "--clean-gate-max-click-excess",
+        type=float,
+        default=0.5,
+        help=(
+            "Maximum reconstructed click-score excess above the matched target. "
+            "This relative gate replaces the absolute click-score gate when set."
+        ),
+    )
+    parser.add_argument(
         "--clean-gate-max-jump-ratio",
         type=float,
         default=2.0,
@@ -687,14 +727,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage2-quality-retention-patience",
         type=int,
-        default=6,
+        default=12,
         help="Consecutive validation regressions before the Stage-2 quality hard stop.",
     )
     parser.add_argument(
         "--stage2-rvq-retention-patience",
         type=int,
-        default=3,
+        default=6,
         help="Consecutive q00/q01 regressions before the Stage-2 RVQ hard stop.",
+    )
+    parser.add_argument(
+        "--stage2-max-voiced-hf-ratio-db-drop",
+        type=float,
+        default=0.30,
+        help=(
+            "Maximum Stage-2 voiced 3-7 kHz energy-ratio drop from the "
+            "initialization baseline in dB."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-max-voiced-hf-ratio-db-rise",
+        type=float,
+        default=0.75,
+        help=(
+            "Maximum Stage-2 voiced 3-7 kHz energy-ratio rise from the "
+            "initialization baseline in dB."
+        ),
     )
     parser.add_argument(
         "--stage2-max-click-score-rise",
@@ -785,6 +843,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--discr-max-grad-norm",
+        type=float,
+        default=0.5,
+        help="Independent gradient-norm clipping threshold for each discriminator branch.",
+    )
+    parser.add_argument(
         "--stage2-unfreeze-encoder-rvq-step",
         type=int,
         default=-1,
@@ -819,11 +883,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--decoder-linear-upsample-kernel-min",
         type=int,
-        default=5,
+        default=4,
         help=(
             "Minimum kernel size for decoder linear-upsample CausalConv1d. "
-            "With the default 5, large-stride layers keep 2*stride while the "
-            "final small-stride layer is lightly smoothed."
+            "With the default 4, every layer uses its natural 2*stride "
+            "kernel (16, 10, 8, 4 for decoder strides 8, 5, 4, 2), "
+            "avoiding extra smoothing in the final x2 upsampling layer."
         ),
     )
     parser.add_argument(
@@ -856,10 +921,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage2-generator-freeze-steps",
         type=int,
-        default=1_000,
+        default=0,
         help=(
-            "For gan_pretrain, keep all generator parameters unchanged for "
-            "this many initial steps while optionally pretraining discriminators."
+            "For gan_pretrain, optionally keep all generator parameters unchanged. "
+            "The default is zero so paired reconstruction continues before GAN starts."
         ),
     )
     parser.add_argument(
@@ -937,7 +1002,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage2-quality-gate-start-steps",
         type=int,
-        default=10_000,
+        default=25_000,
         help=(
             "Record Stage-2 quality retention from initialization, but defer "
             "quality hard-stop accumulation until this step."
@@ -1025,6 +1090,31 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Explicit checkpoint for --test-only; accepts model-only or full trainer checkpoints.",
+    )
+    parser.add_argument(
+        "--validation-only",
+        action="store_true",
+        help=(
+            "Skip training and evaluate only --validation-checkpoint on the "
+            "deterministic fixed validation set. This mode is intended for "
+            "checkpoint handoff / fallback decisions and never evaluates the "
+            "held-out test split."
+        ),
+    )
+    parser.add_argument(
+        "--validation-checkpoint",
+        type=Path,
+        default=None,
+        help="Explicit model-only or full trainer checkpoint for --validation-only.",
+    )
+    parser.add_argument(
+        "--validation-report-file",
+        type=Path,
+        default=None,
+        help=(
+            "TSV output for --validation-only. Defaults to "
+            "results/fixed_validation_report.tsv."
+        ),
     )
     parser.add_argument(
         "--resume",
@@ -1265,7 +1355,7 @@ def main() -> None:
             discr_lr=1e-6,
             stft_discr_lr=5e-7,
             waveform_discr_lrs=(1e-6, 2e-6, 2e-6),
-            waveform_discr_update_every=(1, 1, 1),
+            waveform_discr_update_every=(1, 2, 2),
             stft_discr_update_every=2,
             gan_start=1_000,
             gan_ramp=10_000,
@@ -1281,7 +1371,7 @@ def main() -> None:
         # The targeted preset is decoder-only by design.  Ignore an old launch
         # argument that would otherwise unfreeze Encoder/RVQ mid-run.
         args.stage2_unfreeze_encoder_rvq_step = -1
-        args.stage2_generator_freeze_steps = 1_000
+        args.stage2_generator_freeze_steps = 0
         args.stage2_discriminator_start_steps = 0
         args.stage2_max_aligned_si_sdr_drop = min(
             args.stage2_max_aligned_si_sdr_drop,
@@ -1295,6 +1385,11 @@ def main() -> None:
             args.stage2_best_checkpoint_min_step,
             1_000,
         )
+
+    if args.generator_lr is not None:
+        if args.generator_lr <= 0:
+            raise ValueError("--generator-lr must be positive.")
+        stage_defaults["lr"] = args.generator_lr
 
     if args.seed < 0:
         raise ValueError("--seed must be non-negative.")
@@ -1390,12 +1485,20 @@ def main() -> None:
         raise ValueError("--stft-discr-update-every must be positive.")
     if args.gan_grad_diagnostics_every < 0:
         raise ValueError("--gan-grad-diagnostics-every cannot be negative.")
+    if args.discr_max_grad_norm <= 0:
+        raise ValueError("--discr-max-grad-norm must be positive.")
+    if args.clean_gate_max_click_excess < 0:
+        raise ValueError("--clean-gate-max-click-excess cannot be negative.")
     if args.stage2_unfreeze_encoder_rvq_step < -1:
         raise ValueError("--stage2-unfreeze-encoder-rvq-step must be -1 or non-negative.")
     if args.stage2_generator_hold_steps < 0:
         raise ValueError("--stage2-generator-hold-steps cannot be negative.")
     if args.stage2_generator_hold_lr <= 0:
         raise ValueError("--stage2-generator-hold-lr must be positive.")
+    if args.stage2_max_voiced_hf_ratio_db_drop < 0:
+        raise ValueError("--stage2-max-voiced-hf-ratio-db-drop cannot be negative.")
+    if args.stage2_max_voiced_hf_ratio_db_rise < 0:
+        raise ValueError("--stage2-max-voiced-hf-ratio-db-rise cannot be negative.")
     if args.stage2_generator_freeze_steps < 0:
         raise ValueError("--stage2-generator-freeze-steps cannot be negative.")
     if args.stage2_discriminator_hold_steps < 0:
@@ -1477,7 +1580,11 @@ def main() -> None:
     ):
         if getattr(args, name) < 0:
             raise ValueError(f"--{name.replace('_', '-')} cannot be negative.")
-    for name in ("stage2_quality_retention_patience", "stage2_rvq_retention_patience"):
+    for name in (
+        "stage1_rvq_retention_patience",
+        "stage2_quality_retention_patience",
+        "stage2_rvq_retention_patience",
+    ):
         if getattr(args, name) <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be greater than zero.")
     if args.dl_num_workers < 0:
@@ -1821,7 +1928,7 @@ def main() -> None:
             print(
                 "Stage-2 reconstruction weights: fixed for the full run "
                 "(wave=10.0, mel=1.1, SI-SDR=0.07, corr=0.02, "
-                "envelope=0.05, voiced-highband<=0.02, noise-floor=0.03, "
+                "envelope=0.05, voiced-highband=0.04, noise-floor=0.03, "
                 "STFT=0, frame-phase=0)."
             )
         else:
@@ -1835,7 +1942,7 @@ def main() -> None:
             f"best checkpoints and quality hard-stop begin at step "
             f"{args.stage2_best_checkpoint_min_step}/"
             f"{args.stage2_quality_gate_start_steps}; best_gan_balanced.pt "
-            "additionally requires GAN ramp >= 0.5."
+            "requires GAN ramp >= 0.5 and best_full_gan_balanced.pt requires ramp=1.0."
         )
         print(
             "Stage-2 generator gradient diagnostics: every "
@@ -1861,7 +1968,8 @@ def main() -> None:
         f"max_weight={voiced_highband_loss_weight}, "
         f"start_steps={voiced_highband_loss_start_steps if voiced_highband_loss_weight > 0 else 0}, "
         f"warmup_steps={voiced_highband_loss_warmup_steps if voiced_highband_loss_weight > 0 else 0}, "
-        "band=3000-7000 Hz, target-voiced and frame-gain-normalized, "
+        "loss_band=2500-5500 Hz primary + 5500-7000 Hz auxiliary(0.35), "
+        "diagnostic_band=3000-7000 Hz, target-voiced and frame-gain-normalized, "
         f"energy_deficit_weight={args.voiced_highband_energy_deficit_weight}, "
         f"allowed_deficit={args.voiced_highband_energy_margin_db} dB, "
         "excess_not_rewarded"
@@ -1885,7 +1993,8 @@ def main() -> None:
         f"rms_ratio=[{args.clean_gate_min_rms_ratio}, {args.clean_gate_max_rms_ratio}], "
         f"peak<={args.clean_gate_max_recon_peak}, "
         f"clip<={args.clean_gate_max_recon_clip_fraction}, "
-        f"click<={args.clean_gate_max_click_score}, "
+        f"click_excess<={args.clean_gate_max_click_excess} "
+        f"(absolute click diagnostic threshold={args.clean_gate_max_click_score}), "
         f"jump<={args.clean_gate_max_jump_ratio}, "
         f"p999_jump<={args.clean_gate_max_p999_jump_ratio}, "
         f"stage1_voiced_hf_ratio_db=[{args.clean_gate_min_voiced_hf_ratio_db}, "
@@ -1898,10 +2007,12 @@ def main() -> None:
             f"aligned_si_sdr_drop<={args.stage2_max_aligned_si_sdr_drop:.2f} dB, "
             f"aligned_corr_drop<={args.stage2_max_aligned_corr_drop:.3f}, "
             f"quiet_hf_excess_rise<={args.stage2_max_quiet_hf_excess_db_rise:.2f} dB, "
+            f"voiced_hf_ratio_delta=[-{args.stage2_max_voiced_hf_ratio_db_drop:.2f}, "
+            f"+{args.stage2_max_voiced_hf_ratio_db_rise:.2f}] dB, "
             f"ac320_rise<={args.stage2_max_ac320_isolated_rise:.4f}, "
             "comb_median_excess_rise<="
             f"{args.stage2_max_comb_median_excess_db_rise:.2f} dB, "
-            "q00/q01=(active>=0.30, perplexity>=16), "
+            "q00=(active>=0.70, perplexity>=50), q01/RVQ healthy, "
             f"hard_stop=(quality={args.stage2_quality_retention_patience}, "
             f"rvq={args.stage2_rvq_retention_patience}) validation checks"
         )
@@ -1928,6 +2039,12 @@ def main() -> None:
         "STFT reconstruction loss weight: "
         f"max={stft_recon_loss_weight}, warmup_steps={stft_recon_loss_warmup_steps}"
     )
+    if args.stage == "recon_pretrain":
+        print(
+            "Stage-1 RVQ protective stop: "
+            f"patience={args.stage1_rvq_retention_patience} consecutive "
+            "fixed-validation checks after the early-stopping floor"
+        )
     print(
         "Frame-phase residual loss: "
         f"max={frame_phase_loss_weight}, warmup_steps={frame_phase_loss_warmup_steps}, "
@@ -1979,7 +2096,8 @@ def main() -> None:
             f"STFT real-only gamma={args.stft_r1_gamma:.3e} every "
             f"{args.stft_r1_every} steps (no interval multiplier); "
             f"waveform gamma={args.waveform_r1_gamma:.3e} every "
-            f"{args.waveform_r1_every} steps"
+            f"{args.waveform_r1_every} steps; "
+            f"per-branch grad_clip={args.discr_max_grad_norm:g}"
         )
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     effective_global_batch = (
@@ -2122,7 +2240,7 @@ def main() -> None:
             if args.stage == "gan_pretrain"
             else 0
         ),
-        discr_max_grad_norm=0.5,
+        discr_max_grad_norm=args.discr_max_grad_norm,
         warmup_steps=warmup_steps,
         scheduler=scheduler,
         scheduler_kwargs=scheduler_kwargs,
@@ -2220,7 +2338,7 @@ def main() -> None:
             0.05 if args.stage == "gan_pretrain" else 0.
         ),
         stage2_initial_voiced_highband_loss_weight=(
-            0.02 if args.stage == "gan_pretrain" else 0.
+            0.04 if args.stage == "gan_pretrain" else 0.
         ),
         stage2_initial_noise_floor_loss_weight=(
             0.03 if args.stage == "gan_pretrain" else 0.
@@ -2301,6 +2419,7 @@ def main() -> None:
         clean_gate_max_recon_peak=args.clean_gate_max_recon_peak,
         clean_gate_max_recon_clip_fraction=args.clean_gate_max_recon_clip_fraction,
         clean_gate_max_click_score=args.clean_gate_max_click_score,
+        clean_gate_max_click_excess=args.clean_gate_max_click_excess,
         clean_gate_max_jump_ratio=args.clean_gate_max_jump_ratio,
         clean_gate_max_p999_jump_ratio=args.clean_gate_max_p999_jump_ratio,
         clean_gate_min_voiced_hf_ratio_db=(
@@ -2331,6 +2450,12 @@ def main() -> None:
         quality_retention_max_aligned_si_sdr_drop=args.stage2_max_aligned_si_sdr_drop,
         quality_retention_max_aligned_corr_drop=args.stage2_max_aligned_corr_drop,
         quality_retention_max_quiet_hf_excess_db_rise=args.stage2_max_quiet_hf_excess_db_rise,
+        quality_retention_max_voiced_hf_ratio_db_drop=(
+            args.stage2_max_voiced_hf_ratio_db_drop
+        ),
+        quality_retention_max_voiced_hf_ratio_db_rise=(
+            args.stage2_max_voiced_hf_ratio_db_rise
+        ),
         quality_retention_max_click_score_rise=args.stage2_max_click_score_rise,
         quality_retention_max_ac320_isolated_rise=args.stage2_max_ac320_isolated_rise,
         quality_retention_max_comb_median_excess_db_rise=(
@@ -2338,6 +2463,7 @@ def main() -> None:
         ),
         quality_retention_patience=args.stage2_quality_retention_patience,
         quality_retention_rvq_patience=args.stage2_rvq_retention_patience,
+        stage1_rvq_retention_patience=args.stage1_rvq_retention_patience,
         freeze_codebook_after_step=stage_defaults.get("freeze_codebook_after_step"),
         freeze_codebook_before_step=(
             args.stage2_unfreeze_encoder_rvq_step
@@ -2391,21 +2517,53 @@ def main() -> None:
         force_clear_prev_results=False,
     )
 
+    if args.test_only and args.validation_only:
+        raise ValueError("--test-only and --validation-only are mutually exclusive")
+
+    evaluation_only = args.test_only or args.validation_only
     checkpoint = (
         latest_checkpoint(results_dir)
-        if args.resume and not args.test_only
+        if args.resume and not evaluation_only
         else None
     )
 
-    if args.test_only:
-        if args.test_checkpoint is None:
-            raise ValueError("--test-only requires --test-checkpoint")
-        args.test_checkpoint = args.test_checkpoint.expanduser().resolve()
-        if not args.test_checkpoint.is_file():
-            raise FileNotFoundError(
-                f"Test checkpoint not found: {args.test_checkpoint}"
+    if evaluation_only:
+        evaluation_checkpoint = (
+            args.test_checkpoint
+            if args.test_only
+            else args.validation_checkpoint
+        )
+        required_flag = (
+            "--test-checkpoint"
+            if args.test_only
+            else "--validation-checkpoint"
+        )
+        if evaluation_checkpoint is None:
+            raise ValueError(
+                f"{'--test-only' if args.test_only else '--validation-only'} "
+                f"requires {required_flag}"
             )
-        print(f"Test-only mode; training and checkpoint writes are disabled: {args.test_checkpoint}")
+        evaluation_checkpoint = evaluation_checkpoint.expanduser().resolve()
+        if not evaluation_checkpoint.is_file():
+            raise FileNotFoundError(
+                f"Evaluation checkpoint not found: {evaluation_checkpoint}"
+            )
+        if args.test_only:
+            args.test_checkpoint = evaluation_checkpoint
+            print(
+                "Test-only mode; training and checkpoint writes are disabled: "
+                f"{evaluation_checkpoint}"
+            )
+        else:
+            args.validation_checkpoint = evaluation_checkpoint
+            print(
+                "Fixed-validation-only mode; training, held-out testing, and "
+                f"checkpoint writes are disabled: {evaluation_checkpoint}"
+            )
+            load_model_weights_only(
+                trainer.unwrapped_soundstream,
+                evaluation_checkpoint,
+            )
     elif checkpoint is not None:
         print(f"Resuming from checkpoint: {checkpoint}")
         trainer.load(
@@ -2433,9 +2591,18 @@ def main() -> None:
                 else STAGE_RESULTS_DIRS[predecessor_stage]
             )
             predecessor_candidates = (
-                ("best_by_aligned_si_sdr.pt", "best_selected.pt")
+                (
+                    "best_raw_online_by_clarity.pt",
+                    "best_by_aligned_si_sdr.pt",
+                    "best_selected.pt",
+                    "best_raw_online_by_aligned_si_sdr.pt",
+                )
                 if predecessor_stage in ("recon_pretrain", "spectral_refine")
-                else ("best_selected.pt",)
+                else (
+                    "best_full_gan_balanced.pt",
+                    "best_gan_balanced.pt",
+                    "best_selected.pt",
+                )
             )
             init_checkpoint = next(
                 (predecessor_dir / name for name in predecessor_candidates
@@ -2511,7 +2678,7 @@ def main() -> None:
         print("Starting a new training run.")
 
     if (
-        not args.test_only and
+        not evaluation_only and
         args.stage == "gan_pretrain" and
         trainer.quality_retention_gate and
         not trainer.has_quality_retention_baseline
@@ -2523,6 +2690,7 @@ def main() -> None:
             "aligned_si_sdr",
             "aligned_correlation",
             "quiet_hf_excess_db",
+            "voiced_hf_energy_ratio_db",
             "click_score",
             "ac_320_isolated",
             "comb_median_excess_db",
@@ -2579,6 +2747,7 @@ def main() -> None:
                 f"aligned_si_sdr={baseline_metrics['aligned_si_sdr']:.3f}, "
                 f"aligned_corr={baseline_metrics['aligned_correlation']:.3f}, "
                 f"quiet_hf_excess_db={baseline_metrics['quiet_hf_excess_db']:.3f}, "
+                f"voiced_hf_ratio_db={baseline_metrics['voiced_hf_energy_ratio_db']:+.3f}, "
                 f"click_score={baseline_metrics['click_score']:.3f}, "
                 f"ac_320_isolated={baseline_metrics['ac_320_isolated']:.4f}, "
                 f"comb_median_excess_db={baseline_metrics['comb_median_excess_db']:.3f}"
@@ -2627,6 +2796,38 @@ def main() -> None:
                 )
         trainer.accelerator.wait_for_everyone()
 
+    if args.validation_only:
+        validation_metrics = None
+        if trainer.is_main:
+            validation_metrics = trainer.evaluate_fixed_validation_score(
+                trainer.unwrapped_soundstream
+            )
+            validation_report_file = (
+                args.validation_report_file
+                or (results_dir / "fixed_validation_report.tsv")
+            ).expanduser().resolve()
+            validation_report_file.parent.mkdir(parents=True, exist_ok=True)
+            with validation_report_file.open("w", encoding="utf-8") as report:
+                report.write("metric\tvalue\n")
+                for metric, value in sorted(validation_metrics.items()):
+                    report.write(f"{metric}\t{value}\n")
+            print(
+                "Fixed validation report: "
+                f"score={validation_metrics['score']:.6f}, "
+                f"aligned_si_sdr={validation_metrics['aligned_si_sdr']:.6f}, "
+                f"aligned_corr={validation_metrics['aligned_correlation']:.6f}, "
+                f"voiced_hf_ratio_db={validation_metrics['voiced_hf_energy_ratio_db']:+.6f}, "
+                f"quiet_hf_excess_db={validation_metrics['quiet_hf_excess_db']:+.6f}, "
+                f"ac_320_isolated={validation_metrics['ac_320_isolated']:+.6f}, "
+                f"click_score={validation_metrics['click_score']:.6f}, "
+                f"q00_ok={int(validation_metrics['q00_validation_eligible'] >= 0.5)}, "
+                f"q01_ok={int(validation_metrics['q01_validation_eligible'] >= 0.5)}, "
+                f"rvq_ok={int(validation_metrics['rvq_validation_eligible'] >= 0.5)}"
+            )
+            print(f"Fixed validation report saved to: {validation_report_file}")
+        trainer.accelerator.wait_for_everyone()
+        return
+
     if not args.test_only:
         trainer.train()
         trainer.accelerator.wait_for_everyone()
@@ -2655,29 +2856,49 @@ def main() -> None:
         print(f"Parameters saved to: {final_checkpoint}")
 
     trainer.accelerator.wait_for_everyone()
+    best_full_gan_balanced = results_dir / "best_full_gan_balanced.pt"
     best_gan_balanced = results_dir / "best_gan_balanced.pt"
     best_balanced = results_dir / "best_balanced.pt"
     best_by_aligned_si_sdr = results_dir / "best_by_aligned_si_sdr.pt"
     best_selected = results_dir / "best_selected.pt"
+    best_raw_clarity = results_dir / "best_raw_online_by_clarity.pt"
+    best_raw_online = results_dir / "best_raw_online_by_aligned_si_sdr.pt"
     best_checkpoint = (
         args.test_checkpoint
         if args.test_only
         else (
-            best_gan_balanced
-            if args.stage == "gan_pretrain" and best_gan_balanced.exists()
+            best_full_gan_balanced
+            if args.stage == "gan_pretrain" and best_full_gan_balanced.exists()
             else (
-                best_balanced
-                if best_balanced.exists()
+                best_gan_balanced
+                if args.stage == "gan_pretrain" and best_gan_balanced.exists()
                 else (
-                    best_by_aligned_si_sdr
-                    if best_by_aligned_si_sdr.exists()
-                    else best_selected
+                    best_balanced
+                    if best_balanced.exists()
+                    else (
+                        best_by_aligned_si_sdr
+                        if best_by_aligned_si_sdr.exists()
+                        else (
+                            best_selected
+                            if best_selected.exists()
+                            else (
+                                best_raw_clarity
+                                if best_raw_clarity.exists()
+                                else best_raw_online
+                            )
+                        )
+                    )
                 )
             )
         )
     )
 
     if best_checkpoint.exists() and trainer.test_files:
+        if is_main and best_checkpoint in (best_raw_clarity, best_raw_online):
+            print(
+                "WARNING: no clean-gated best checkpoint exists; final test is "
+                f"using {best_checkpoint.name} for diagnostics only."
+            )
         print(f"Final test checkpoint: {best_checkpoint}")
         selected_test_files = list(trainer.test_files)
         if args.test_eval_batches is not None:

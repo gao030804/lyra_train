@@ -28,7 +28,12 @@
 !infer_soundstream.py
 !install_fairseq.cmd
 !run_stages_0_to_4.sh
+!run_stage1_stage15_stage2.sh
 !soundstream_training_network_summary.md
+
+!tools/
+!tools/checkpoint_decoder_config.py
+!tools/select_stage1_checkpoint.py
 
 # ============================================================
 # Keep source code directories

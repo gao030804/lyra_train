@@ -340,6 +340,7 @@ class SoundStreamTrainer(nn.Module):
         clean_gate_max_recon_peak: float = 1.2,
         clean_gate_max_recon_clip_fraction: float = 1e-3,
         clean_gate_max_click_score: float = 6.,
+        clean_gate_max_click_excess: float | None = 0.5,
         clean_gate_max_jump_ratio: float = 2.,
         clean_gate_max_p999_jump_ratio: float = 1.75,
         clean_gate_min_voiced_hf_ratio_db: float | None = None,
@@ -348,6 +349,8 @@ class SoundStreamTrainer(nn.Module):
         quality_retention_max_aligned_si_sdr_drop: float = 0.30,
         quality_retention_max_aligned_corr_drop: float = 0.02,
         quality_retention_max_quiet_hf_excess_db_rise: float = 0.50,
+        quality_retention_max_voiced_hf_ratio_db_drop: float = 0.30,
+        quality_retention_max_voiced_hf_ratio_db_rise: float = 0.75,
         quality_retention_max_click_score_rise: float = 0.30,
         quality_retention_max_ac320_isolated_rise: float = 0.005,
         quality_retention_max_comb_median_excess_db_rise: float = 0.25,
@@ -357,6 +360,7 @@ class SoundStreamTrainer(nn.Module):
         quality_retention_q00_warn_perplexity: float = 70.,
         quality_retention_patience: int = 3,
         quality_retention_rvq_patience: int = 2,
+        stage1_rvq_retention_patience: int = 8,
         early_stopping_patience: int | None = None,
         early_stopping_min_delta: float = 0.,
         early_stopping_min_steps: int = 0,
@@ -510,6 +514,9 @@ class SoundStreamTrainer(nn.Module):
         self.clean_gate_max_recon_peak = clean_gate_max_recon_peak
         self.clean_gate_max_recon_clip_fraction = clean_gate_max_recon_clip_fraction
         self.clean_gate_max_click_score = clean_gate_max_click_score
+        if exists(clean_gate_max_click_excess):
+            assert clean_gate_max_click_excess >= 0.
+        self.clean_gate_max_click_excess = clean_gate_max_click_excess
         self.clean_gate_max_jump_ratio = clean_gate_max_jump_ratio
         self.clean_gate_max_p999_jump_ratio = clean_gate_max_p999_jump_ratio
         if (
@@ -526,6 +533,8 @@ class SoundStreamTrainer(nn.Module):
         assert quality_retention_max_aligned_si_sdr_drop >= 0.
         assert quality_retention_max_aligned_corr_drop >= 0.
         assert quality_retention_max_quiet_hf_excess_db_rise >= 0.
+        assert quality_retention_max_voiced_hf_ratio_db_drop >= 0.
+        assert quality_retention_max_voiced_hf_ratio_db_rise >= 0.
         assert quality_retention_max_click_score_rise >= 0.
         assert quality_retention_max_ac320_isolated_rise >= 0.
         assert quality_retention_max_comb_median_excess_db_rise >= 0.
@@ -535,10 +544,13 @@ class SoundStreamTrainer(nn.Module):
         assert quality_retention_q00_warn_perplexity >= 0.
         assert quality_retention_patience > 0
         assert quality_retention_rvq_patience > 0
+        assert stage1_rvq_retention_patience > 0
         self.quality_retention_gate = quality_retention_gate
         self.quality_retention_max_aligned_si_sdr_drop = quality_retention_max_aligned_si_sdr_drop
         self.quality_retention_max_aligned_corr_drop = quality_retention_max_aligned_corr_drop
         self.quality_retention_max_quiet_hf_excess_db_rise = quality_retention_max_quiet_hf_excess_db_rise
+        self.quality_retention_max_voiced_hf_ratio_db_drop = quality_retention_max_voiced_hf_ratio_db_drop
+        self.quality_retention_max_voiced_hf_ratio_db_rise = quality_retention_max_voiced_hf_ratio_db_rise
         self.quality_retention_max_click_score_rise = quality_retention_max_click_score_rise
         self.quality_retention_max_ac320_isolated_rise = quality_retention_max_ac320_isolated_rise
         self.quality_retention_max_comb_median_excess_db_rise = quality_retention_max_comb_median_excess_db_rise
@@ -551,6 +563,8 @@ class SoundStreamTrainer(nn.Module):
         self.quality_retention_baseline = None
         self.quality_retention_bad_evals = 0
         self.quality_retention_rvq_bad_evals = 0
+        self.stage1_rvq_retention_patience = stage1_rvq_retention_patience
+        self.stage1_rvq_bad_evals = 0
         self.stft_saturation_history = deque(maxlen = 1000)
         self.waveform_grad_clip_histories = {
             float(scale): deque(maxlen = 1000)
@@ -958,9 +972,12 @@ class SoundStreamTrainer(nn.Module):
             float('-inf') if self.early_stopping_mode == 'max' else float('inf')
         )
         self.best_aligned_si_sdr = float('-inf')
+        self.best_raw_online_aligned_si_sdr = float('-inf')
+        self.best_raw_online_clarity_score = float('-inf')
         self.best_frame_leakage_score = float('inf')
         self.best_balanced_score = float('inf')
         self.best_gan_balanced_score = float('inf')
+        self.best_full_gan_balanced_score = float('inf')
         assert not exists(early_stopping_patience) or early_stopping_patience > 0
         assert early_stopping_min_delta >= 0.
         assert early_stopping_min_steps >= 0
@@ -1094,14 +1111,18 @@ class SoundStreamTrainer(nn.Module):
             early_stopping_best_score = self.early_stopping_best_score,
             early_stopping_metric = self.early_stopping_metric,
             best_aligned_si_sdr = self.best_aligned_si_sdr,
+            best_raw_online_aligned_si_sdr = self.best_raw_online_aligned_si_sdr,
+            best_raw_online_clarity_score = self.best_raw_online_clarity_score,
             best_frame_leakage_score = self.best_frame_leakage_score,
             best_balanced_score = self.best_balanced_score,
             best_gan_balanced_score = self.best_gan_balanced_score,
+            best_full_gan_balanced_score = self.best_full_gan_balanced_score,
             early_stopping_bad_evals = self.early_stopping_bad_evals,
             early_stopping_triggered = self.early_stopping_triggered,
             quality_retention_baseline = self.quality_retention_baseline,
             quality_retention_bad_evals = self.quality_retention_bad_evals,
             quality_retention_rvq_bad_evals = self.quality_retention_rvq_bad_evals,
+            stage1_rvq_bad_evals = self.stage1_rvq_bad_evals,
             trainer_step = trainer_step,
             version = __version__
         )
@@ -1204,6 +1225,24 @@ class SoundStreamTrainer(nn.Module):
                     best_aligned_si_sdr
                 )
 
+        best_raw_online_aligned_si_sdr = self.saved_model_only_score(
+            self.results_folder / 'best_raw_online_by_aligned_si_sdr.pt'
+        )
+        if exists(best_raw_online_aligned_si_sdr):
+            self.best_raw_online_aligned_si_sdr = max(
+                self.best_raw_online_aligned_si_sdr,
+                best_raw_online_aligned_si_sdr,
+            )
+
+        best_raw_online_clarity_score = self.saved_model_only_score(
+            self.results_folder / 'best_raw_online_by_clarity.pt'
+        )
+        if exists(best_raw_online_clarity_score):
+            self.best_raw_online_clarity_score = max(
+                self.best_raw_online_clarity_score,
+                best_raw_online_clarity_score,
+            )
+
         best_frame_leakage_score = self.saved_model_only_score(
             self.results_folder / 'best_by_frame_leakage.pt'
         )
@@ -1229,6 +1268,15 @@ class SoundStreamTrainer(nn.Module):
             self.best_gan_balanced_score = min(
                 self.best_gan_balanced_score,
                 best_gan_balanced_score,
+            )
+
+        best_full_gan_balanced_score = self.saved_model_only_score(
+            self.results_folder / 'best_full_gan_balanced.pt'
+        )
+        if exists(best_full_gan_balanced_score):
+            self.best_full_gan_balanced_score = min(
+                self.best_full_gan_balanced_score,
+                best_full_gan_balanced_score,
             )
 
     def codebook_metrics(self, model, indices):
@@ -1624,6 +1672,11 @@ class SoundStreamTrainer(nn.Module):
             recon_max_jump /
             recon_rms.mean().clamp_min(1e-8)
         )
+        target_click_score = (
+            target_max_jump /
+            target_rms.mean().clamp_min(1e-8)
+        )
+        click_excess = click_score - target_click_score
 
         if hasattr(model, 'frame_boundary_loss'):
             boundary_loss = model.frame_boundary_loss(recon)
@@ -1782,7 +1835,9 @@ class SoundStreamTrainer(nn.Module):
             recon_p999_jump = float(recon_p999_jump.detach().cpu()),
             jump_ratio = float(jump_ratio.detach().cpu()),
             p999_jump_ratio = float(p999_jump_ratio.detach().cpu()),
+            target_click_score = float(target_click_score.detach().cpu()),
             click_score = float(click_score.detach().cpu()),
+            click_excess = float(click_excess.detach().cpu()),
             correlation = float(correlation.detach().cpu()),
             si_sdr = float(si_sdr.detach().cpu()),
             aligned_correlation = float(aligned_correlation.detach().cpu()),
@@ -2377,13 +2432,19 @@ class SoundStreamTrainer(nn.Module):
             )
         )
 
+        click_ok = (
+            metrics.get('click_excess', float('inf')) <= self.clean_gate_max_click_excess
+            if exists(self.clean_gate_max_click_excess)
+            else metrics.get('click_score', float('inf')) <= self.effective_clean_gate_max_click_score()
+        )
+
         return (
             metrics.get('aligned_si_sdr', float('-inf')) >= self.clean_gate_min_aligned_si_sdr and
             metrics.get('aligned_correlation', float('-inf')) >= self.clean_gate_min_aligned_corr and
             self.clean_gate_min_rms_ratio <= metrics.get('rms_ratio', float('inf')) <= self.clean_gate_max_rms_ratio and
             metrics.get('recon_peak', float('inf')) <= self.clean_gate_max_recon_peak and
             metrics.get('recon_clip_fraction', float('inf')) <= self.clean_gate_max_recon_clip_fraction and
-            metrics.get('click_score', float('inf')) <= self.effective_clean_gate_max_click_score() and
+            click_ok and
             metrics.get('jump_ratio', float('inf')) <= self.clean_gate_max_jump_ratio and
             metrics.get('p999_jump_ratio', float('inf')) <= self.clean_gate_max_p999_jump_ratio and
             voiced_hf_ok
@@ -2411,7 +2472,10 @@ class SoundStreamTrainer(nn.Module):
         if metrics.get('recon_clip_fraction', float('inf')) > self.clean_gate_max_recon_clip_fraction:
             reasons.append('clip')
 
-        if metrics.get('click_score', float('inf')) > self.effective_clean_gate_max_click_score():
+        if exists(self.clean_gate_max_click_excess):
+            if metrics.get('click_excess', float('inf')) > self.clean_gate_max_click_excess:
+                reasons.append('click_excess')
+        elif metrics.get('click_score', float('inf')) > self.effective_clean_gate_max_click_score():
             reasons.append('click')
 
         if metrics.get('jump_ratio', float('inf')) > self.clean_gate_max_jump_ratio:
@@ -2440,6 +2504,7 @@ class SoundStreamTrainer(nn.Module):
             'aligned_si_sdr',
             'aligned_correlation',
             'quiet_hf_excess_db',
+            'voiced_hf_energy_ratio_db',
             'click_score',
             'ac_320_isolated',
             'comb_median_excess_db',
@@ -2454,6 +2519,7 @@ class SoundStreamTrainer(nn.Module):
             'aligned_si_sdr',
             'aligned_correlation',
             'quiet_hf_excess_db',
+            'voiced_hf_energy_ratio_db',
             'click_score',
             'ac_320_isolated',
             'comb_median_excess_db',
@@ -2523,6 +2589,18 @@ class SoundStreamTrainer(nn.Module):
             tolerance
         ):
             reasons.append('quiet_hf')
+        if metrics.get('voiced_hf_energy_ratio_db', float('-inf')) < (
+            baseline['voiced_hf_energy_ratio_db'] -
+            self.quality_retention_max_voiced_hf_ratio_db_drop -
+            tolerance
+        ):
+            reasons.append('voiced_hf_low')
+        if metrics.get('voiced_hf_energy_ratio_db', float('inf')) > (
+            baseline['voiced_hf_energy_ratio_db'] +
+            self.quality_retention_max_voiced_hf_ratio_db_rise +
+            tolerance
+        ):
+            reasons.append('voiced_hf_high')
         if metrics.get('click_score', float('inf')) > (
             baseline.get('click_score', self.clean_gate_max_click_score) +
             self.quality_retention_max_click_score_rise +
@@ -2615,8 +2693,18 @@ class SoundStreamTrainer(nn.Module):
         averaged_metrics['rvq_validation_eligible'] = float(rvq_eligible)
         click_allowed = self.effective_clean_gate_max_click_score()
         averaged_metrics['click_allowed'] = click_allowed
+        averaged_metrics['click_excess_allowed'] = (
+            self.clean_gate_max_click_excess
+            if exists(self.clean_gate_max_click_excess)
+            else float('nan')
+        )
         averaged_metrics['click_fail_margin'] = (
-            averaged_metrics.get('click_score', float('inf')) - click_allowed
+            (
+                averaged_metrics.get('click_excess', float('inf')) -
+                self.clean_gate_max_click_excess
+            )
+            if exists(self.clean_gate_max_click_excess)
+            else averaged_metrics.get('click_score', float('inf')) - click_allowed
         )
         clean_eligible = self.clean_gate_passes(averaged_metrics)
         averaged_metrics['clean_validation_eligible'] = float(clean_eligible)
@@ -2906,9 +2994,21 @@ class SoundStreamTrainer(nn.Module):
             self.discr_optim.load_state_dict(pkg['discr_optim'])
         self.best_valid_score = pkg.get('best_valid_score', float('inf'))
         self.best_aligned_si_sdr = pkg.get('best_aligned_si_sdr', float('-inf'))
+        self.best_raw_online_aligned_si_sdr = pkg.get(
+            'best_raw_online_aligned_si_sdr',
+            float('-inf')
+        )
+        self.best_raw_online_clarity_score = pkg.get(
+            'best_raw_online_clarity_score',
+            float('-inf')
+        )
         self.best_frame_leakage_score = pkg.get('best_frame_leakage_score', float('inf'))
         self.best_balanced_score = pkg.get('best_balanced_score', float('inf'))
         self.best_gan_balanced_score = pkg.get('best_gan_balanced_score', float('inf'))
+        self.best_full_gan_balanced_score = pkg.get(
+            'best_full_gan_balanced_score',
+            float('inf')
+        )
         saved_early_stopping_metric = pkg.get('early_stopping_metric', 'score')
         if saved_early_stopping_metric == self.early_stopping_metric:
             self.early_stopping_best_score = pkg.get(
@@ -2937,6 +3037,7 @@ class SoundStreamTrainer(nn.Module):
         self.quality_retention_baseline = pkg.get('quality_retention_baseline')
         self.quality_retention_bad_evals = pkg.get('quality_retention_bad_evals', 0)
         self.quality_retention_rvq_bad_evals = pkg.get('quality_retention_rvq_bad_evals', 0)
+        self.stage1_rvq_bad_evals = pkg.get('stage1_rvq_bad_evals', 0)
 
         if not discriminator_reinitialized:
             for key, _ in self.multiscale_discriminator_iter():
@@ -4200,7 +4301,69 @@ class SoundStreamTrainer(nn.Module):
                 gan_balanced_selected_model = None
                 gan_balanced_selected_metrics = None
 
+            # Production Stage-2 candidates must have seen the complete GAN
+            # schedule. Keep them separate from the half-ramp diagnostic best.
+            full_gan_balanced_candidates = (
+                balanced_candidates
+                if gan_progress >= 1.
+                else []
+            )
+            if full_gan_balanced_candidates:
+                (
+                    full_gan_balanced_selected_name,
+                    full_gan_balanced_selected_model,
+                    full_gan_balanced_selected_metrics,
+                ) = min(
+                    full_gan_balanced_candidates,
+                    key = lambda candidate: candidate[2]['score'],
+                )
+            else:
+                full_gan_balanced_selected_name = 'none'
+                full_gan_balanced_selected_model = None
+                full_gan_balanced_selected_metrics = None
+
             self.sync_best_scores_from_disk()
+
+            # Keep an online diagnostic best independently of the perceptual
+            # clean gate.  The highband-k5 run reached its true SI-SDR peak
+            # while narrowly failing click/high-band thresholds, so the gated
+            # path never wrote the corresponding weights.  This checkpoint is
+            # deliberately online-only and still requires a healthy q00/RVQ;
+            # it is not a production-quality replacement for the gated best.
+            raw_online_eligible = (
+                self.best_checkpoint_metric == 'recon_pretrain' and
+                steps >= self.best_checkpoint_min_step and
+                isfinite(online_score.get('aligned_si_sdr', float('-inf'))) and
+                online_score.get('q00_validation_eligible', 0.) >= 0.5 and
+                online_score.get('rvq_validation_eligible', 0.) >= 0.5
+            )
+            raw_online_improved = (
+                raw_online_eligible and
+                online_score['aligned_si_sdr'] > self.best_raw_online_aligned_si_sdr
+            )
+            # SI-SDR alone preferred a noticeably dull checkpoint in the
+            # highband-k4 run.  Keep a second diagnostic candidate that trades
+            # only the *missing* 3-7 kHz energy against SI-SDR.  High-frequency
+            # excess is never rewarded, and the existing q00/RVQ requirements
+            # still apply.  This does not alter early stopping or LR plateau.
+            clarity_hf_floor_db = -1.5
+            clarity_hf_ratio_db = online_score.get(
+                'voiced_hf_energy_ratio_db',
+                float('-inf')
+            )
+            clarity_hf_deficit_db = max(
+                clarity_hf_floor_db - clarity_hf_ratio_db,
+                0.
+            )
+            clarity_score = (
+                online_score.get('aligned_si_sdr', float('-inf')) -
+                0.5 * clarity_hf_deficit_db
+            )
+            raw_online_clarity_improved = (
+                raw_online_eligible and
+                isfinite(clarity_score) and
+                clarity_score > self.best_raw_online_clarity_score
+            )
 
             online_clean_fail = (
                 ",".join(self.clean_gate_failure_reasons(online_score)) or
@@ -4234,8 +4397,11 @@ class SoundStreamTrainer(nn.Module):
                 f"ema_peak={ema_score.get('recon_peak', 0.):.3f}, "
                 f"ema_clip={ema_score.get('recon_clip_fraction', 0.) * 100:.3f}%, "
                 f"ema_jump_ratio={ema_score.get('jump_ratio', 0.):.2f}, "
+                f"ema_target_click={ema_score.get('target_click_score', 0.):.4f}, "
                 f"ema_click={ema_score.get('click_score', 0.):.4f}, "
+                f"ema_click_excess={ema_score.get('click_excess', 0.):+.4f}, "
                 f"ema_click_allowed={ema_score.get('click_allowed', self.effective_clean_gate_max_click_score()):.4f}, "
+                f"ema_click_excess_allowed={ema_score.get('click_excess_allowed', float('nan')):.4f}, "
                 f"ema_click_fail_margin={ema_score.get('click_fail_margin', 0.):+.4f}, "
                 f"ema_clean_ok={ema_score.get('clean_validation_eligible', 0.):.0f}, "
                 f"ema_clean_fail={ema_clean_fail}, "
@@ -4275,8 +4441,11 @@ class SoundStreamTrainer(nn.Module):
                 f"online_peak={online_score.get('recon_peak', 0.):.3f}, "
                 f"online_clip={online_score.get('recon_clip_fraction', 0.) * 100:.3f}%, "
                 f"online_jump_ratio={online_score.get('jump_ratio', 0.):.2f}, "
+                f"online_target_click={online_score.get('target_click_score', 0.):.4f}, "
                 f"online_click={online_score.get('click_score', 0.):.4f}, "
+                f"online_click_excess={online_score.get('click_excess', 0.):+.4f}, "
                 f"online_click_allowed={online_score.get('click_allowed', self.effective_clean_gate_max_click_score()):.4f}, "
+                f"online_click_excess_allowed={online_score.get('click_excess_allowed', float('nan')):.4f}, "
                 f"online_click_fail_margin={online_score.get('click_fail_margin', 0.):+.4f}, "
                 f"online_clean_ok={online_score.get('clean_validation_eligible', 0.):.0f}, "
                 f"online_clean_fail={online_clean_fail}, "
@@ -4290,7 +4459,8 @@ class SoundStreamTrainer(nn.Module):
                 f"best_aligned_si_sdr={self.best_aligned_si_sdr:.3f}, "
                 f"si_sdr_selected={si_sdr_selected_name}, "
                 f"gan_balanced_selected={gan_balanced_selected_name}, "
-                f"best_gan_balanced={self.best_gan_balanced_score:.6f}"
+                f"best_gan_balanced={self.best_gan_balanced_score:.6f}, "
+                f"best_full_gan_balanced={self.best_full_gan_balanced_score:.6f}"
             )
             if self.has_quality_retention_baseline:
                 baseline = self.quality_retention_baseline
@@ -4313,6 +4483,36 @@ class SoundStreamTrainer(nn.Module):
                     f"{steps}: codebook ema "
                     f"{self.format_codebook_diagnostics(ema_score)}"
                 )
+
+            if (
+                self.best_checkpoint_metric == 'recon_pretrain' and
+                steps >= self.early_stopping_start_steps
+            ):
+                online_rvq_healthy = (
+                    online_score.get('q00_validation_eligible', 0.) >= 0.5 and
+                    online_score.get('rvq_validation_eligible', 0.) >= 0.5
+                )
+                self.stage1_rvq_bad_evals = (
+                    0 if online_rvq_healthy else self.stage1_rvq_bad_evals + 1
+                )
+                if not online_rvq_healthy:
+                    self.print(
+                        f"{steps}: Stage-1 online RVQ protection "
+                        f"{self.stage1_rvq_bad_evals}/"
+                        f"{self.stage1_rvq_retention_patience} "
+                        "(q00/RVQ validation unhealthy)"
+                    )
+                if (
+                    self.stage1_rvq_bad_evals >=
+                    self.stage1_rvq_retention_patience
+                ):
+                    self.early_stopping_triggered = True
+                    self.save(str(self.results_folder / 'latest.pt'))
+                    self.print(
+                        f"{steps}: Stage-1 RVQ protective hard stop triggered; "
+                        "use the saved gated best or raw-online diagnostic best, "
+                        "not latest.pt, for reconstruction."
+                    )
 
             if self.quality_retention_gate and steps >= self.quality_retention_start_step:
                 passing_candidates = [
@@ -4439,6 +4639,44 @@ class SoundStreamTrainer(nn.Module):
                 exists(gan_balanced_selected_model) and
                 gan_balanced_selected_metrics['score'] < self.best_gan_balanced_score
             )
+            full_gan_balanced_improved = (
+                exists(full_gan_balanced_selected_model) and
+                full_gan_balanced_selected_metrics['score'] < self.best_full_gan_balanced_score
+            )
+
+            if raw_online_improved:
+                self.best_raw_online_aligned_si_sdr = online_score['aligned_si_sdr']
+                self.save_model_only(
+                    self.results_folder / 'best_raw_online_by_aligned_si_sdr.pt',
+                    online_model,
+                    score = self.best_raw_online_aligned_si_sdr,
+                    step = steps,
+                    weight_source = 'online_raw_diagnostic',
+                )
+                self.save(str(self.results_folder / 'latest.pt'))
+                self.print(
+                    f"{steps}: saving best_raw_online_by_aligned_si_sdr.pt "
+                    f"(aligned_si_sdr={self.best_raw_online_aligned_si_sdr:.3f}; "
+                    "clean gate not applied, q00/RVQ healthy)"
+                )
+
+            if raw_online_clarity_improved:
+                self.best_raw_online_clarity_score = clarity_score
+                self.save_model_only(
+                    self.results_folder / 'best_raw_online_by_clarity.pt',
+                    online_model,
+                    score = self.best_raw_online_clarity_score,
+                    step = steps,
+                    weight_source = 'online_raw_clarity_diagnostic',
+                )
+                self.save(str(self.results_folder / 'latest.pt'))
+                self.print(
+                    f"{steps}: saving best_raw_online_by_clarity.pt "
+                    f"(clarity_score={self.best_raw_online_clarity_score:.3f}, "
+                    f"aligned_si_sdr={online_score['aligned_si_sdr']:.3f}, "
+                    f"voiced_hf_ratio_db={clarity_hf_ratio_db:+.2f}; "
+                    "clean gate not applied, q00/RVQ healthy)"
+                )
 
             if balanced_improved:
                 self.best_balanced_score = balanced_selected_metrics['score']
@@ -4469,6 +4707,22 @@ class SoundStreamTrainer(nn.Module):
                     f"{steps}: saving best_gan_balanced.pt "
                     f"({gan_balanced_selected_name}, score="
                     f"{self.best_gan_balanced_score:.6f}, gan_ramp={gan_progress:.3f})"
+                )
+
+            if full_gan_balanced_improved:
+                self.best_full_gan_balanced_score = full_gan_balanced_selected_metrics['score']
+                self.save_model_only(
+                    self.results_folder / 'best_full_gan_balanced.pt',
+                    full_gan_balanced_selected_model,
+                    score = self.best_full_gan_balanced_score,
+                    step = steps,
+                    weight_source = full_gan_balanced_selected_name,
+                )
+                self.save(str(self.results_folder / 'latest.pt'))
+                self.print(
+                    f"{steps}: saving best_full_gan_balanced.pt "
+                    f"({full_gan_balanced_selected_name}, score="
+                    f"{self.best_full_gan_balanced_score:.6f}, gan_ramp={gan_progress:.3f})"
                 )
 
             if frame_leakage_improved:

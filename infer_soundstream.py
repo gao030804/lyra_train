@@ -60,6 +60,7 @@ def latest_checkpoint(*, use_ema: bool) -> Path | None:
         (
             "best_by_aligned_si_sdr.pt",
             "best_selected.pt",
+            "best_raw_online_by_aligned_si_sdr.pt",
             "best_ema.pt",
             "best.pt",
         )
@@ -120,9 +121,19 @@ def parse_args() -> argparse.Namespace:
         choices=("cuda", "cpu"),
     )
     parser.add_argument(
+        "--weights",
+        choices=("auto", "online", "ema"),
+        default="auto",
+        help=(
+            "Checkpoint weight source. 'auto' honors model-only checkpoint "
+            "metadata and otherwise defaults ambiguous periodic checkpoints "
+            "to online weights."
+        ),
+    )
+    parser.add_argument(
         "--no-ema",
         action="store_true",
-        help="Use the online model weights instead of EMA weights.",
+        help="Deprecated alias for --weights online.",
     )
     parser.add_argument(
         "--bitrate",
@@ -339,22 +350,41 @@ def run_block_context_codec(
 def main() -> None:
     args = parse_args()
 
-    use_ema = not args.no_ema
-    checkpoint = args.checkpoint or latest_checkpoint(use_ema=use_ema)
+    if args.no_ema and args.weights != "auto":
+        raise ValueError("Use either --no-ema or --weights, not both.")
+
+    requested_weights = "online" if args.no_ema else args.weights
+    checkpoint = args.checkpoint or latest_checkpoint(
+        use_ema=(requested_weights == "ema")
+    )
     if checkpoint is None:
         raise FileNotFoundError(
             "No checkpoint found. Pass --checkpoint E:\\lyra\\results\\...\\soundstream.<step>.pt"
         )
 
     pkg = load_checkpoint(checkpoint)
+    checkpoint_weight_source = str(pkg.get("weight_source", "")).lower()
+    if requested_weights == "auto":
+        if checkpoint_weight_source.startswith("ema"):
+            requested_weights = "ema"
+        else:
+            requested_weights = "online"
+            if "ema_model" in pkg and not checkpoint_weight_source:
+                print(
+                    "WARNING: checkpoint contains both online and EMA weights; "
+                    "--weights auto selected online. Pass --weights ema to "
+                    "evaluate EMA explicitly."
+                )
+    use_ema = requested_weights == "ema"
     model_only_ema = pkg.get("weight_source") == "ema"
-    if args.no_ema and (
+    if not use_ema and (
         checkpoint.name == "best_ema.pt" or model_only_ema
     ):
         online_checkpoint = checkpoint.with_name("best.pt")
         if not online_checkpoint.exists():
             raise FileNotFoundError(
-                f"--no-ema requires the matching online checkpoint: {online_checkpoint}"
+                "Online weights were requested for an EMA-only checkpoint, but "
+                f"the matching online checkpoint is missing: {online_checkpoint}"
             )
         checkpoint = online_checkpoint
         pkg = load_checkpoint(checkpoint)
@@ -448,6 +478,7 @@ def main() -> None:
     )
     print(f"Checkpoint: {checkpoint}")
     print(f"Weights: {weight_name}")
+    print(f"Requested weight source: {requested_weights}")
     print(
         "Decoder upsample mode: "
         f"{getattr(model, 'decoder_upsample_mode', 'unknown')}"
