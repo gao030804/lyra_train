@@ -68,9 +68,12 @@ STAGE_DEFAULTS = {
         # its validation peak.  Stage 1 therefore selects and exports online
         # weights only; later stages may still opt into EMA independently.
         use_ema=False,
-        click_loss_weight=0., jump_loss_weight=0.,
+        # A very small first-difference term aligns Stage-1 optimization with
+        # the click-excess clean gate without suppressing normal consonant
+        # transients.  Ramp it quickly enough to affect checkpoint selection.
+        click_loss_weight=0.002, jump_loss_weight=0.,
         preemph_loss_weight=0., noise_floor_loss_weight=0.03,
-        transient_loss_warmup_steps=15_000,
+        transient_loss_warmup_steps=5_000,
         spectral_envelope_loss_weight=0.05,
         spectral_envelope_loss_start_steps=5_000,
         spectral_envelope_loss_warmup_steps=10_000,
@@ -127,7 +130,7 @@ STAGE_DEFAULTS = {
         # freshly initialized GAN cannot quickly displace the selected codec.
         lr=5e-7, discr_lr=1e-6, stft_discr_lr=5e-7,
         waveform_discr_lrs=(1e-6, 2e-6, 2e-6),
-        waveform_discr_update_every=(1, 2, 2),
+        waveform_discr_update_every=(2, 2, 2),
         stft_discr_update_every=2,
         ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
@@ -141,7 +144,7 @@ STAGE_DEFAULTS = {
         # Preserve the deterministic clarity learned in Stage 1.  Stage 2 GAN
         # gradients may add natural detail, but must not replace the paired
         # voiced high-band objective entirely.
-        voiced_highband_loss_weight=0.04,
+        voiced_highband_loss_weight=0.06,
         voiced_highband_loss_start_steps=0,
         voiced_highband_loss_warmup_steps=0,
         stft_recon_loss_weight=0.,
@@ -921,10 +924,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage2-generator-freeze-steps",
         type=int,
-        default=0,
+        default=1_000,
         help=(
-            "For gan_pretrain, optionally keep all generator parameters unchanged. "
-            "The default is zero so paired reconstruction continues before GAN starts."
+            "For gan_pretrain, keep all generator parameters unchanged while "
+            "fresh discriminators warm up; defaults to 1000 steps."
         ),
     )
     parser.add_argument(
@@ -1355,7 +1358,7 @@ def main() -> None:
             discr_lr=1e-6,
             stft_discr_lr=5e-7,
             waveform_discr_lrs=(1e-6, 2e-6, 2e-6),
-            waveform_discr_update_every=(1, 2, 2),
+            waveform_discr_update_every=(2, 2, 2),
             stft_discr_update_every=2,
             gan_start=1_000,
             gan_ramp=10_000,
@@ -1363,7 +1366,7 @@ def main() -> None:
             gan_feature_max=5.0,
             noise_floor_loss_weight=0.03,
             spectral_envelope_loss_weight=0.05,
-            voiced_highband_loss_weight=0.04,
+            voiced_highband_loss_weight=0.06,
             frame_phase_loss_weight=0.,
             frame_phase_loss_warmup_steps=0,
             si_sdr_loss_weight=0.07,
@@ -1371,7 +1374,7 @@ def main() -> None:
         # The targeted preset is decoder-only by design.  Ignore an old launch
         # argument that would otherwise unfreeze Encoder/RVQ mid-run.
         args.stage2_unfreeze_encoder_rvq_step = -1
-        args.stage2_generator_freeze_steps = 0
+        args.stage2_generator_freeze_steps = 1_000
         args.stage2_discriminator_start_steps = 0
         args.stage2_max_aligned_si_sdr_drop = min(
             args.stage2_max_aligned_si_sdr_drop,
@@ -1668,22 +1671,29 @@ def main() -> None:
     )
     effective_early_stopping_min_steps = early_stopping_min_steps
     if args.stage == "gan_pretrain":
-        gan_schedule_end = stage_defaults["gan_start"] + stage_defaults["gan_ramp"]
-        if args.stage2_targeted_refine:
-            # A short targeted run is a bounded diagnostic and may
-            # intentionally end before the slow GAN ramp is complete.  Keep
-            # the quality-retention hard stop active, but do not reject the
-            # launch merely because ordinary patience-based early stopping
-            # would only become eligible after the diagnostic has ended.
-            gan_schedule_end = min(gan_schedule_end, num_train_steps)
+        # A bounded Stage-2 diagnostic may intentionally finish before the
+        # complete GAN / reconstruction / plateau schedule.  Those schedule
+        # endpoints control when patience-based early stopping becomes
+        # eligible; they must not make an otherwise valid short run illegal.
+        # Capping only the validation floor does not shorten the actual
+        # schedules used by the trainer.
+        gan_schedule_end = min(
+            stage_defaults["gan_start"] + stage_defaults["gan_ramp"],
+            num_train_steps,
+        )
+        plateau_schedule_start = (
+            min(args.stage2_plateau_start_steps, num_train_steps)
+            if args.stage2_plateau_lr and not args.stage2_targeted_refine
+            else 0
+        )
+        recon_transition_end = min(
+            args.stage2_recon_transition_end_steps or 0,
+            num_train_steps,
+        )
         effective_early_stopping_min_steps = max(
             effective_early_stopping_min_steps,
-            (
-                args.stage2_plateau_start_steps
-                if args.stage2_plateau_lr and not args.stage2_targeted_refine
-                else 0
-            ),
-            args.stage2_recon_transition_end_steps or 0,
+            plateau_schedule_start,
+            recon_transition_end,
             gan_schedule_end,
         )
     if early_stopping_min_steps < 0:
@@ -2592,10 +2602,9 @@ def main() -> None:
             )
             predecessor_candidates = (
                 (
-                    "best_raw_online_by_clarity.pt",
-                    "best_by_aligned_si_sdr.pt",
+                    "best_by_clarity.pt",
                     "best_selected.pt",
-                    "best_raw_online_by_aligned_si_sdr.pt",
+                    "best_by_aligned_si_sdr.pt",
                 )
                 if predecessor_stage in ("recon_pretrain", "spectral_refine")
                 else (
@@ -2753,28 +2762,14 @@ def main() -> None:
                 f"comb_median_excess_db={baseline_metrics['comb_median_excess_db']:.3f}"
             )
             if checkpoint is None:
-                baseline_candidates = (
-                    (
-                        results_dir / "baseline_init.pt",
-                        baseline_metrics["score"],
-                    ),
-                    (
-                        results_dir / "best_selected.pt",
-                        baseline_metrics["score"],
-                    ),
-                    (
-                        results_dir / "best_by_aligned_si_sdr.pt",
-                        baseline_metrics["aligned_si_sdr"],
-                    ),
-                    (
-                        results_dir / "best_by_frame_leakage.pt",
-                        baseline_metrics["ac_320_isolated"],
-                    ),
-                    (
-                        results_dir / "best_balanced.pt",
-                        baseline_metrics["score"],
-                    ),
-                )
+                # Keep the initialization checkpoint semantically separate
+                # from every trained Stage-2 best. The numerical trackers are
+                # seeded above, so a fine-tuned checkpoint still has to beat
+                # the baseline before it can acquire a best_* filename.
+                baseline_candidates = ((
+                    results_dir / "baseline_init.pt",
+                    baseline_metrics["score"],
+                ),)
                 for baseline_path, baseline_score in baseline_candidates:
                     if baseline_path.exists():
                         print(
@@ -2790,9 +2785,9 @@ def main() -> None:
                         weight_source="initialization",
                     )
                 print(
-                    "Saved Stage-2 initialization candidate as baseline_init.pt "
-                    "and seeded reconstruction, SI-SDR, frame-leakage, and "
-                    "balanced checkpoint comparisons from its metrics."
+                    "Saved Stage-2 initialization as baseline_init.pt only; "
+                    "seeded best-score comparisons without claiming a trained "
+                    "Stage-2 best checkpoint."
                 )
         trainer.accelerator.wait_for_everyone()
 
@@ -2861,39 +2856,57 @@ def main() -> None:
     best_balanced = results_dir / "best_balanced.pt"
     best_by_aligned_si_sdr = results_dir / "best_by_aligned_si_sdr.pt"
     best_selected = results_dir / "best_selected.pt"
+    best_by_clarity = results_dir / "best_by_clarity.pt"
     best_raw_clarity = results_dir / "best_raw_online_by_clarity.pt"
     best_raw_online = results_dir / "best_raw_online_by_aligned_si_sdr.pt"
-    best_checkpoint = (
-        args.test_checkpoint
-        if args.test_only
-        else (
-            best_full_gan_balanced
-            if args.stage == "gan_pretrain" and best_full_gan_balanced.exists()
-            else (
-                best_gan_balanced
-                if args.stage == "gan_pretrain" and best_gan_balanced.exists()
-                else (
-                    best_balanced
-                    if best_balanced.exists()
-                    else (
-                        best_by_aligned_si_sdr
-                        if best_by_aligned_si_sdr.exists()
-                        else (
-                            best_selected
-                            if best_selected.exists()
-                            else (
-                                best_raw_clarity
-                                if best_raw_clarity.exists()
-                                else best_raw_online
-                            )
-                        )
-                    )
-                )
+    if args.test_only:
+        best_checkpoint = args.test_checkpoint
+    elif args.stage == "gan_pretrain":
+        best_checkpoint = next((
+            checkpoint for checkpoint in (
+                best_full_gan_balanced,
+                best_gan_balanced,
             )
-        )
-    )
+            if checkpoint.exists()
+        ), None)
+    elif args.stage == "recon_pretrain":
+        # Production handoff and final testing prefer the clean-gated clarity
+        # candidate. Raw checkpoints remain last-resort diagnostics only.
+        best_checkpoint = next((
+            checkpoint for checkpoint in (
+                best_by_clarity,
+                best_selected,
+                best_by_aligned_si_sdr,
+                best_raw_clarity,
+                best_raw_online,
+            )
+            if checkpoint.exists()
+        ), best_raw_online)
+    else:
+        best_checkpoint = next((
+            checkpoint for checkpoint in (
+                best_balanced,
+                best_by_aligned_si_sdr,
+                best_selected,
+                best_raw_clarity,
+                best_raw_online,
+            )
+            if checkpoint.exists()
+        ), best_raw_online)
 
-    if best_checkpoint.exists() and trainer.test_files:
+    if (
+        is_main and
+        not args.test_only and
+        args.stage == "gan_pretrain" and
+        best_checkpoint is None
+    ):
+        print(
+            "Final held-out test skipped: no eligible trained Stage-2 GAN "
+            "checkpoint was produced. baseline_init.pt remains an initialization "
+            "reference, not a Stage-2 result."
+        )
+
+    if best_checkpoint is not None and best_checkpoint.exists() and trainer.test_files:
         if is_main and best_checkpoint in (best_raw_clarity, best_raw_online):
             print(
                 "WARNING: no clean-gated best checkpoint exists; final test is "

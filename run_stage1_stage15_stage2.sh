@@ -104,17 +104,17 @@ pick_validation_best() {
   local checkpoint
 
   for checkpoint in \
-    best_raw_online_by_clarity.pt \
-    best_by_aligned_si_sdr.pt \
+    best_by_clarity.pt \
     best_selected.pt \
-    best_raw_online_by_aligned_si_sdr.pt; do
+    best_by_aligned_si_sdr.pt; do
     if [ -f "$results_dir/$checkpoint" ]; then
       printf '%s\n' "$results_dir/$checkpoint"
       return 0
     fi
   done
 
-  echo "ERROR: $stage_label finished without a validation-selected checkpoint in $results_dir" >&2
+  echo "ERROR: $stage_label finished without a clean-gated validation checkpoint in $results_dir" >&2
+  echo "Raw diagnostic checkpoints are intentionally not eligible for Stage 2 initialization." >&2
   return 1
 }
 
@@ -239,12 +239,12 @@ run_and_log "$STAGE1_LOG" "$RESUME_STAGE1" run_stage "Stage 1: recon_pretrain" 2
   --plateau-cooldown 2 \
   --plateau-min-lr 1e-5 \
   --plateau-unclean-grace-checks 8 \
-  --click-loss-weight 0 \
+  --click-loss-weight 0.002 \
   --jump-loss-weight 0 \
   --preemph-loss-weight 0 \
   --noise-floor-loss-weight 0.03 \
-  --transient-loss-warmup-steps 15000 \
-  --test-eval-batches 0 \
+  --transient-loss-warmup-steps 5000 \
+  --test-eval-batches 100 \
   "$STAGE1_RESUME_FLAG"
 
 STAGE1_CKPT="$(pick_validation_best "$STAGE1_DIR" "Stage 1")"
@@ -300,6 +300,14 @@ STAGE2_PREFLIGHT_REPORT="$STAGE1_DIR/stage2_init_preflight_validation.tsv"
 echo "===== Stage 2 initialization preflight ====="
 evaluate_stage1_checkpoint "$STAGE1_CKPT" "$STAGE2_PREFLIGHT_REPORT"
 "$PYTHON_BIN" tools/validate_stage2_init.py "$STAGE2_PREFLIGHT_REPORT" \
+  --min-aligned-si-sdr 0 \
+  --min-aligned-correlation 0.65 \
+  --max-click-excess 0.5 \
+  --min-voiced-hf-ratio-db -1.5 \
+  --max-voiced-hf-ratio-db 1.0 \
+  --max-quiet-hf-excess-db 1.0 \
+  --max-ac320-isolated 0.10 \
+  --max-comb-median-excess-db 8.0 \
   --min-q00-active-ratio 0.70 \
   --min-q00-perplexity 50 \
   --max-recon-clip-fraction 0.001
@@ -338,7 +346,7 @@ run_stage "Stage 2: gan_pretrain" 29503 \
   --si-sdr-loss-start-steps 0 \
   --si-sdr-loss-warmup-steps 0 \
   --spectral-envelope-loss-weight 0.05 \
-  --voiced-highband-loss-weight 0.04 \
+  --voiced-highband-loss-weight 0.06 \
   --voiced-highband-loss-start-steps 0 \
   --voiced-highband-loss-warmup-steps 0 \
   --noise-floor-loss-weight 0.03 \
@@ -356,15 +364,15 @@ run_stage "Stage 2: gan_pretrain" 29503 \
   --stage2-plateau-stft-discr-min-lr 1e-7 \
   --waveform-discr-lrs 1e-6 2e-6 2e-6 \
   --stft-discr-lr 5e-7 \
-  --waveform-discr-update-every 1 2 2 \
+  --waveform-discr-update-every 2 2 2 \
   --stft-discr-update-every 2 \
   --gan-grad-diagnostics-every 500 \
   --discr-max-grad-norm 1.0 \
-  --stage2-generator-freeze-steps 0 \
+  --stage2-generator-freeze-steps 1000 \
   --stage2-discriminator-start-steps 0 \
   --stage2-unfreeze-encoder-rvq-step -1 \
-  --stage2-generator-hold-steps 0 \
-  --stage2-generator-hold-lr 5e-6 \
+  --stage2-generator-hold-steps 2000 \
+  --stage2-generator-hold-lr 2.5e-7 \
   --stage2-discriminator-hold-steps 0 \
   --stage2-discriminator-hold-lr 5e-6 \
   --stage2-quality-gate-start-steps 25000 \
@@ -380,7 +388,7 @@ run_stage "Stage 2: gan_pretrain" 29503 \
   --stft-r1-gamma 5e-3 \
   --waveform-r1-every 0 \
   --waveform-r1-gamma 0 \
-  --test-eval-batches 0 \
+  --test-eval-batches 100 \
   --no-resume \
   > "$STAGE2_LOG" 2>&1
 

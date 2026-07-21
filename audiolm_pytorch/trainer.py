@@ -974,6 +974,7 @@ class SoundStreamTrainer(nn.Module):
         self.best_aligned_si_sdr = float('-inf')
         self.best_raw_online_aligned_si_sdr = float('-inf')
         self.best_raw_online_clarity_score = float('-inf')
+        self.best_clean_online_clarity_score = float('-inf')
         self.best_frame_leakage_score = float('inf')
         self.best_balanced_score = float('inf')
         self.best_gan_balanced_score = float('inf')
@@ -986,10 +987,17 @@ class SoundStreamTrainer(nn.Module):
         self.early_stopping_min_steps = early_stopping_min_steps
         stage2_schedule_floor = 0
         if best_checkpoint_metric == 'gan_pretrain':
-            stage2_schedule_floor = max(
-                plateau_lr_start_steps if plateau_lr_enabled else 0,
-                stage2_recon_transition_end_steps or 0,
-                gan_start_step + gan_ramp_steps,
+            # Short diagnostics are allowed to end before the full Stage-2
+            # schedule.  This caps only patience-based early stopping; the
+            # GAN, reconstruction and plateau schedules themselves retain
+            # their configured endpoints.
+            stage2_schedule_floor = min(
+                max(
+                    plateau_lr_start_steps if plateau_lr_enabled else 0,
+                    stage2_recon_transition_end_steps or 0,
+                    gan_start_step + gan_ramp_steps,
+                ),
+                num_train_steps,
             )
         self.early_stopping_start_steps = max(
             early_stopping_min_steps,
@@ -1113,6 +1121,7 @@ class SoundStreamTrainer(nn.Module):
             best_aligned_si_sdr = self.best_aligned_si_sdr,
             best_raw_online_aligned_si_sdr = self.best_raw_online_aligned_si_sdr,
             best_raw_online_clarity_score = self.best_raw_online_clarity_score,
+            best_clean_online_clarity_score = self.best_clean_online_clarity_score,
             best_frame_leakage_score = self.best_frame_leakage_score,
             best_balanced_score = self.best_balanced_score,
             best_gan_balanced_score = self.best_gan_balanced_score,
@@ -1241,6 +1250,15 @@ class SoundStreamTrainer(nn.Module):
             self.best_raw_online_clarity_score = max(
                 self.best_raw_online_clarity_score,
                 best_raw_online_clarity_score,
+            )
+
+        best_clean_online_clarity_score = self.saved_model_only_score(
+            self.results_folder / 'best_by_clarity.pt'
+        )
+        if exists(best_clean_online_clarity_score):
+            self.best_clean_online_clarity_score = max(
+                self.best_clean_online_clarity_score,
+                best_clean_online_clarity_score,
             )
 
         best_frame_leakage_score = self.saved_model_only_score(
@@ -3002,6 +3020,10 @@ class SoundStreamTrainer(nn.Module):
             'best_raw_online_clarity_score',
             float('-inf')
         )
+        self.best_clean_online_clarity_score = pkg.get(
+            'best_clean_online_clarity_score',
+            float('-inf')
+        )
         self.best_frame_leakage_score = pkg.get('best_frame_leakage_score', float('inf'))
         self.best_balanced_score = pkg.get('best_balanced_score', float('inf'))
         self.best_gan_balanced_score = pkg.get('best_gan_balanced_score', float('inf'))
@@ -3612,6 +3634,20 @@ class SoundStreamTrainer(nn.Module):
                 )
                 waveform_grad_norm = float(waveform_grad_norm)
                 waveform_grad_norms.append(waveform_grad_norm)
+                gradient_parameter_count = sum(
+                    parameter.numel()
+                    for parameter in discriminator.parameters()
+                    if parameter.grad is not None
+                )
+                waveform_grad_rms = (
+                    waveform_grad_norm / sqrt(gradient_parameter_count)
+                    if gradient_parameter_count > 0
+                    else 0.
+                )
+                waveform_clip_coefficient = min(
+                    1.,
+                    self.discr_max_grad_norm / max(waveform_grad_norm, 1e-12),
+                )
 
                 scale = float(scale)
                 history = self.waveform_grad_clip_histories.setdefault(
@@ -3623,6 +3659,8 @@ class SoundStreamTrainer(nn.Module):
                 scale_label = f'{scale:g}'
                 accum_log(logs, {
                     f'waveform_d_grad_norm_pre_clip:{scale_label}': waveform_grad_norm,
+                    f'waveform_d_grad_rms_pre_clip:{scale_label}': waveform_grad_rms,
+                    f'waveform_d_clip_coefficient:{scale_label}': waveform_clip_coefficient,
                     f'waveform_d_clip_fraction_1000:{scale_label}': clip_fraction,
                 })
 
@@ -4048,6 +4086,10 @@ class SoundStreamTrainer(nn.Module):
                 log_name = f"waveform_d_grad_norm_scale_{key.split(':', 1)[1]}"
             elif key.startswith('waveform_d_clip_fraction_1000:'):
                 log_name = f"waveform_d_clip_fraction_1000_scale_{key.split(':', 1)[1]}"
+            elif key.startswith('waveform_d_grad_rms_pre_clip:'):
+                log_name = f"waveform_d_grad_rms_scale_{key.split(':', 1)[1]}"
+            elif key.startswith('waveform_d_clip_coefficient:'):
+                log_name = f"waveform_d_clip_coefficient_scale_{key.split(':', 1)[1]}"
             elif key.startswith('waveform_d_fully_saturated_fraction_1000:'):
                 log_name = f"waveform_d_fully_saturated_fraction_1000_scale_{key.split(':', 1)[1]}"
             elif key.startswith('waveform_d_near_saturated_fraction_1000:'):
@@ -4364,6 +4406,13 @@ class SoundStreamTrainer(nn.Module):
                 isfinite(clarity_score) and
                 clarity_score > self.best_raw_online_clarity_score
             )
+            clean_online_clarity_improved = (
+                raw_online_eligible and
+                online_score.get('validation_eligible', 0.) >= 0.5 and
+                not quality_reasons['online'] and
+                isfinite(clarity_score) and
+                clarity_score > self.best_clean_online_clarity_score
+            )
 
             online_clean_fail = (
                 ",".join(self.clean_gate_failure_reasons(online_score)) or
@@ -4549,7 +4598,7 @@ class SoundStreamTrainer(nn.Module):
                         self.print(
                             f"{steps}: Stage-2 quality retention hard stop triggered; "
                             "no fine-tuned candidate preserved the initialized baseline; "
-                            "falling back to the initialized best_balanced checkpoint."
+                            "baseline_init.pt is retained only as the initialization reference."
                         )
             elif self.quality_retention_gate and self.is_main:
                 self.print(
@@ -4676,6 +4725,25 @@ class SoundStreamTrainer(nn.Module):
                     f"aligned_si_sdr={online_score['aligned_si_sdr']:.3f}, "
                     f"voiced_hf_ratio_db={clarity_hf_ratio_db:+.2f}; "
                     "clean gate not applied, q00/RVQ healthy)"
+                )
+
+            if clean_online_clarity_improved:
+                self.best_clean_online_clarity_score = clarity_score
+                self.save_model_only(
+                    self.results_folder / 'best_by_clarity.pt',
+                    online_model,
+                    score = self.best_clean_online_clarity_score,
+                    step = steps,
+                    weight_source = 'online_clean_gated_clarity',
+                )
+                self.save(str(self.results_folder / 'latest.pt'))
+                self.print(
+                    f"{steps}: saving best_by_clarity.pt "
+                    f"(clarity_score={self.best_clean_online_clarity_score:.3f}, "
+                    f"aligned_si_sdr={online_score['aligned_si_sdr']:.3f}, "
+                    f"voiced_hf_ratio_db={clarity_hf_ratio_db:+.2f}, "
+                    f"click_excess={online_score.get('click_excess', float('inf')):+.4f}; "
+                    "clean gate, q00, and RVQ passed)"
                 )
 
             if balanced_improved:
