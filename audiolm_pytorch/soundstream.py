@@ -680,6 +680,8 @@ class SoundStream(Module):
         voiced_highband_loss_weight = 0.,
         voiced_highband_energy_deficit_weight = 0.35,
         voiced_highband_energy_margin_db = 0.10,
+        voiced_hf_retention_loss_weight = 0.,
+        voiced_hf_retention_margin_db = 0.50,
         si_sdr_loss_weight = 0.,
         correlation_loss_weight = 0.,
         energy_loss_weight = 0.1,
@@ -929,11 +931,21 @@ class SoundStream(Module):
             raise ValueError('voiced_highband_energy_deficit_weight must be >= 0')
         if voiced_highband_energy_margin_db < 0:
             raise ValueError('voiced_highband_energy_margin_db must be >= 0')
+        if voiced_hf_retention_loss_weight < 0:
+            raise ValueError('voiced_hf_retention_loss_weight must be >= 0')
+        if voiced_hf_retention_margin_db < 0:
+            raise ValueError('voiced_hf_retention_margin_db must be >= 0')
         self.voiced_highband_energy_deficit_weight = float(
             voiced_highband_energy_deficit_weight
         )
         self.voiced_highband_energy_margin_db = float(
             voiced_highband_energy_margin_db
+        )
+        self.voiced_hf_retention_loss_weight = float(
+            voiced_hf_retention_loss_weight
+        )
+        self.voiced_hf_retention_margin_db = float(
+            voiced_hf_retention_margin_db
         )
         self.register_buffer(
             'spectral_envelope_window',
@@ -1466,7 +1478,7 @@ class SoundStream(Module):
         ):
             return (
                 self.zero, self.zero, self.zero,
-                self.zero, self.zero, self.zero
+                self.zero, self.zero, self.zero, self.zero
             )
 
         frame_rms = F.avg_pool1d(
@@ -1546,6 +1558,15 @@ class SoundStream(Module):
         hf_ratio_db = 10. * torch.log10(
             (recon_hf_power + 1e-10) / (target_hf_power + 1e-10)
         )
+        # Gate-aligned, target-voiced 3-7 kHz retention objective.  It only
+        # penalizes a reconstructed power deficit beyond the allowed margin;
+        # excess high-frequency power receives no reward.  Squaring in dB
+        # gives the gate boundary a smooth zero-gradient side while strongly
+        # discouraging the persistent voiced-HF loss seen in Stage 2.
+        voiced_hf_retention_loss = (
+            F.relu(-hf_ratio_db - self.voiced_hf_retention_margin_db).square() *
+            voiced_weight
+        ).sum() / voiced_count
         voiced_hf_energy_ratio_db = (
             hf_ratio_db.clamp(-40., 40.) * voiced_weight
         ).sum() / voiced_count
@@ -1585,7 +1606,8 @@ class SoundStream(Module):
             voiced_highband_logmag_error,
             voiced_hf_energy_deficit,
             spectral_centroid_delta_hz,
-            spectral_slope_delta
+            spectral_slope_delta,
+            voiced_hf_retention_loss
         )
 
     def transient_noise_losses(self, target, recon):
@@ -2199,11 +2221,16 @@ class SoundStream(Module):
             if self.spectral_envelope_loss_weight > 0
             else self.zero
         )
-        voiced_highband_loss = (
-            self.voiced_highband_metrics(target, recon_x)[0]
-            if self.voiced_highband_loss_weight > 0
-            else self.zero
+        voiced_highband_metrics = (
+            self.voiced_highband_metrics(target, recon_x)
+            if (
+                self.voiced_highband_loss_weight > 0 or
+                self.voiced_hf_retention_loss_weight > 0
+            )
+            else (self.zero,) * 7
         )
+        voiced_highband_loss = voiced_highband_metrics[0]
+        voiced_hf_retention_loss = voiced_highband_metrics[6]
         preemph_loss, noise_floor_loss = self.background_noise_losses(target, recon_x)
         frame_phase_loss = (
             self.frame_phase_residual_loss(target, recon_x)
@@ -2226,6 +2253,7 @@ class SoundStream(Module):
             si_sdr_loss * self.si_sdr_loss_weight +
             spectral_envelope_loss * self.spectral_envelope_loss_weight +
             voiced_highband_loss * self.voiced_highband_loss_weight +
+            voiced_hf_retention_loss * self.voiced_hf_retention_loss_weight +
             correlation_loss * self.correlation_loss_weight +
             click_loss * self.click_loss_weight +
             jump_loss * self.jump_loss_weight +
@@ -2244,6 +2272,7 @@ class SoundStream(Module):
                 stft_recon_loss,
                 spectral_envelope_loss,
                 voiced_highband_loss,
+                voiced_hf_retention_loss,
                 adversarial_loss,
                 feature_loss,
                 all_commitment_loss,
@@ -2657,11 +2686,16 @@ class FrameStreamingSoundStream(SoundStream):
             if self.spectral_envelope_loss_weight > 0
             else self.zero
         )
-        voiced_highband_loss = (
-            self.voiced_highband_metrics(target, recon_x)[0]
-            if self.voiced_highband_loss_weight > 0
-            else self.zero
+        voiced_highband_metrics = (
+            self.voiced_highband_metrics(target, recon_x)
+            if (
+                self.voiced_highband_loss_weight > 0 or
+                self.voiced_hf_retention_loss_weight > 0
+            )
+            else (self.zero,) * 7
         )
+        voiced_highband_loss = voiced_highband_metrics[0]
+        voiced_hf_retention_loss = voiced_highband_metrics[6]
         adversarial_loss, feature_loss = self.generator_perceptual_losses(
             orig_x,
             recon_x
@@ -2676,6 +2710,7 @@ class FrameStreamingSoundStream(SoundStream):
             si_sdr_loss * self.si_sdr_loss_weight +
             spectral_envelope_loss * self.spectral_envelope_loss_weight +
             voiced_highband_loss * self.voiced_highband_loss_weight +
+            voiced_hf_retention_loss * self.voiced_hf_retention_loss_weight +
             correlation_loss * self.correlation_loss_weight +
             click_loss * self.click_loss_weight +
             jump_loss * self.jump_loss_weight +
@@ -2694,6 +2729,7 @@ class FrameStreamingSoundStream(SoundStream):
                 stft_recon_loss,
                 spectral_envelope_loss,
                 voiced_highband_loss,
+                voiced_hf_retention_loss,
                 adversarial_loss,
                 feature_loss,
                 all_commitment_loss,

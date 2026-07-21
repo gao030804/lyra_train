@@ -270,7 +270,9 @@ class SoundStreamTrainer(nn.Module):
         stft_discr_lr: float | None = None,
         waveform_discr_lrs: tuple[float, ...] | None = None,
         waveform_discr_update_every: tuple[int, ...] = (1, 1, 1),
+        waveform_discr_loss_weights: tuple[float, ...] = (1., 1., 1.),
         stft_discr_update_every: int = 1,
+        stft_discr_loss_weight: float = 1.,
         gan_grad_diagnostics_every: int = 0,
         grad_accum_every: int = 4,
         wd: float = 0.,
@@ -350,7 +352,8 @@ class SoundStreamTrainer(nn.Module):
         quality_retention_max_aligned_corr_drop: float = 0.02,
         quality_retention_max_quiet_hf_excess_db_rise: float = 0.50,
         quality_retention_max_voiced_hf_ratio_db_drop: float = 0.30,
-        quality_retention_max_voiced_hf_ratio_db_rise: float = 0.75,
+        quality_retention_max_voiced_hf_ratio_db_rise: float = 1.00,
+        quality_retention_hf_score_weight: float = 3.,
         quality_retention_max_click_score_rise: float = 0.30,
         quality_retention_max_ac320_isolated_rise: float = 0.005,
         quality_retention_max_comb_median_excess_db_rise: float = 0.25,
@@ -544,6 +547,7 @@ class SoundStreamTrainer(nn.Module):
         assert quality_retention_q00_warn_perplexity >= 0.
         assert quality_retention_patience > 0
         assert quality_retention_rvq_patience > 0
+        assert quality_retention_hf_score_weight >= 0.
         assert stage1_rvq_retention_patience > 0
         self.quality_retention_gate = quality_retention_gate
         self.quality_retention_max_aligned_si_sdr_drop = quality_retention_max_aligned_si_sdr_drop
@@ -551,6 +555,7 @@ class SoundStreamTrainer(nn.Module):
         self.quality_retention_max_quiet_hf_excess_db_rise = quality_retention_max_quiet_hf_excess_db_rise
         self.quality_retention_max_voiced_hf_ratio_db_drop = quality_retention_max_voiced_hf_ratio_db_drop
         self.quality_retention_max_voiced_hf_ratio_db_rise = quality_retention_max_voiced_hf_ratio_db_rise
+        self.quality_retention_hf_score_weight = quality_retention_hf_score_weight
         self.quality_retention_max_click_score_rise = quality_retention_max_click_score_rise
         self.quality_retention_max_ac320_isolated_rise = quality_retention_max_ac320_isolated_rise
         self.quality_retention_max_comb_median_excess_db_rise = quality_retention_max_comb_median_excess_db_rise
@@ -663,6 +668,7 @@ class SoundStreamTrainer(nn.Module):
         assert quality_retention_start_step >= 0
         self.quality_retention_start_step = quality_retention_start_step
         self.plateau_lr_unclean_checks = 0
+        self.plateau_lr_reduction_count = 0
         # Build this after the trainer modules are passed through
         # accelerator.prepare().  Otherwise the scheduler can hold a reference
         # to the pre-prepare optimizer while training uses the prepared one.
@@ -681,11 +687,16 @@ class SoundStreamTrainer(nn.Module):
         assert all(one_lr > 0. for one_lr in waveform_discr_lrs)
         assert len(waveform_discr_update_every) == discriminator_count
         assert all(interval > 0 for interval in waveform_discr_update_every)
+        assert len(waveform_discr_loss_weights) == discriminator_count
+        assert all(weight >= 0. for weight in waveform_discr_loss_weights)
         assert stft_discr_update_every > 0
+        assert stft_discr_loss_weight >= 0.
         assert gan_grad_diagnostics_every >= 0
         self.waveform_discr_lrs = tuple(float(one_lr) for one_lr in waveform_discr_lrs)
         self.waveform_discr_update_every = tuple(int(interval) for interval in waveform_discr_update_every)
+        self.waveform_discr_loss_weights = tuple(float(weight) for weight in waveform_discr_loss_weights)
         self.stft_discr_update_every = int(stft_discr_update_every)
+        self.stft_discr_loss_weight = float(stft_discr_loss_weight)
         self.gan_grad_diagnostics_every = int(gan_grad_diagnostics_every)
         discr_warmup_steps = default(discr_warmup_steps, warmup_steps)
 
@@ -1113,6 +1124,7 @@ class SoundStreamTrainer(nn.Module):
             optim = self.optim.state_dict(),
             plateau_scheduler = self.plateau_scheduler.state_dict() if exists(self.plateau_scheduler) else None,
             plateau_lr_unclean_checks = self.plateau_lr_unclean_checks,
+            plateau_lr_reduction_count = self.plateau_lr_reduction_count,
             config = self.unwrapped_soundstream._configs,
             discr_optim = self.discr_optim.state_dict(),
             best_valid_score = self.best_valid_score,
@@ -1723,7 +1735,8 @@ class SoundStreamTrainer(nn.Module):
             voiced_hf_logmag_error,
             voiced_hf_energy_deficit,
             spectral_centroid_delta_hz,
-            spectral_slope_delta
+            spectral_slope_delta,
+            voiced_hf_retention_loss
         ) = model.voiced_highband_metrics(target, recon)
         _, quiet_hf_excess_db = model.quiet_multiband_noise_metrics(
             target,
@@ -1830,6 +1843,7 @@ class SoundStreamTrainer(nn.Module):
             voiced_hf_energy_ratio_db = float(voiced_hf_energy_ratio_db.detach().cpu()),
             voiced_hf_logmag_error = float(voiced_hf_logmag_error.detach().cpu()),
             voiced_hf_energy_deficit = float(voiced_hf_energy_deficit.detach().cpu()),
+            voiced_hf_retention_loss = float(voiced_hf_retention_loss.detach().cpu()),
             spectral_centroid_delta_hz = float(spectral_centroid_delta_hz.detach().cpu()),
             spectral_slope_delta = float(spectral_slope_delta.detach().cpu()),
             quiet_hf_excess_db = float(quiet_hf_excess_db.detach().cpu()),
@@ -2179,6 +2193,43 @@ class SoundStreamTrainer(nn.Module):
         averaged_metrics.update(
             self.codebook_metrics_from_counts(total_code_counts)
         )
+        averaged_metrics['reconstruction_score'] = averaged_metrics['score']
+        hf_score_penalty = 0.
+        hf_low_score_penalty = 0.
+        hf_high_score_penalty = 0.
+        if (
+            self.best_checkpoint_metric == 'gan_pretrain' and
+            self.has_quality_retention_baseline and
+            self.quality_retention_hf_score_weight > 0.
+        ):
+            minimum_retained_ratio = (
+                self.quality_retention_baseline['voiced_hf_energy_ratio_db'] -
+                self.quality_retention_max_voiced_hf_ratio_db_drop
+            )
+            maximum_retained_ratio = (
+                self.quality_retention_baseline['voiced_hf_energy_ratio_db'] +
+                self.quality_retention_max_voiced_hf_ratio_db_rise
+            )
+            current_ratio = averaged_metrics['voiced_hf_energy_ratio_db']
+            hf_shortfall_db = max(
+                0.,
+                minimum_retained_ratio - current_ratio,
+            )
+            hf_excess_db = max(
+                0.,
+                current_ratio - maximum_retained_ratio,
+            )
+            hf_low_score_penalty = (
+                self.quality_retention_hf_score_weight * hf_shortfall_db ** 2
+            )
+            hf_high_score_penalty = (
+                self.quality_retention_hf_score_weight * hf_excess_db ** 2
+            )
+            hf_score_penalty = hf_low_score_penalty + hf_high_score_penalty
+            averaged_metrics['score'] += hf_score_penalty
+        averaged_metrics['voiced_hf_score_penalty'] = hf_score_penalty
+        averaged_metrics['voiced_hf_low_score_penalty'] = hf_low_score_penalty
+        averaged_metrics['voiced_hf_high_score_penalty'] = hf_high_score_penalty
         averaged_metrics['code_counts'] = total_code_counts.detach().cpu()
         averaged_metrics['num_samples'] = total_samples
         return averaged_metrics
@@ -3057,6 +3108,7 @@ class SoundStreamTrainer(nn.Module):
                 f"{self.early_stopping_metric}."
             )
         self.quality_retention_baseline = pkg.get('quality_retention_baseline')
+        self.plateau_lr_reduction_count = pkg.get('plateau_lr_reduction_count', 0)
         self.quality_retention_bad_evals = pkg.get('quality_retention_bad_evals', 0)
         self.quality_retention_rvq_bad_evals = pkg.get('quality_retention_rvq_bad_evals', 0)
         self.stage1_rvq_bad_evals = pkg.get('stage1_rvq_bad_evals', 0)
@@ -3351,11 +3403,12 @@ class SoundStreamTrainer(nn.Module):
         return scale
 
     def cap_generator_lr_for_retention(self, steps):
-        """Cap early Stage-2 generator updates without disturbing warmup/plateau.
+        """Linearly release the early Stage-2 generator learning rate.
 
-        The cap is applied immediately before the optimizer update.  It leaves
-        the standard initial warmup intact when it is already below the cap,
-        and it ends cleanly before GAN/discriminator training begins.
+        The generator is normally frozen through ``generator_freeze_steps``.
+        Once released, this moves from ``generator_hold_lr`` to the configured
+        base LR by ``generator_hold_steps`` instead of introducing an abrupt
+        decoder update at the handoff boundary.
         """
         current_lr = self.optim.optimizer.param_groups[0]['lr']
         if (
@@ -3363,9 +3416,20 @@ class SoundStreamTrainer(nn.Module):
             self.generator_hold_steps > 0 and
             steps < self.generator_hold_steps
         ):
-            applied_lr = min(current_lr, self.generator_hold_lr)
-            for group in self.optim.optimizer.param_groups:
-                group['lr'] = min(group['lr'], self.generator_hold_lr)
+            ramp_start = min(self.generator_freeze_steps, self.generator_hold_steps)
+            ramp_span = max(self.generator_hold_steps - ramp_start, 1)
+            progress = min(max((steps - ramp_start) / ramp_span, 0.), 1.)
+            target_lrs = [
+                self.generator_hold_lr +
+                (base_lr - self.generator_hold_lr) * progress
+                for base_lr in self.generator_hold_base_lrs
+            ]
+            for group, target_lr in zip(
+                self.optim.optimizer.param_groups,
+                target_lrs,
+            ):
+                group['lr'] = target_lr
+            applied_lr = target_lrs[0]
             return applied_lr
 
         if (
@@ -3507,6 +3571,10 @@ class SoundStreamTrainer(nn.Module):
                     'stft_r1_weighted',
                 }
                 optimization_losses = []
+                waveform_loss_weight_by_scale = dict(zip(
+                    map(float, model.discr_multi_scales),
+                    self.waveform_discr_loss_weights,
+                ))
                 for name, discr_loss in discr_losses:
                     if not torch.isfinite(discr_loss).all():
                         raise RuntimeError(
@@ -3528,7 +3596,13 @@ class SoundStreamTrainer(nn.Module):
                         )
                     )
                     if name not in diagnostic_names and is_active_optimization_loss:
-                        optimization_losses.append(discr_loss)
+                        branch_weight = (
+                            self.stft_discr_loss_weight
+                            if name == 'stft_total'
+                            else waveform_loss_weight_by_scale[waveform_scale]
+                        )
+                        if branch_weight > 0.:
+                            optimization_losses.append(discr_loss * branch_weight)
                     accum_log(
                         logs,
                         {name: discr_loss.item() / self.grad_accum_every}
@@ -3537,12 +3611,17 @@ class SoundStreamTrainer(nn.Module):
                     raise RuntimeError('no active discriminator optimization losses were returned')
 
                 # The STFT branch already packages hinge + R1 as stft_total.
-                # Backpropagate the complete D objective once; never backward
-                # the R1 diagnostic as a second graph branch.
-                # The branches have disjoint optimizers. Summing preserves the
-                # gradient of each active branch regardless of how many other
-                # discriminators happen to update on this global step.
-                total_discriminator_loss = torch.stack(optimization_losses).sum()
+                # Use a normalized weighted mean so the effective D objective
+                # does not jump when a different subset of discriminator
+                # branches is active on this global step.
+                configured_discriminator_weight = (
+                    sum(self.waveform_discr_loss_weights) +
+                    self.stft_discr_loss_weight
+                )
+                total_discriminator_loss = (
+                    torch.stack(optimization_losses).sum() /
+                    max(configured_discriminator_weight, 1e-8)
+                )
                 self.accelerator.backward(
                     total_discriminator_loss / self.grad_accum_every
                 )
@@ -3843,6 +3922,7 @@ class SoundStreamTrainer(nn.Module):
                     stft_recon_loss,
                     spectral_envelope_loss,
                     voiced_highband_loss,
+                    voiced_hf_retention_loss,
                     adversarial_loss,
                     feature_loss,
                     all_commitment_loss,
@@ -3920,6 +4000,7 @@ class SoundStreamTrainer(nn.Module):
                 stft_recon_loss = stft_recon_loss.item() / self.grad_accum_every,
                 spectral_envelope_loss = spectral_envelope_loss.item() / self.grad_accum_every,
                 voiced_highband_loss = voiced_highband_loss.item() / self.grad_accum_every,
+                voiced_hf_retention_loss = voiced_hf_retention_loss.item() / self.grad_accum_every,
                 adversarial_loss = adversarial_loss.item() / self.grad_accum_every,
                 feature_loss = feature_loss.item() / self.grad_accum_every,
                 weighted_adversarial_loss = weighted_adversarial_loss.item() / self.grad_accum_every,
@@ -3988,6 +4069,8 @@ class SoundStreamTrainer(nn.Module):
             f"(w={model.spectral_envelope_loss_weight:.4g},ramp={spectral_envelope_loss_progress:.4f}) | "
             f"voiced_highband={logs['voiced_highband_loss']:.6f}"
             f"(w={model.voiced_highband_loss_weight:.4g},ramp={voiced_highband_loss_progress:.4f}) | "
+            f"hf_retain={logs['voiced_hf_retention_loss']:.6f}"
+            f"(w={getattr(model, 'voiced_hf_retention_loss_weight', 0.):.4g}) | "
             f"corr_loss={logs['correlation_loss']:.6f}"
             f"(w={model.correlation_loss_weight:.4g}) | "
             f"si_sdr_loss={logs['si_sdr_loss']:.6f}"
@@ -4463,6 +4546,10 @@ class SoundStreamTrainer(nn.Module):
             )
             self.print(
                 f"{steps}: validation score online={online_score['score']:.6f}, "
+                f"online_recon_score={online_score.get('reconstruction_score', online_score['score']):.6f}, "
+                f"online_hf_score_penalty={online_score.get('voiced_hf_score_penalty', 0.):.6f}, "
+                f"online_hf_low_penalty={online_score.get('voiced_hf_low_score_penalty', 0.):.6f}, "
+                f"online_hf_high_penalty={online_score.get('voiced_hf_high_score_penalty', 0.):.6f}, "
                 f"{ema_summary}, best={self.best_valid_score:.6f}, "
                 f"selected={selected_name} | "
                 f"online_rms={online_score['rms_ratio']:.3f}, "
@@ -4589,9 +4676,21 @@ class SoundStreamTrainer(nn.Module):
                         f"{self.quality_retention_rvq_bad_evals}/"
                         f"{self.quality_retention_rvq_patience})"
                     )
+                    quality_patience_exhausted = (
+                        self.quality_retention_bad_evals >=
+                        self.quality_retention_patience
+                    )
+                    rvq_patience_exhausted = (
+                        self.quality_retention_rvq_bad_evals >=
+                        self.quality_retention_rvq_patience
+                    )
+                    quality_hard_stop_ready = (
+                        not self.plateau_lr_enabled or
+                        self.plateau_lr_reduction_count > 0
+                    )
                     if (
-                        self.quality_retention_bad_evals >= self.quality_retention_patience or
-                        self.quality_retention_rvq_bad_evals >= self.quality_retention_rvq_patience
+                        rvq_patience_exhausted or
+                        (quality_patience_exhausted and quality_hard_stop_ready)
                     ):
                         self.early_stopping_triggered = True
                         self.save(str(self.results_folder / 'latest.pt'))
@@ -4599,6 +4698,11 @@ class SoundStreamTrainer(nn.Module):
                             f"{steps}: Stage-2 quality retention hard stop triggered; "
                             "no fine-tuned candidate preserved the initialized baseline; "
                             "baseline_init.pt is retained only as the initialization reference."
+                        )
+                    elif quality_patience_exhausted:
+                        self.print(
+                            f"{steps}: Stage-2 quality hard stop deferred until "
+                            "ReduceLROnPlateau has reduced the generator LR at least once."
                         )
             elif self.quality_retention_gate and self.is_main:
                 self.print(
@@ -4923,6 +5027,7 @@ class SoundStreamTrainer(nn.Module):
                 )
                 discr_lr_changes = []
                 if lr_changed and old_lrs[0] > 0.:
+                    self.plateau_lr_reduction_count += 1
                     discr_lr_changes = self.scale_discriminator_lrs_from_plateau(
                         new_lrs[0] / old_lrs[0]
                     )

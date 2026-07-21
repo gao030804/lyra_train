@@ -123,15 +123,17 @@ STAGE_DEFAULTS = {
         gan_adversarial_max=0., gan_feature_max=0.,
     ),
     "gan_pretrain": dict(
-        steps=200_000, batch_size=4, segment_seconds=4.,
-        save_every=5_000, eval_every=500, min_steps=90_000, patience=30,
+        steps=50_000, batch_size=4, segment_seconds=4.,
+        save_every=5_000, eval_every=500, min_steps=20_000, patience=12,
         early_stopping_min_delta=0.003,
         # Keep Stage-2 decoder updates smaller than discriminator updates so a
         # freshly initialized GAN cannot quickly displace the selected codec.
-        lr=5e-7, discr_lr=1e-6, stft_discr_lr=5e-7,
-        waveform_discr_lrs=(1e-6, 2e-6, 2e-6),
-        waveform_discr_update_every=(2, 2, 2),
-        stft_discr_update_every=2,
+        lr=5e-7, discr_lr=5e-7, stft_discr_lr=2.5e-7,
+        waveform_discr_lrs=(5e-7, 5e-7, 2.5e-7),
+        waveform_discr_update_every=(2, 4, 4),
+        waveform_discr_loss_weights=(1.0, 0.25, 0.25),
+        stft_discr_update_every=4,
+        stft_discr_loss_weight=0.5,
         ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
         use_ema=False,
@@ -144,7 +146,8 @@ STAGE_DEFAULTS = {
         # Preserve the deterministic clarity learned in Stage 1.  Stage 2 GAN
         # gradients may add natural detail, but must not replace the paired
         # voiced high-band objective entirely.
-        voiced_highband_loss_weight=0.06,
+        voiced_highband_loss_weight=0.07,
+        voiced_hf_retention_loss_weight=0.02,
         voiced_highband_loss_start_steps=0,
         voiced_highband_loss_warmup_steps=0,
         stft_recon_loss_weight=0.,
@@ -159,7 +162,7 @@ STAGE_DEFAULTS = {
         # Warm up fresh discriminators against a frozen Stage-1 generator for
         # 1k steps. Then introduce GAN gradients slowly over 20k steps.
         gan_start=1_000, gan_ramp=20_000,
-        gan_adversarial_max=2e-4, gan_feature_max=2.5,
+        gan_adversarial_max=2e-4, gan_feature_max=1.25,
     ),
     "stream_finetune": dict(
         steps=20_000, batch_size=4, segment_seconds=2.,
@@ -417,7 +420,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--voiced-highband-energy-deficit-weight",
         type=float,
-        default=0.35,
+        default=0.40,
         help=(
             "Internal one-sided high-band energy-deficit weight. This "
             "penalizes missing voiced high-band energy without rewarding "
@@ -432,6 +435,22 @@ def parse_args() -> argparse.Namespace:
             "Allowed voiced high-band energy deficit before the one-sided "
             "penalty activates."
         ),
+    )
+    parser.add_argument(
+        "--voiced-hf-retention-loss-weight",
+        type=float,
+        default=None,
+        help=(
+            "One-sided target-voiced 3-7 kHz power-retention loss weight. "
+            "This is aligned with the Stage-2 voiced-HF quality gate and does "
+            "not reward excess high-frequency power."
+        ),
+    )
+    parser.add_argument(
+        "--voiced-hf-retention-margin-db",
+        type=float,
+        default=0.50,
+        help="Allowed target-voiced 3-7 kHz power deficit before retention loss.",
     )
 
     parser.add_argument(
@@ -516,7 +535,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage2-plateau-start-steps",
         type=int,
-        default=60_000,
+        default=10_000,
         help="Do not allow Stage-2 plateau LR reductions before this completed step.",
     )
     parser.add_argument(
@@ -528,7 +547,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage2-plateau-patience",
         type=int,
-        default=16,
+        default=8,
         help="Stage-2 quality-retained validation checks without a reconstruction-score improvement before reducing LR.",
     )
     parser.add_argument(
@@ -730,7 +749,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage2-quality-retention-patience",
         type=int,
-        default=12,
+        default=8,
         help="Consecutive validation regressions before the Stage-2 quality hard stop.",
     )
     parser.add_argument(
@@ -751,10 +770,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage2-max-voiced-hf-ratio-db-rise",
         type=float,
-        default=0.75,
+        default=1.00,
         help=(
             "Maximum Stage-2 voiced 3-7 kHz energy-ratio rise from the "
             "initialization baseline in dB."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-voiced-hf-score-weight",
+        type=float,
+        default=3.,
+        help=(
+            "Squared two-sided voiced-HF gate-deviation penalty added to the Stage-2 "
+            "validation score used for checkpoint ranking and plateau LR."
         ),
     )
     parser.add_argument(
@@ -831,10 +859,27 @@ def parse_args() -> argparse.Namespace:
         help="Update intervals for waveform D scales 1.0, 0.5, 0.25.",
     )
     parser.add_argument(
+        "--waveform-discr-loss-weights",
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=("SCALE1", "SCALE05", "SCALE025"),
+        help=(
+            "Normalized waveform-discriminator branch weights. Defaults to "
+            "the stage configuration."
+        ),
+    )
+    parser.add_argument(
         "--stft-discr-update-every",
         type=int,
         default=None,
         help="Update the STFT discriminator once per this many generator steps.",
+    )
+    parser.add_argument(
+        "--stft-discr-loss-weight",
+        type=float,
+        default=None,
+        help="STFT discriminator branch weight in the normalized D objective.",
     )
     parser.add_argument(
         "--gan-grad-diagnostics-every",
@@ -915,7 +960,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage2-generator-hold-steps",
         type=int,
-        default=0,
+        default=5_000,
         help=(
             "For gan_pretrain, keep the generator at a conservative LR during "
             "the initial GAN ramp so the Stage-1 reconstruction baseline is retained."
@@ -957,8 +1002,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage2-generator-hold-lr",
         type=float,
-        default=5e-6,
-        help="Generator LR during the initial Stage-2 GAN ramp.",
+        default=1e-7,
+        help="Generator LR at release, linearly ramped to the base LR by hold-steps.",
     )
     parser.add_argument(
         "--stage2-discriminator-hold-steps",
@@ -1005,7 +1050,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage2-quality-gate-start-steps",
         type=int,
-        default=25_000,
+        default=20_000,
         help=(
             "Record Stage-2 quality retention from initialization, but defer "
             "quality hard-stop accumulation until this step."
@@ -1255,6 +1300,8 @@ def build_model(
     voiced_highband_loss_weight: float,
     voiced_highband_energy_deficit_weight: float,
     voiced_highband_energy_margin_db: float,
+    voiced_hf_retention_loss_weight: float,
+    voiced_hf_retention_margin_db: float,
     click_loss_weight: float,
     jump_loss_weight: float,
     preemph_loss_weight: float,
@@ -1300,6 +1347,8 @@ def build_model(
         voiced_highband_loss_weight=voiced_highband_loss_weight,
         voiced_highband_energy_deficit_weight=voiced_highband_energy_deficit_weight,
         voiced_highband_energy_margin_db=voiced_highband_energy_margin_db,
+        voiced_hf_retention_loss_weight=voiced_hf_retention_loss_weight,
+        voiced_hf_retention_margin_db=voiced_hf_retention_margin_db,
         si_sdr_loss_weight=si_sdr_loss_weight,
         correlation_loss_weight=correlation_loss_weight,
         energy_loss_weight=0.1,
@@ -1356,17 +1405,20 @@ def main() -> None:
             early_stopping_min_delta=0.003,
             lr=2e-7,
             discr_lr=1e-6,
-            stft_discr_lr=5e-7,
-            waveform_discr_lrs=(1e-6, 2e-6, 2e-6),
-            waveform_discr_update_every=(2, 2, 2),
-            stft_discr_update_every=2,
+            stft_discr_lr=2.5e-7,
+            waveform_discr_lrs=(5e-7, 5e-7, 2.5e-7),
+            waveform_discr_update_every=(2, 4, 4),
+            waveform_discr_loss_weights=(1.0, 0.25, 0.25),
+            stft_discr_update_every=4,
+            stft_discr_loss_weight=0.5,
             gan_start=1_000,
             gan_ramp=10_000,
             gan_adversarial_max=2e-4,
             gan_feature_max=5.0,
             noise_floor_loss_weight=0.03,
             spectral_envelope_loss_weight=0.05,
-            voiced_highband_loss_weight=0.06,
+            voiced_highband_loss_weight=0.07,
+            voiced_hf_retention_loss_weight=0.02,
             frame_phase_loss_weight=0.,
             frame_phase_loss_warmup_steps=0,
             si_sdr_loss_weight=0.07,
@@ -1414,6 +1466,15 @@ def main() -> None:
         raise ValueError("--voiced-highband-energy-deficit-weight cannot be negative.")
     if args.voiced_highband_energy_margin_db < 0:
         raise ValueError("--voiced-highband-energy-margin-db cannot be negative.")
+    if (
+        args.voiced_hf_retention_loss_weight is not None and
+        args.voiced_hf_retention_loss_weight < 0
+    ):
+        raise ValueError("--voiced-hf-retention-loss-weight cannot be negative.")
+    if args.voiced_hf_retention_margin_db < 0:
+        raise ValueError("--voiced-hf-retention-margin-db cannot be negative.")
+    if args.stage2_voiced_hf_score_weight < 0:
+        raise ValueError("--stage2-voiced-hf-score-weight cannot be negative.")
     if args.stft_recon_loss_weight is not None and args.stft_recon_loss_weight < 0:
         raise ValueError("--stft-recon-loss-weight cannot be negative.")
     if args.stft_recon_loss_warmup_steps is not None and args.stft_recon_loss_warmup_steps < 0:
@@ -1486,6 +1547,13 @@ def main() -> None:
         raise ValueError("--waveform-discr-update-every values must all be positive.")
     if args.stft_discr_update_every is not None and args.stft_discr_update_every <= 0:
         raise ValueError("--stft-discr-update-every must be positive.")
+    if (
+        args.waveform_discr_loss_weights is not None and
+        any(weight < 0 for weight in args.waveform_discr_loss_weights)
+    ):
+        raise ValueError("--waveform-discr-loss-weights values cannot be negative.")
+    if args.stft_discr_loss_weight is not None and args.stft_discr_loss_weight < 0:
+        raise ValueError("--stft-discr-loss-weight cannot be negative.")
     if args.gan_grad_diagnostics_every < 0:
         raise ValueError("--gan-grad-diagnostics-every cannot be negative.")
     if args.discr_max_grad_norm <= 0:
@@ -1645,10 +1713,25 @@ def main() -> None:
         if args.waveform_discr_update_every is not None
         else stage_defaults.get("waveform_discr_update_every", (1, 1, 1))
     )
+    waveform_discr_loss_weights = tuple(
+        args.waveform_discr_loss_weights
+        if args.waveform_discr_loss_weights is not None
+        else stage_defaults.get("waveform_discr_loss_weights", (1., 1., 1.))
+    )
     stft_discr_update_every = (
         args.stft_discr_update_every
         if args.stft_discr_update_every is not None
         else stage_defaults.get("stft_discr_update_every", 1)
+    )
+    stft_discr_loss_weight = (
+        args.stft_discr_loss_weight
+        if args.stft_discr_loss_weight is not None
+        else stage_defaults.get("stft_discr_loss_weight", 1.)
+    )
+    voiced_hf_retention_loss_weight = (
+        args.voiced_hf_retention_loss_weight
+        if args.voiced_hf_retention_loss_weight is not None
+        else stage_defaults.get("voiced_hf_retention_loss_weight", 0.)
     )
     if batch_size <= 0:
         raise ValueError("--batch-size must be greater than zero.")
@@ -1903,8 +1986,8 @@ def main() -> None:
                 f"waveform discriminators={waveform_lr_text} / STFT discriminator="
                 f"{stft_discr_lr:.3e} until step "
                 f"{args.stage2_plateau_start_steps}; validation ReduceLROnPlateau "
-                "then lowers the generator only on quality-retained reconstruction score "
-                "(10*wave + 1.1*Mel; lower is better) "
+                "then lowers the generator on the HF-penalized composite score "
+                "(10*wave + 1.1*Mel + two-sided voiced-HF gate penalty; lower is better) "
                 f"(factor={args.stage2_plateau_factor}, "
                 f"patience={args.stage2_plateau_patience}, "
                 f"threshold={args.stage2_plateau_threshold}, "
@@ -1922,6 +2005,12 @@ def main() -> None:
             f"{waveform_update_text}/{stft_discr_update_every}."
         )
         print(
+            "Stage-2 normalized discriminator loss weights "
+            "(scale1/scale0.5/scale0.25/STFT): "
+            f"{'/'.join(f'{weight:g}' for weight in waveform_discr_loss_weights)}/"
+            f"{stft_discr_loss_weight:g}."
+        )
+        print(
             "Stage-2 retention phase: Generator frozen through step "
             f"{args.stage2_generator_freeze_steps}; discriminator updates begin at step "
             f"{args.stage2_discriminator_start_steps if args.stage2_discriminator_start_steps is not None else stage_defaults['gan_start']}. "
@@ -1932,14 +2021,19 @@ def main() -> None:
                 else f"jointly frozen through step {args.stage2_unfreeze_encoder_rvq_step}"
             )
             + "; generator adversarial/feature losses begin after step "
-            f"{stage_defaults['gan_start']}."
+            f"{stage_defaults['gan_start']}; generator LR releases linearly from "
+            f"{args.stage2_generator_hold_lr:.3e} to {stage_defaults['lr']:.3e} "
+            f"by step {args.stage2_generator_hold_steps}."
         )
         if args.stage2_recon_transition_start_steps is None:
             print(
                 "Stage-2 reconstruction weights: fixed for the full run "
-                "(wave=10.0, mel=1.1, SI-SDR=0.07, corr=0.02, "
-                "envelope=0.05, voiced-highband=0.04, noise-floor=0.03, "
-                "STFT=0, frame-phase=0)."
+                f"(wave=10.0, mel=1.1, SI-SDR={si_sdr_loss_weight:g}, "
+                f"corr=0.02, envelope={spectral_envelope_loss_weight:g}, "
+                f"voiced-highband={voiced_highband_loss_weight:g}, "
+                f"voiced-HF-retention={voiced_hf_retention_loss_weight:g}, "
+                f"noise-floor={noise_floor_loss_weight:g}, "
+                f"STFT={stft_recon_loss_weight:g}, frame-phase={frame_phase_loss_weight:g})."
             )
         else:
             print(
@@ -1985,6 +2079,12 @@ def main() -> None:
         "excess_not_rewarded"
     )
     print(
+        "Gate-aligned voiced-HF retention loss: "
+        f"weight={voiced_hf_retention_loss_weight}, band=3000-7000 Hz, "
+        f"margin={args.voiced_hf_retention_margin_db} dB, target_voiced_only=True, "
+        "excess_not_rewarded=True"
+    )
+    print(
         "Transient noise loss: "
         f"click_weight={click_loss_weight}, "
         f"jump_weight={jump_loss_weight}, "
@@ -2019,6 +2119,7 @@ def main() -> None:
             f"quiet_hf_excess_rise<={args.stage2_max_quiet_hf_excess_db_rise:.2f} dB, "
             f"voiced_hf_ratio_delta=[-{args.stage2_max_voiced_hf_ratio_db_drop:.2f}, "
             f"+{args.stage2_max_voiced_hf_ratio_db_rise:.2f}] dB, "
+            f"voiced_hf_score_weight={args.stage2_voiced_hf_score_weight:g}, "
             f"ac320_rise<={args.stage2_max_ac320_isolated_rise:.4f}, "
             "comb_median_excess_rise<="
             f"{args.stage2_max_comb_median_excess_db_rise:.2f} dB, "
@@ -2199,6 +2300,8 @@ def main() -> None:
         voiced_highband_loss_weight=voiced_highband_loss_weight,
         voiced_highband_energy_deficit_weight=args.voiced_highband_energy_deficit_weight,
         voiced_highband_energy_margin_db=args.voiced_highband_energy_margin_db,
+        voiced_hf_retention_loss_weight=voiced_hf_retention_loss_weight,
+        voiced_hf_retention_margin_db=args.voiced_hf_retention_margin_db,
         preemph_loss_weight=preemph_loss_weight,
         noise_floor_loss_weight=noise_floor_loss_weight,
         stft_recon_loss_weight=stft_recon_loss_weight,
@@ -2244,7 +2347,9 @@ def main() -> None:
         stft_discr_lr=stft_discr_lr,
         waveform_discr_lrs=waveform_discr_lrs,
         waveform_discr_update_every=waveform_discr_update_every,
+        waveform_discr_loss_weights=waveform_discr_loss_weights,
         stft_discr_update_every=stft_discr_update_every,
+        stft_discr_loss_weight=stft_discr_loss_weight,
         gan_grad_diagnostics_every=(
             args.gan_grad_diagnostics_every
             if args.stage == "gan_pretrain"
@@ -2297,7 +2402,10 @@ def main() -> None:
             if stage2_plateau_lr_enabled
             else None
         ),
-        plateau_lr_require_quality_retention=stage2_plateau_lr_enabled,
+        # Stage-2 plateau observes the HF-penalized composite score even when
+        # the strict retention gate is currently failing. The gate still
+        # controls checkpoint eligibility and the delayed hard stop.
+        plateau_lr_require_quality_retention=False,
         generator_hold_steps=(
             args.stage2_generator_hold_steps
             if args.stage == "gan_pretrain"
@@ -2348,7 +2456,7 @@ def main() -> None:
             0.05 if args.stage == "gan_pretrain" else 0.
         ),
         stage2_initial_voiced_highband_loss_weight=(
-            0.04 if args.stage == "gan_pretrain" else 0.
+            voiced_highband_loss_weight if args.stage == "gan_pretrain" else 0.
         ),
         stage2_initial_noise_floor_loss_weight=(
             0.03 if args.stage == "gan_pretrain" else 0.
@@ -2466,6 +2574,7 @@ def main() -> None:
         quality_retention_max_voiced_hf_ratio_db_rise=(
             args.stage2_max_voiced_hf_ratio_db_rise
         ),
+        quality_retention_hf_score_weight=args.stage2_voiced_hf_score_weight,
         quality_retention_max_click_score_rise=args.stage2_max_click_score_rise,
         quality_retention_max_ac320_isolated_rise=args.stage2_max_ac320_isolated_rise,
         quality_retention_max_comb_median_excess_db_rise=(
@@ -2995,6 +3104,7 @@ def main() -> None:
             'voiced_hf_energy_ratio_db',
             'voiced_hf_logmag_error',
             'voiced_hf_energy_deficit',
+            'voiced_hf_retention_loss',
             'spectral_centroid_delta_hz',
             'spectral_slope_delta',
             'frame_diagnostic_valid',
@@ -3073,6 +3183,7 @@ def main() -> None:
                 f"voiced_hf_ratio_db={test_metrics.get('voiced_hf_energy_ratio_db', 0.):+.3f}, "
                 f"voiced_hf_error={test_metrics.get('voiced_hf_logmag_error', 0.):.4f}, "
                 f"voiced_hf_deficit={test_metrics.get('voiced_hf_energy_deficit', 0.):.4f}, "
+                f"voiced_hf_retention={test_metrics.get('voiced_hf_retention_loss', 0.):.4f}, "
                 f"centroid_delta_hz={test_metrics.get('spectral_centroid_delta_hz', 0.):+.1f}, "
                 f"slope_delta={test_metrics.get('spectral_slope_delta', 0.):+.3f}, "
                 f"ac_320_isolated={test_metrics.get('ac_320_isolated', 0.):+.6f}, "

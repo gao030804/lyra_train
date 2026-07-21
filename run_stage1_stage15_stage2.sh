@@ -17,7 +17,7 @@ GPU_LIST="${GPU_LIST:-0,1,2,3,4,5,7}"
 NUM_PROCESSES="${NUM_PROCESSES:-7}"
 AUDIO_DIR="${AUDIO_DIR:-$PWD/data/librispeech/LibriSpeech/train-clean-100}"
 SEED="${SEED:-42}"
-STAGE2_STEPS="${STAGE2_STEPS:-200000}"
+STAGE2_STEPS="${STAGE2_STEPS:-50000}"
 SKIP_STAGE1="${SKIP_STAGE1:-0}"
 RESUME_STAGE1="${RESUME_STAGE1:-0}"
 FALLBACK_STAGE1_CKPT="${FALLBACK_STAGE1_CKPT:-}"
@@ -34,15 +34,15 @@ RUN_TAG="${RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
 # Short diagnostics intentionally finish before the formal 60k/90k schedule
 # floors. Clamp those floors to the requested run length so the same launcher
 # works for both a 30k diagnostic and a 200k formal run.
-if (( STAGE2_STEPS < 90000 )); then
+if (( STAGE2_STEPS < 20000 )); then
   DEFAULT_STAGE2_EARLY_STOP_MIN_STEPS="$STAGE2_STEPS"
 else
-  DEFAULT_STAGE2_EARLY_STOP_MIN_STEPS=90000
+  DEFAULT_STAGE2_EARLY_STOP_MIN_STEPS=20000
 fi
-if (( STAGE2_STEPS < 60000 )); then
+if (( STAGE2_STEPS < 10000 )); then
   DEFAULT_STAGE2_PLATEAU_START_STEPS="$STAGE2_STEPS"
 else
-  DEFAULT_STAGE2_PLATEAU_START_STEPS=60000
+  DEFAULT_STAGE2_PLATEAU_START_STEPS=10000
 fi
 STAGE2_EARLY_STOP_MIN_STEPS="${STAGE2_EARLY_STOP_MIN_STEPS:-$DEFAULT_STAGE2_EARLY_STOP_MIN_STEPS}"
 STAGE2_PLATEAU_START_STEPS="${STAGE2_PLATEAU_START_STEPS:-$DEFAULT_STAGE2_PLATEAU_START_STEPS}"
@@ -80,7 +80,7 @@ fi
 # Defaults include a timestamp, so --no-resume cannot accidentally reuse an
 # older checkpoint's best-score state.  Set explicit names only when needed.
 STAGE1_NAME="${STAGE1_NAME:-recon-pretrain-full-${RUN_TAG}-7gpu-4s}"
-STAGE2_NAME="${STAGE2_NAME:-gan-pretrain-direct-s1-${RUN_TAG}-s2-200k-ramp-7gpu-4s}"
+STAGE2_NAME="${STAGE2_NAME:-gan-pretrain-direct-s1-${RUN_TAG}-s2-50k-hfretain-7gpu-4s}"
 
 STAGE1_DIR="$PWD/results/$STAGE1_NAME"
 STAGE2_DIR="$PWD/results/$STAGE2_NAME"
@@ -341,12 +341,16 @@ run_stage "Stage 2: gan_pretrain" 29503 \
   --save-model-every 5000 \
   --best-eval-every 500 \
   --early-stopping-min-steps "$STAGE2_EARLY_STOP_MIN_STEPS" \
-  --early-stopping-patience 30 \
+  --early-stopping-patience 12 \
   --si-sdr-loss-weight 0.07 \
   --si-sdr-loss-start-steps 0 \
   --si-sdr-loss-warmup-steps 0 \
   --spectral-envelope-loss-weight 0.05 \
-  --voiced-highband-loss-weight 0.06 \
+  --voiced-highband-loss-weight 0.07 \
+  --voiced-highband-energy-deficit-weight 0.40 \
+  --voiced-highband-energy-margin-db 0.05 \
+  --voiced-hf-retention-loss-weight 0.02 \
+  --voiced-hf-retention-margin-db 0.50 \
   --voiced-highband-loss-start-steps 0 \
   --voiced-highband-loss-warmup-steps 0 \
   --noise-floor-loss-weight 0.03 \
@@ -356,31 +360,34 @@ run_stage "Stage 2: gan_pretrain" 29503 \
   --stage2-plateau-lr \
   --stage2-plateau-start-steps "$STAGE2_PLATEAU_START_STEPS" \
   --stage2-plateau-factor 0.5 \
-  --stage2-plateau-patience 16 \
+  --stage2-plateau-patience 8 \
   --stage2-plateau-threshold 0.01 \
   --stage2-plateau-cooldown 2 \
   --stage2-plateau-min-lr 1e-7 \
-  --stage2-plateau-discr-min-lr 2e-7 \
+  --stage2-plateau-discr-min-lr 1e-7 \
   --stage2-plateau-stft-discr-min-lr 1e-7 \
-  --waveform-discr-lrs 1e-6 2e-6 2e-6 \
-  --stft-discr-lr 5e-7 \
-  --waveform-discr-update-every 2 2 2 \
-  --stft-discr-update-every 2 \
+  --waveform-discr-lrs 5e-7 5e-7 2.5e-7 \
+  --stft-discr-lr 2.5e-7 \
+  --waveform-discr-update-every 2 4 4 \
+  --waveform-discr-loss-weights 1.0 0.25 0.25 \
+  --stft-discr-update-every 4 \
+  --stft-discr-loss-weight 0.5 \
   --gan-grad-diagnostics-every 500 \
   --discr-max-grad-norm 1.0 \
   --stage2-generator-freeze-steps 1000 \
   --stage2-discriminator-start-steps 0 \
   --stage2-unfreeze-encoder-rvq-step -1 \
-  --stage2-generator-hold-steps 2000 \
-  --stage2-generator-hold-lr 2.5e-7 \
+  --stage2-generator-hold-steps 5000 \
+  --stage2-generator-hold-lr 1e-7 \
   --stage2-discriminator-hold-steps 0 \
   --stage2-discriminator-hold-lr 5e-6 \
-  --stage2-quality-gate-start-steps 25000 \
+  --stage2-quality-gate-start-steps 20000 \
   --stage2-best-checkpoint-min-step 5000 \
-  --stage2-quality-retention-patience 12 \
+  --stage2-quality-retention-patience 8 \
   --stage2-rvq-retention-patience 6 \
   --stage2-max-voiced-hf-ratio-db-drop 0.30 \
-  --stage2-max-voiced-hf-ratio-db-rise 0.75 \
+  --stage2-max-voiced-hf-ratio-db-rise 1.00 \
+  --stage2-voiced-hf-score-weight 3.0 \
   --stage2-max-click-score-rise 0.30 \
   --clean-gate-max-click-score 6.0 \
   --clean-gate-max-click-excess 0.5 \
