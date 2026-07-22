@@ -33,6 +33,7 @@
 
 !tools/
 !tools/checkpoint_decoder_config.py
+!tools/reconstruct_long_test10.py
 !tools/select_stage1_checkpoint.py
 !tools/validate_stage2_init.py
 # ============================================================

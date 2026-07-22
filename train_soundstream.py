@@ -42,8 +42,21 @@ STAGE_RESULTS_DIRS = {
     "stream_finetune_long": PROJECT_DIR / "results" / "stream-finetune-long-64d-23q",
 }
 
-RECONSTRUCTION_STAGES = frozenset(("recon_pretrain", "spectral_refine", "gan_pretrain"))
-GAN_STAGES = frozenset(("gan_pretrain", "stream_finetune", "stream_finetune_long"))
+RECONSTRUCTION_STAGES = frozenset((
+    "recon_pretrain",
+    "spectral_refine",
+    "gan_pretrain",
+    "stream_finetune",
+    "stream_finetune_long",
+))
+# Stage 3 is deliberately reconstruction-only.  Stage 4 is the optional weak
+# streaming-GAN pass after stateful/offline consistency has been established.
+GAN_STAGES = frozenset(("gan_pretrain", "stream_finetune_long"))
+QUALITY_RETENTION_STAGES = frozenset((
+    "gan_pretrain",
+    "stream_finetune",
+    "stream_finetune_long",
+))
 
 STAGE_DEFAULTS = {
     "overfit": dict(
@@ -165,30 +178,54 @@ STAGE_DEFAULTS = {
         gan_adversarial_max=2e-4, gan_feature_max=1.25,
     ),
     "stream_finetune": dict(
-        steps=20_000, batch_size=4, segment_seconds=2.,
+        steps=20_000, batch_size=4, segment_seconds=4.,
         save_every=1_000, eval_every=250, min_steps=5_000, patience=30,
-        lr=3e-5, discr_lr=5e-5, ema_beta=0.999,
+        lr=5e-7, discr_lr=5e-7, ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
+        use_ema=False,
         click_loss_weight=0., jump_loss_weight=0.,
-        preemph_loss_weight=0., noise_floor_loss_weight=0.,
+        preemph_loss_weight=0., noise_floor_loss_weight=0.03,
         transient_loss_warmup_steps=0,
-        spectral_envelope_loss_weight=0.,
-        voiced_highband_loss_weight=0.,
+        spectral_envelope_loss_weight=0.05,
+        voiced_highband_loss_weight=0.07,
+        voiced_hf_retention_loss_weight=0.02,
         stft_recon_loss_weight=0.,
-        gan_start=5_000, gan_ramp=10_000,
+        si_sdr_loss_weight=0.07,
+        boundary_loss_weight=0.02,
+        boundary_loss_start_steps=2_000,
+        boundary_loss_warmup_steps=3_000,
+        # Streaming consistency is a waveform-only teacher loss.  Keep it
+        # light: ordinary Mel / high-band objectives already preserve the
+        # spectrum, while reusing the log-Mel reconstruction loss here made
+        # the training value orders of magnitude larger than validation.
+        stream_consistency_loss_weight=0.10,
+        stream_consistency_loss_start_steps=0,
+        stream_consistency_loss_warmup_steps=2_000,
+        gan_start=0, gan_ramp=0,
+        gan_adversarial_max=0., gan_feature_max=0.,
     ),
     "stream_finetune_long": dict(
-        steps=5_000, batch_size=2, segment_seconds=4.,
-        save_every=1_000, eval_every=250, min_steps=1_000, patience=15,
-        lr=1e-5, discr_lr=2e-5, ema_beta=0.999,
+        steps=20_000, batch_size=2, segment_seconds=4.,
+        save_every=1_000, eval_every=250, min_steps=5_000, patience=20,
+        lr=2.5e-7, discr_lr=5e-7, stft_discr_lr=2.5e-7, ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
+        use_ema=False,
         click_loss_weight=0., jump_loss_weight=0.,
-        preemph_loss_weight=0., noise_floor_loss_weight=0.,
+        preemph_loss_weight=0., noise_floor_loss_weight=0.03,
         transient_loss_warmup_steps=0,
-        spectral_envelope_loss_weight=0.,
-        voiced_highband_loss_weight=0.,
+        spectral_envelope_loss_weight=0.05,
+        voiced_highband_loss_weight=0.07,
+        voiced_hf_retention_loss_weight=0.02,
         stft_recon_loss_weight=0.,
-        gan_start=1_000, gan_ramp=2_000,
+        si_sdr_loss_weight=0.07,
+        boundary_loss_weight=0.02,
+        boundary_loss_start_steps=0,
+        boundary_loss_warmup_steps=0,
+        stream_consistency_loss_weight=0.10,
+        stream_consistency_loss_start_steps=0,
+        stream_consistency_loss_warmup_steps=0,
+        gan_start=1_000, gan_ramp=10_000,
+        gan_adversarial_max=5e-5, gan_feature_max=0.25,
     ),
 }
 
@@ -770,7 +807,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage2-max-voiced-hf-ratio-db-rise",
         type=float,
-        default=1.00,
+        default=1.50,
         help=(
             "Maximum Stage-2 voiced 3-7 kHz energy-ratio rise from the "
             "initialization baseline in dB."
@@ -1075,12 +1112,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--boundary-loss-weight",
         type=float,
-        default=0.1,
+        default=None,
+        help="Streaming boundary target weight; stage default is 0.02.",
     )
     parser.add_argument(
         "--boundary-loss-radius",
         type=int,
         default=8,
+    )
+    parser.add_argument(
+        "--boundary-loss-start-steps",
+        type=int,
+        default=None,
+        help="Streaming step before boundary loss begins.",
+    )
+    parser.add_argument(
+        "--boundary-loss-warmup-steps",
+        type=int,
+        default=None,
+        help="Linear boundary-loss ramp length after its start step.",
+    )
+    parser.add_argument(
+        "--stream-consistency-loss-weight",
+        type=float,
+        default=None,
+        help=(
+            "Weight for stateful-streaming output consistency against the "
+            "same weights executed through the full-sequence causal path."
+        ),
+    )
+    parser.add_argument(
+        "--stream-consistency-loss-start-steps",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--stream-consistency-loss-warmup-steps",
+        type=int,
+        default=None,
     )
     parser.add_argument(
         "--valid-frac",
@@ -1293,6 +1362,11 @@ def build_model(
     stream_context_frames: int,
     boundary_loss_weight: float,
     boundary_loss_radius: int,
+    boundary_loss_start_steps: int,
+    boundary_loss_warmup_steps: int,
+    stream_consistency_loss_weight: float,
+    stream_consistency_loss_start_steps: int,
+    stream_consistency_loss_warmup_steps: int,
     codebook_size: int,
     num_quantizers: int,
     si_sdr_loss_weight: float,
@@ -1361,7 +1435,11 @@ def build_model(
         commitment_loss_weight=(
             commitment_loss_weight
             if commitment_loss_weight is not None
-            else (0. if stage == "gan_pretrain" else 0.1)
+            else (
+                0.
+                if stage in ("gan_pretrain", "stream_finetune", "stream_finetune_long")
+                else 0.1
+            )
         ),
         adversarial_loss_weight=(gan_adversarial_max if stage in GAN_STAGES else 0.),
         feature_loss_weight=(gan_feature_max if stage in GAN_STAGES else 0.),
@@ -1386,6 +1464,11 @@ def build_model(
         stream_context_frames=stream_context_frames,
         boundary_loss_weight=boundary_loss_weight,
         boundary_loss_radius=boundary_loss_radius,
+        boundary_loss_start_steps=boundary_loss_start_steps,
+        boundary_loss_warmup_steps=boundary_loss_warmup_steps,
+        stream_consistency_loss_weight=stream_consistency_loss_weight,
+        stream_consistency_loss_start_steps=stream_consistency_loss_start_steps,
+        stream_consistency_loss_warmup_steps=stream_consistency_loss_warmup_steps,
         **model_kwargs,
     )
 
@@ -1441,6 +1524,37 @@ def main() -> None:
             1_000,
         )
 
+    args.boundary_loss_weight = (
+        args.boundary_loss_weight
+        if args.boundary_loss_weight is not None
+        else stage_defaults.get("boundary_loss_weight", 0.02)
+    )
+    args.boundary_loss_start_steps = (
+        args.boundary_loss_start_steps
+        if args.boundary_loss_start_steps is not None
+        else stage_defaults.get("boundary_loss_start_steps", 0)
+    )
+    args.boundary_loss_warmup_steps = (
+        args.boundary_loss_warmup_steps
+        if args.boundary_loss_warmup_steps is not None
+        else stage_defaults.get("boundary_loss_warmup_steps", 0)
+    )
+    args.stream_consistency_loss_weight = (
+        args.stream_consistency_loss_weight
+        if args.stream_consistency_loss_weight is not None
+        else stage_defaults.get("stream_consistency_loss_weight", 0.)
+    )
+    args.stream_consistency_loss_start_steps = (
+        args.stream_consistency_loss_start_steps
+        if args.stream_consistency_loss_start_steps is not None
+        else stage_defaults.get("stream_consistency_loss_start_steps", 0)
+    )
+    args.stream_consistency_loss_warmup_steps = (
+        args.stream_consistency_loss_warmup_steps
+        if args.stream_consistency_loss_warmup_steps is not None
+        else stage_defaults.get("stream_consistency_loss_warmup_steps", 0)
+    )
+
     if args.generator_lr is not None:
         if args.generator_lr <= 0:
             raise ValueError("--generator-lr must be positive.")
@@ -1454,6 +1568,17 @@ def main() -> None:
         raise ValueError("--si-sdr-loss-start-steps cannot be negative.")
     if args.si_sdr_loss_warmup_steps is not None and args.si_sdr_loss_warmup_steps < 0:
         raise ValueError("--si-sdr-loss-warmup-steps cannot be negative.")
+    if args.boundary_loss_weight < 0:
+        raise ValueError("--boundary-loss-weight cannot be negative.")
+    if args.boundary_loss_start_steps < 0 or args.boundary_loss_warmup_steps < 0:
+        raise ValueError("Boundary-loss schedule steps cannot be negative.")
+    if args.stream_consistency_loss_weight < 0:
+        raise ValueError("--stream-consistency-loss-weight cannot be negative.")
+    if (
+        args.stream_consistency_loss_start_steps < 0 or
+        args.stream_consistency_loss_warmup_steps < 0
+    ):
+        raise ValueError("Stream-consistency schedule steps cannot be negative.")
     if args.spectral_envelope_loss_weight is not None and args.spectral_envelope_loss_weight < 0:
         raise ValueError("--spectral-envelope-loss-weight cannot be negative.")
     if args.voiced_highband_loss_weight is not None and args.voiced_highband_loss_weight < 0:
@@ -2233,7 +2358,18 @@ def main() -> None:
     if args.stage in ("stream_finetune", "stream_finetune_long"):
         print(f"Internal streaming frame: {stream_frame_size} samples")
         print("Streaming context: per-layer causal state (no previous PCM frames)")
-        print(f"Boundary loss weight: {args.boundary_loss_weight}")
+        print(
+            "Boundary loss schedule: "
+            f"weight={args.boundary_loss_weight}, "
+            f"start={args.boundary_loss_start_steps}, "
+            f"warmup={args.boundary_loss_warmup_steps}"
+        )
+        print(
+            "Offline/stateful consistency schedule: "
+            f"weight={args.stream_consistency_loss_weight}, "
+            f"start={args.stream_consistency_loss_start_steps}, "
+            f"warmup={args.stream_consistency_loss_warmup_steps}"
+        )
         print(f"Boundary loss radius: {args.boundary_loss_radius} samples")
     print(f"Codebook size: {codebook_size}")
     print(f"RVQ quantizers: {num_quantizers}")
@@ -2291,6 +2427,11 @@ def main() -> None:
         stream_context_frames=stream_context_frames,
         boundary_loss_weight=args.boundary_loss_weight,
         boundary_loss_radius=args.boundary_loss_radius,
+        boundary_loss_start_steps=args.boundary_loss_start_steps,
+        boundary_loss_warmup_steps=args.boundary_loss_warmup_steps,
+        stream_consistency_loss_weight=args.stream_consistency_loss_weight,
+        stream_consistency_loss_start_steps=args.stream_consistency_loss_start_steps,
+        stream_consistency_loss_warmup_steps=args.stream_consistency_loss_warmup_steps,
         codebook_size=codebook_size,
         num_quantizers=num_quantizers,
         si_sdr_loss_weight=si_sdr_loss_weight,
@@ -2315,7 +2456,13 @@ def main() -> None:
         # Restore it automatically if the user explicitly unfreezes that path.
         commitment_loss_weight=(
             0.
-            if args.stage == "gan_pretrain" and args.stage2_unfreeze_encoder_rvq_step < 0
+            if (
+                args.stage in ("stream_finetune", "stream_finetune_long") or
+                (
+                    args.stage == "gan_pretrain" and
+                    args.stage2_unfreeze_encoder_rvq_step < 0
+                )
+            )
             else 0.1
         ),
         sync_codebook=(world_size > 1),
@@ -2464,7 +2611,11 @@ def main() -> None:
         quality_retention_start_step=(
             args.stage2_quality_gate_start_steps
             if args.stage == "gan_pretrain"
-            else 0
+            else (
+                stage_defaults.get("min_steps", 0)
+                if args.stage in ("stream_finetune", "stream_finetune_long")
+                else 0
+            )
         ),
         save_results_every=args.save_results_every,
         save_model_every=save_model_every,
@@ -2523,7 +2674,11 @@ def main() -> None:
                 if args.stage == "gan_pretrain"
                 else (
                     stage_defaults.get("min_steps", 0)
-                    if args.stage == "spectral_refine"
+                    if args.stage in (
+                        "spectral_refine",
+                        "stream_finetune",
+                        "stream_finetune_long",
+                    )
                     else 0
                 )
             )
@@ -2563,22 +2718,45 @@ def main() -> None:
         gan_adversarial_max=stage_defaults.get("gan_adversarial_max", 0.001),
         gan_feature_max=stage_defaults.get("gan_feature_max", 5.),
         quality_retention_gate=(
-            args.stage == "gan_pretrain" and args.stage2_quality_retention_gate
+            args.stage in QUALITY_RETENTION_STAGES and
+            args.stage2_quality_retention_gate
         ),
-        quality_retention_max_aligned_si_sdr_drop=args.stage2_max_aligned_si_sdr_drop,
-        quality_retention_max_aligned_corr_drop=args.stage2_max_aligned_corr_drop,
-        quality_retention_max_quiet_hf_excess_db_rise=args.stage2_max_quiet_hf_excess_db_rise,
+        quality_retention_max_aligned_si_sdr_drop=(
+            0.20
+            if args.stage in ("stream_finetune", "stream_finetune_long")
+            else args.stage2_max_aligned_si_sdr_drop
+        ),
+        quality_retention_max_aligned_corr_drop=(
+            0.01
+            if args.stage in ("stream_finetune", "stream_finetune_long")
+            else args.stage2_max_aligned_corr_drop
+        ),
+        quality_retention_max_quiet_hf_excess_db_rise=(
+            0.30
+            if args.stage in ("stream_finetune", "stream_finetune_long")
+            else args.stage2_max_quiet_hf_excess_db_rise
+        ),
         quality_retention_max_voiced_hf_ratio_db_drop=(
-            args.stage2_max_voiced_hf_ratio_db_drop
+            0.50
+            if args.stage in ("stream_finetune", "stream_finetune_long")
+            else args.stage2_max_voiced_hf_ratio_db_drop
         ),
         quality_retention_max_voiced_hf_ratio_db_rise=(
-            args.stage2_max_voiced_hf_ratio_db_rise
+            0.50
+            if args.stage in ("stream_finetune", "stream_finetune_long")
+            else args.stage2_max_voiced_hf_ratio_db_rise
         ),
         quality_retention_hf_score_weight=args.stage2_voiced_hf_score_weight,
         quality_retention_max_click_score_rise=args.stage2_max_click_score_rise,
-        quality_retention_max_ac320_isolated_rise=args.stage2_max_ac320_isolated_rise,
+        quality_retention_max_ac320_isolated_rise=(
+            0.003
+            if args.stage in ("stream_finetune", "stream_finetune_long")
+            else args.stage2_max_ac320_isolated_rise
+        ),
         quality_retention_max_comb_median_excess_db_rise=(
-            args.stage2_max_comb_median_excess_db_rise
+            0.30
+            if args.stage in ("stream_finetune", "stream_finetune_long")
+            else args.stage2_max_comb_median_excess_db_rise
         ),
         quality_retention_patience=args.stage2_quality_retention_patience,
         quality_retention_rvq_patience=args.stage2_rvq_retention_patience,
@@ -2593,6 +2771,9 @@ def main() -> None:
             else None
         ),
         freeze_encoder_before_step=(
+            num_train_steps + 1
+            if args.stage in ("stream_finetune", "stream_finetune_long")
+            else
             (
                 num_train_steps + 1
                 if args.stage2_unfreeze_encoder_rvq_step < 0
@@ -2746,7 +2927,12 @@ def main() -> None:
                 init_checkpoint,
                 generator_only=(predecessor_stage is not None),
             )
-            if args.stage in ("spectral_refine", "gan_pretrain"):
+            if args.stage in (
+                "spectral_refine",
+                "gan_pretrain",
+                "stream_finetune",
+                "stream_finetune_long",
+            ):
                 inherited_block_scales = checkpoint_config.get(
                     "decoder_block_residual_scales"
                 )
@@ -2776,7 +2962,11 @@ def main() -> None:
                     inherited_block_scales
                 )
                 trainer.decoder_x8_residual_scale_start = inherited_block_scales[0]
-                if args.stage == "gan_pretrain":
+                if args.stage in (
+                    "gan_pretrain",
+                    "stream_finetune",
+                    "stream_finetune_long",
+                ):
                     # Keep every refined block scale fixed. Using the legacy
                     # scalar scheduler here would silently reset x5/x4/x2.
                     trainer.decoder_x8_residual_scale_target = inherited_block_scales[0]
@@ -2797,7 +2987,7 @@ def main() -> None:
 
     if (
         not evaluation_only and
-        args.stage == "gan_pretrain" and
+        args.stage in QUALITY_RETENTION_STAGES and
         trainer.quality_retention_gate and
         not trainer.has_quality_retention_baseline
     ):
@@ -2991,6 +3181,18 @@ def main() -> None:
             )
             if checkpoint.exists()
         ), best_raw_online)
+    elif args.stage in ("stream_finetune", "stream_finetune_long"):
+        # Streaming adaptation is ranked by the gated reconstruction +
+        # boundary + offline/stateful consistency score.
+        best_checkpoint = next((
+            checkpoint for checkpoint in (
+                best_selected,
+                best_by_aligned_si_sdr,
+                best_raw_clarity,
+                best_raw_online,
+            )
+            if checkpoint.exists()
+        ), best_raw_online)
     else:
         best_checkpoint = next((
             checkpoint for checkpoint in (
@@ -3021,7 +3223,8 @@ def main() -> None:
                 "WARNING: no clean-gated best checkpoint exists; final test is "
                 f"using {best_checkpoint.name} for diagnostics only."
             )
-        print(f"Final test checkpoint: {best_checkpoint}")
+        if is_main:
+            print(f"Final test checkpoint: {best_checkpoint}")
         selected_test_files = list(trainer.test_files)
         if args.test_eval_batches is not None:
             selected_test_files = selected_test_files[:args.test_eval_batches]
@@ -3044,11 +3247,14 @@ def main() -> None:
             if save_test_reconstructions
             else None
         )
-        test_report_file = (
-            (args.test_report_file or (results_dir / "stage1_test_report.txt")).resolve()
+        default_test_report_name = (
+            "stage1_test_report.txt"
             if args.stage in ("recon_pretrain", "spectral_refine")
-            else None
+            else "held_out_test_report.txt"
         )
+        test_report_file = (
+            args.test_report_file or (results_dir / default_test_report_name)
+        ).resolve()
 
         if is_main:
             print(
@@ -3058,7 +3264,7 @@ def main() -> None:
             )
             if save_test_reconstructions:
                 print(f"Saving stage-1 test reconstructions to: {test_recon_dir}")
-                print(f"Writing stage-1 test report to: {test_report_file}")
+            print(f"Writing held-out test report to: {test_report_file}")
 
         load_model_weights_only(test_model, best_checkpoint)
         if is_main and hasattr(test_model, "get_decoder_block_residual_scales"):
@@ -3077,11 +3283,15 @@ def main() -> None:
 
         metric_names = (
             'score',
+            'reconstruction_score',
+            'selection_score',
+            'voiced_hf_score_penalty',
             'multi_spectral_recon_loss',
             'stft_recon_loss',
             'recon_loss',
             'wave_mse',
             'boundary_loss',
+            'stream_consistency_loss',
             'commitment_loss',
             'energy_loss',
             'rms_ratio',
@@ -3164,11 +3374,15 @@ def main() -> None:
             print(
                 "Test report: "
                 f"score={test_metrics['score']:.6f}, "
+                f"reconstruction_score={test_metrics['reconstruction_score']:.6f}, "
+                f"selection_score={test_metrics['selection_score']:.6f}, "
+                f"hf_penalty={test_metrics['voiced_hf_score_penalty']:.6f}, "
                 f"mel={test_metrics['multi_spectral_recon_loss']:.6f}, "
                 f"stft={test_metrics['stft_recon_loss']:.6f}, "
                 f"recon={test_metrics['recon_loss']:.6f}, "
                 f"mse={test_metrics['wave_mse']:.6f}, "
                 f"boundary={test_metrics['boundary_loss']:.6f}, "
+                f"stream_consistency={test_metrics['stream_consistency_loss']:.6f}, "
                 f"commitment={test_metrics['commitment_loss']:.6f}, "
                 f"energy={test_metrics['energy_loss']:.6f}, "
                 f"rms_ratio={test_metrics['rms_ratio']:.6f}, "
@@ -3195,7 +3409,7 @@ def main() -> None:
             if test_report_file is not None:
                 test_report_file.parent.mkdir(parents=True, exist_ok=True)
                 with test_report_file.open("w", encoding="utf-8") as f:
-                    f.write("Stage-1/1.5 held-out test report\n")
+                    f.write(f"{args.stage} held-out test report\n")
                     f.write(f"checkpoint\t{best_checkpoint}\n")
                     f.write(f"results_dir\t{results_dir}\n")
                     f.write(f"num_test_files\t{len(selected_test_files)}\n")

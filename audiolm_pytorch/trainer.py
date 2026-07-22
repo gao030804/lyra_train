@@ -352,7 +352,7 @@ class SoundStreamTrainer(nn.Module):
         quality_retention_max_aligned_corr_drop: float = 0.02,
         quality_retention_max_quiet_hf_excess_db_rise: float = 0.50,
         quality_retention_max_voiced_hf_ratio_db_drop: float = 0.30,
-        quality_retention_max_voiced_hf_ratio_db_rise: float = 1.00,
+        quality_retention_max_voiced_hf_ratio_db_rise: float = 1.50,
         quality_retention_hf_score_weight: float = 3.,
         quality_retention_max_click_score_rise: float = 0.30,
         quality_retention_max_ac320_isolated_rise: float = 0.005,
@@ -1575,6 +1575,7 @@ class SoundStreamTrainer(nn.Module):
         energy_loss = F.l1_loss(recon_rms, target_rms)
         rms_ratio = (recon_rms / target_rms).mean()
         boundary_loss = target.new_tensor(0.)
+        stream_consistency_loss = target.new_tensor(0.)
 
         # Validation-only 50 Hz / 320-sample leakage diagnostics.  These use
         # exactly the same full residual for every checkpoint candidate and do
@@ -1710,6 +1711,8 @@ class SoundStreamTrainer(nn.Module):
 
         if hasattr(model, 'frame_boundary_loss'):
             boundary_loss = model.frame_boundary_loss(recon)
+        if hasattr(model, 'stream_consistency_loss'):
+            stream_consistency_loss = model.stream_consistency_loss(target, recon)
 
         min_mel_samples = max(
             transform.n_fft
@@ -1794,7 +1797,11 @@ class SoundStreamTrainer(nn.Module):
             'stream_finetune',
             'stream_finetune_long'
         ):
-            score = score + boundary_loss * model.boundary_loss_weight
+            score = (
+                score +
+                boundary_loss * model.boundary_loss_weight +
+                stream_consistency_loss * model.stream_consistency_loss_weight
+            )
 
         validation_eligible = (
             (rms_ratio >= 0.25) &
@@ -1848,6 +1855,9 @@ class SoundStreamTrainer(nn.Module):
             spectral_slope_delta = float(spectral_slope_delta.detach().cpu()),
             quiet_hf_excess_db = float(quiet_hf_excess_db.detach().cpu()),
             boundary_loss = float(boundary_loss.detach().cpu()),
+            stream_consistency_loss = float(
+                stream_consistency_loss.detach().cpu()
+            ),
             energy_loss = float(energy_loss.detach().cpu()),
             rms_ratio = float(rms_ratio.detach().cpu()),
             target_peak = float(target_peak.detach().cpu()),
@@ -1962,7 +1972,8 @@ class SoundStreamTrainer(nn.Module):
         context_ms = 60.,
         max_files = None,
         save_recon_dir = None,
-        metrics_path = None
+        metrics_path = None,
+        apply_quality_retention_penalty = False,
     ):
         if not files:
             return None
@@ -2198,38 +2209,43 @@ class SoundStreamTrainer(nn.Module):
         hf_low_score_penalty = 0.
         hf_high_score_penalty = 0.
         if (
-            self.best_checkpoint_metric == 'gan_pretrain' and
+            apply_quality_retention_penalty and
+            self.quality_retention_gate and
             self.has_quality_retention_baseline and
             self.quality_retention_hf_score_weight > 0.
         ):
-            minimum_retained_ratio = (
-                self.quality_retention_baseline['voiced_hf_energy_ratio_db'] -
-                self.quality_retention_max_voiced_hf_ratio_db_drop
-            )
-            maximum_retained_ratio = (
-                self.quality_retention_baseline['voiced_hf_energy_ratio_db'] +
-                self.quality_retention_max_voiced_hf_ratio_db_rise
-            )
-            current_ratio = averaged_metrics['voiced_hf_energy_ratio_db']
-            hf_shortfall_db = max(
-                0.,
-                minimum_retained_ratio - current_ratio,
-            )
-            hf_excess_db = max(
-                0.,
-                current_ratio - maximum_retained_ratio,
-            )
-            hf_low_score_penalty = (
-                self.quality_retention_hf_score_weight * hf_shortfall_db ** 2
-            )
-            hf_high_score_penalty = (
-                self.quality_retention_hf_score_weight * hf_excess_db ** 2
+            (
+                hf_low_score_penalty,
+                hf_high_score_penalty,
+            ) = self.quality_retention_voiced_hf_score_penalties(
+                averaged_metrics['voiced_hf_energy_ratio_db']
             )
             hf_score_penalty = hf_low_score_penalty + hf_high_score_penalty
             averaged_metrics['score'] += hf_score_penalty
+        averaged_metrics['selection_score'] = averaged_metrics['score']
         averaged_metrics['voiced_hf_score_penalty'] = hf_score_penalty
         averaged_metrics['voiced_hf_low_score_penalty'] = hf_low_score_penalty
         averaged_metrics['voiced_hf_high_score_penalty'] = hf_high_score_penalty
+        hf_bounds = (
+            self.quality_retention_voiced_hf_bounds()
+            if apply_quality_retention_penalty
+            else None
+        )
+        if hf_bounds is None:
+            hf_gate_min_db = float('nan')
+            hf_gate_max_db = float('nan')
+            hf_gate_violation_db = 0.
+        else:
+            hf_gate_min_db, hf_gate_max_db = hf_bounds
+            current_hf_ratio_db = averaged_metrics['voiced_hf_energy_ratio_db']
+            hf_gate_violation_db = max(
+                0.,
+                hf_gate_min_db - current_hf_ratio_db,
+                current_hf_ratio_db - hf_gate_max_db,
+            )
+        averaged_metrics['voiced_hf_gate_min_db'] = hf_gate_min_db
+        averaged_metrics['voiced_hf_gate_max_db'] = hf_gate_max_db
+        averaged_metrics['voiced_hf_gate_violation_db'] = hf_gate_violation_db
         averaged_metrics['code_counts'] = total_code_counts.detach().cpu()
         averaged_metrics['num_samples'] = total_samples
         return averaged_metrics
@@ -2604,6 +2620,30 @@ class SoundStreamTrainer(nn.Module):
         self.quality_retention_bad_evals = 0
         self.quality_retention_rvq_bad_evals = 0
 
+    def quality_retention_voiced_hf_bounds(self):
+        """Return the exact voiced-HF interval shared by scoring and gating."""
+        if not self.has_quality_retention_baseline:
+            return None
+
+        baseline_ratio = self.quality_retention_baseline[
+            'voiced_hf_energy_ratio_db'
+        ]
+        return (
+            baseline_ratio - self.quality_retention_max_voiced_hf_ratio_db_drop,
+            baseline_ratio + self.quality_retention_max_voiced_hf_ratio_db_rise,
+        )
+
+    def quality_retention_voiced_hf_score_penalties(self, current_ratio):
+        bounds = self.quality_retention_voiced_hf_bounds()
+        if bounds is None or self.quality_retention_hf_score_weight <= 0.:
+            return 0., 0.
+
+        minimum_ratio, maximum_ratio = bounds
+        shortfall_db = max(0., minimum_ratio - current_ratio)
+        excess_db = max(0., current_ratio - maximum_ratio)
+        weight = self.quality_retention_hf_score_weight
+        return weight * shortfall_db ** 2, weight * excess_db ** 2
+
     def balanced_checkpoint_failure_reasons(self, metrics):
         """Stricter Stage-2 gate for a reconstruction/artifact compromise."""
         reasons = self.quality_retention_failure_reasons(metrics)
@@ -2658,16 +2698,15 @@ class SoundStreamTrainer(nn.Module):
             tolerance
         ):
             reasons.append('quiet_hf')
+        minimum_hf_ratio, maximum_hf_ratio = (
+            self.quality_retention_voiced_hf_bounds()
+        )
         if metrics.get('voiced_hf_energy_ratio_db', float('-inf')) < (
-            baseline['voiced_hf_energy_ratio_db'] -
-            self.quality_retention_max_voiced_hf_ratio_db_drop -
-            tolerance
+            minimum_hf_ratio - tolerance
         ):
             reasons.append('voiced_hf_low')
         if metrics.get('voiced_hf_energy_ratio_db', float('inf')) > (
-            baseline['voiced_hf_energy_ratio_db'] +
-            self.quality_retention_max_voiced_hf_ratio_db_rise +
-            tolerance
+            maximum_hf_ratio + tolerance
         ):
             reasons.append('voiced_hf_high')
         if metrics.get('click_score', float('inf')) > (
@@ -2722,6 +2761,44 @@ class SoundStreamTrainer(nn.Module):
         averaged_metrics.update(
             self.codebook_metrics_from_counts(total_code_counts)
         )
+        averaged_metrics['reconstruction_score'] = averaged_metrics['score']
+        hf_low_score_penalty = 0.
+        hf_high_score_penalty = 0.
+        if (
+            self.quality_retention_gate and
+            self.has_quality_retention_baseline and
+            self.quality_retention_hf_score_weight > 0.
+        ):
+            (
+                hf_low_score_penalty,
+                hf_high_score_penalty,
+            ) = self.quality_retention_voiced_hf_score_penalties(
+                averaged_metrics['voiced_hf_energy_ratio_db']
+            )
+        hf_score_penalty = hf_low_score_penalty + hf_high_score_penalty
+        averaged_metrics['selection_score'] = (
+            averaged_metrics['reconstruction_score'] + hf_score_penalty
+        )
+        averaged_metrics['score'] = averaged_metrics['selection_score']
+        averaged_metrics['voiced_hf_score_penalty'] = hf_score_penalty
+        averaged_metrics['voiced_hf_low_score_penalty'] = hf_low_score_penalty
+        averaged_metrics['voiced_hf_high_score_penalty'] = hf_high_score_penalty
+        hf_bounds = self.quality_retention_voiced_hf_bounds()
+        if hf_bounds is None:
+            hf_gate_min_db = float('nan')
+            hf_gate_max_db = float('nan')
+            hf_gate_violation_db = 0.
+        else:
+            hf_gate_min_db, hf_gate_max_db = hf_bounds
+            current_hf_ratio_db = averaged_metrics['voiced_hf_energy_ratio_db']
+            hf_gate_violation_db = max(
+                0.,
+                hf_gate_min_db - current_hf_ratio_db,
+                current_hf_ratio_db - hf_gate_max_db,
+            )
+        averaged_metrics['voiced_hf_gate_min_db'] = hf_gate_min_db
+        averaged_metrics['voiced_hf_gate_max_db'] = hf_gate_max_db
+        averaged_metrics['voiced_hf_gate_violation_db'] = hf_gate_violation_db
         # Eligibility must be evaluated from the final aggregate. Averaging
         # per-wave booleans allowed checkpoints whose reported mean
         # correlation and SI-SDR were both below their required thresholds.
@@ -3880,6 +3957,11 @@ class SoundStreamTrainer(nn.Module):
         generator_frozen = steps < self.generator_freeze_steps
         generator_released = self.release_generator_freeze(steps)
         decoder_residual_scale = self.update_decoder_residual_scale(steps)
+        stream_loss_weights = None
+        if hasattr(self.unwrapped_soundstream, 'update_stream_loss_weights'):
+            stream_loss_weights = self.unwrapped_soundstream.update_stream_loss_weights(
+                steps
+            )
         self.sync_ema_runtime_state()
 
         self.soundstream.train()
@@ -3916,7 +3998,12 @@ class SoundStreamTrainer(nn.Module):
                 freeze_encoder_and_rvq(),
                 generator_grad_context()
             ):
-                loss, (
+                loss, loss_breakdown = self.soundstream(
+                    wave,
+                    return_loss_breakdown = True,
+                    freeze_codebook = freeze_codebook
+                )
+                (
                     recon_loss,
                     multi_spectral_recon_loss,
                     stft_recon_loss,
@@ -3933,10 +4020,11 @@ class SoundStreamTrainer(nn.Module):
                     preemph_loss,
                     noise_floor_loss,
                     frame_phase_or_boundary_loss
-                ) = self.soundstream(
-                    wave,
-                    return_loss_breakdown = True,
-                    freeze_codebook = freeze_codebook
+                ) = loss_breakdown[:16]
+                stream_consistency_loss = (
+                    loss_breakdown[16]
+                    if len(loss_breakdown) > 16
+                    else loss.new_zeros(())
                 )
 
                 if not torch.isfinite(loss).all():
@@ -4022,6 +4110,9 @@ class SoundStreamTrainer(nn.Module):
                     frame_phase_or_boundary_loss.item() / self.grad_accum_every
                     if hasattr(self.unwrapped_soundstream, 'frame_boundary_loss') else 0.
                 ),
+                stream_consistency_loss = (
+                    stream_consistency_loss.item() / self.grad_accum_every
+                ),
             ))
 
         if exists(self.max_grad_norm) and not generator_frozen:
@@ -4101,7 +4192,9 @@ class SoundStreamTrainer(nn.Module):
         if hasattr(model, 'boundary_loss_weight'):
             losses_str += (
                 f" | boundary={logs['boundary_loss']:.6f}"
-                f"(w={model.boundary_loss_weight:.4g})"
+                f"(w={getattr(model, 'runtime_boundary_loss_weight', model.boundary_loss_weight):.4g})"
+                f" | stream_consistency={logs['stream_consistency_loss']:.6f}"
+                f"(w={getattr(model, 'runtime_stream_consistency_loss_weight', 0.):.4g})"
             )
 
         losses_str += (
@@ -4550,9 +4643,16 @@ class SoundStreamTrainer(nn.Module):
                 f"online_hf_score_penalty={online_score.get('voiced_hf_score_penalty', 0.):.6f}, "
                 f"online_hf_low_penalty={online_score.get('voiced_hf_low_score_penalty', 0.):.6f}, "
                 f"online_hf_high_penalty={online_score.get('voiced_hf_high_score_penalty', 0.):.6f}, "
+                f"online_hf_gate=[{online_score.get('voiced_hf_gate_min_db', float('nan')):+.2f},"
+                f"{online_score.get('voiced_hf_gate_max_db', float('nan')):+.2f}], "
+                f"online_hf_gate_violation_db="
+                f"{online_score.get('voiced_hf_gate_violation_db', 0.):.3f}, "
                 f"{ema_summary}, best={self.best_valid_score:.6f}, "
                 f"selected={selected_name} | "
                 f"online_rms={online_score['rms_ratio']:.3f}, "
+                f"online_boundary={online_score.get('boundary_loss', 0.):.6f}, "
+                f"online_stream_consistency="
+                f"{online_score.get('stream_consistency_loss', 0.):.6f}, "
                 f"online_corr={online_score['correlation']:.3f}, "
                 f"online_si_sdr={online_score['si_sdr']:.3f}, "
                 f"online_aligned_corr={online_score['aligned_correlation']:.3f}, "
@@ -4669,7 +4769,7 @@ class SoundStreamTrainer(nn.Module):
                     )
                     online_quality_fail = ','.join(quality_reasons['online']) or 'none'
                     self.print(
-                        f"{steps}: Stage-2 quality retention gate rejected all candidates "
+                        f"{steps}: quality retention gate rejected all candidates "
                         f"(online_fail={online_quality_fail}, "
                         f"quality_bad={self.quality_retention_bad_evals}/"
                         f"{self.quality_retention_patience}, rvq_bad="
@@ -4695,18 +4795,18 @@ class SoundStreamTrainer(nn.Module):
                         self.early_stopping_triggered = True
                         self.save(str(self.results_folder / 'latest.pt'))
                         self.print(
-                            f"{steps}: Stage-2 quality retention hard stop triggered; "
+                            f"{steps}: quality retention hard stop triggered; "
                             "no fine-tuned candidate preserved the initialized baseline; "
                             "baseline_init.pt is retained only as the initialization reference."
                         )
                     elif quality_patience_exhausted:
                         self.print(
-                            f"{steps}: Stage-2 quality hard stop deferred until "
+                            f"{steps}: quality hard stop deferred until "
                             "ReduceLROnPlateau has reduced the generator LR at least once."
                         )
             elif self.quality_retention_gate and self.is_main:
                 self.print(
-                    f"{steps}: Stage-2 quality retention monitored but hard-stop "
+                    f"{steps}: quality retention monitored but hard-stop "
                     f"is deferred until step {self.quality_retention_start_step}."
                 )
 

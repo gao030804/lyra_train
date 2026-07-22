@@ -2295,6 +2295,11 @@ class FrameStreamingSoundStream(SoundStream):
         stream_context_frames = 0,
         boundary_loss_weight = 0.1,
         boundary_loss_radius = 8,
+        boundary_loss_start_steps = 0,
+        boundary_loss_warmup_steps = 0,
+        stream_consistency_loss_weight = 0.,
+        stream_consistency_loss_start_steps = 0,
+        stream_consistency_loss_warmup_steps = 0,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -2302,13 +2307,127 @@ class FrameStreamingSoundStream(SoundStream):
         self.stream_context_frames = stream_context_frames
         self.boundary_loss_weight = boundary_loss_weight
         self.boundary_loss_radius = boundary_loss_radius
+        self.boundary_loss_start_steps = int(boundary_loss_start_steps)
+        self.boundary_loss_warmup_steps = int(boundary_loss_warmup_steps)
+        self.stream_consistency_loss_weight = float(stream_consistency_loss_weight)
+        self.stream_consistency_loss_start_steps = int(stream_consistency_loss_start_steps)
+        self.stream_consistency_loss_warmup_steps = int(stream_consistency_loss_warmup_steps)
+        self.runtime_boundary_loss_weight = (
+            0.
+            if self.boundary_loss_start_steps > 0 or self.boundary_loss_warmup_steps > 0
+            else float(boundary_loss_weight)
+        )
+        self.runtime_stream_consistency_loss_weight = (
+            0.
+            if (
+                self.stream_consistency_loss_start_steps > 0 or
+                self.stream_consistency_loss_warmup_steps > 0
+            )
+            else float(stream_consistency_loss_weight)
+        )
 
         config = pickle.loads(self._configs)
         config['stream_frame_size'] = stream_frame_size
         config['stream_context_frames'] = stream_context_frames
         config['boundary_loss_weight'] = boundary_loss_weight
         config['boundary_loss_radius'] = boundary_loss_radius
+        config['boundary_loss_start_steps'] = boundary_loss_start_steps
+        config['boundary_loss_warmup_steps'] = boundary_loss_warmup_steps
+        config['stream_consistency_loss_weight'] = stream_consistency_loss_weight
+        config['stream_consistency_loss_start_steps'] = stream_consistency_loss_start_steps
+        config['stream_consistency_loss_warmup_steps'] = stream_consistency_loss_warmup_steps
         self._configs = pickle.dumps(config)
+
+    @staticmethod
+    def _scheduled_stream_weight(step, start_steps, warmup_steps, target_weight):
+        if step < start_steps:
+            return 0.
+        if warmup_steps <= 0:
+            return float(target_weight)
+        progress = min(max((step - start_steps) / warmup_steps, 0.), 1.)
+        return float(target_weight) * progress
+
+    def update_stream_loss_weights(self, step):
+        """Update only runtime weights; checkpoint configuration keeps targets."""
+        self.runtime_boundary_loss_weight = self._scheduled_stream_weight(
+            step,
+            self.boundary_loss_start_steps,
+            self.boundary_loss_warmup_steps,
+            self.boundary_loss_weight,
+        )
+        self.runtime_stream_consistency_loss_weight = self._scheduled_stream_weight(
+            step,
+            self.stream_consistency_loss_start_steps,
+            self.stream_consistency_loss_warmup_steps,
+            self.stream_consistency_loss_weight,
+        )
+        return (
+            self.runtime_boundary_loss_weight,
+            self.runtime_stream_consistency_loss_weight,
+        )
+
+    def offline_reconstruction(self, x):
+        """Run the same weights through the full-sequence causal path."""
+        return SoundStream.forward(
+            self,
+            x,
+            return_recons_only = True,
+            freeze_codebook = True,
+        )
+
+    def offline_decode_quantized(self, quantized, is_denoising = None):
+        """Decode an existing latent sequence once through the offline path.
+
+        Reusing the exact latent sequence produced by ``stream_codec`` avoids
+        a second encoder / RVQ call in training.  That both removes needless
+        work and prevents train-mode quantizer behaviour from contaminating a
+        loss whose purpose is to compare the two decoder execution paths.
+        """
+        x = quantized
+        if exists(is_denoising):
+            denoise_input = torch.tensor(
+                [is_denoising, not is_denoising],
+                dtype = x.dtype,
+                device = x.device,
+            )
+            x = self.decoder_film(x, denoise_input)
+        x = rearrange(x, 'b n c -> b c n')
+        return self.decoder(x)
+
+    def stream_consistency_loss(
+        self,
+        x,
+        stream_recon,
+        quantized = None,
+        is_denoising = None,
+    ):
+        if self.stream_consistency_loss_weight <= 0.:
+            return self.zero
+
+        with torch.no_grad():
+            offline_recon = (
+                self.offline_decode_quantized(
+                    quantized,
+                    is_denoising = is_denoising,
+                )
+                if exists(quantized)
+                else self.offline_reconstruction(x)
+            )
+
+        offline_recon = offline_recon[..., :stream_recon.shape[-1]]
+        stream_recon = stream_recon[..., :offline_recon.shape[-1]]
+        # This objective measures implementation consistency, not perceptual
+        # reconstruction quality.  The previous reuse of reconstruction_losses
+        # included a multi-scale log-Mel L2 term.  Tiny near-silence differences
+        # between the offline and stateful paths could therefore produce raw
+        # training losses around 5-15 while validation stayed near 0.04.  A
+        # direct waveform Smooth-L1 is deterministic, robust to isolated
+        # outliers, and keeps train / validation values in the same units.
+        return F.smooth_l1_loss(
+            stream_recon,
+            offline_recon,
+            beta = 0.01,
+        )
 
     def frame_boundary_loss(self, recon_x):
         weight = self.boundary_loss_weight
@@ -2702,6 +2821,12 @@ class FrameStreamingSoundStream(SoundStream):
         )
 
         boundary_loss = self.frame_boundary_loss(recon_x)
+        stream_consistency_loss = self.stream_consistency_loss(
+            orig_x,
+            recon_x,
+            quantized = quantized,
+            is_denoising = is_denoising,
+        )
 
         total_loss = (
             recon_loss * self.recon_loss_weight +
@@ -2719,7 +2844,8 @@ class FrameStreamingSoundStream(SoundStream):
             adversarial_loss * self.adversarial_loss_weight +
             feature_loss * self.feature_loss_weight +
             all_commitment_loss * self.commitment_loss_weight +
-            boundary_loss * self.boundary_loss_weight
+            boundary_loss * self.runtime_boundary_loss_weight +
+            stream_consistency_loss * self.runtime_stream_consistency_loss_weight
         )
 
         if return_loss_breakdown:
@@ -2739,7 +2865,8 @@ class FrameStreamingSoundStream(SoundStream):
                 jump_loss,
                 preemph_loss,
                 noise_floor_loss,
-                boundary_loss
+                boundary_loss,
+                stream_consistency_loss
             )
 
         return total_loss

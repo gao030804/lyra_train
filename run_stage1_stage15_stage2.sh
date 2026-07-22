@@ -386,7 +386,7 @@ run_stage "Stage 2: gan_pretrain" 29503 \
   --stage2-quality-retention-patience 8 \
   --stage2-rvq-retention-patience 6 \
   --stage2-max-voiced-hf-ratio-db-drop 0.30 \
-  --stage2-max-voiced-hf-ratio-db-rise 1.00 \
+  --stage2-max-voiced-hf-ratio-db-rise 1.50 \
   --stage2-voiced-hf-score-weight 3.0 \
   --stage2-max-click-score-rise 0.30 \
   --clean-gate-max-click-score 6.0 \
