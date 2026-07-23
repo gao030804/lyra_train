@@ -29,6 +29,7 @@
 !install_fairseq.cmd
 !run_stages_0_to_4.sh
 !run_stage1_stage15_stage2.sh
+!run_stage25_encoder_refine.sh
 !soundstream_training_network_summary.md
 
 !tools/

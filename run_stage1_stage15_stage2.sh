@@ -342,11 +342,11 @@ run_stage "Stage 2: gan_pretrain" 29503 \
   --best-eval-every 500 \
   --early-stopping-min-steps "$STAGE2_EARLY_STOP_MIN_STEPS" \
   --early-stopping-patience 12 \
-  --si-sdr-loss-weight 0.07 \
+  --si-sdr-loss-weight 0.05 \
   --si-sdr-loss-start-steps 0 \
   --si-sdr-loss-warmup-steps 0 \
   --spectral-envelope-loss-weight 0.05 \
-  --voiced-highband-loss-weight 0.07 \
+  --voiced-highband-loss-weight 0.06 \
   --voiced-highband-energy-deficit-weight 0.40 \
   --voiced-highband-energy-margin-db 0.05 \
   --voiced-hf-retention-loss-weight 0.02 \
@@ -363,7 +363,7 @@ run_stage "Stage 2: gan_pretrain" 29503 \
   --stage2-plateau-patience 8 \
   --stage2-plateau-threshold 0.01 \
   --stage2-plateau-cooldown 2 \
-  --stage2-plateau-min-lr 1e-7 \
+  --stage2-plateau-min-lr 2e-7 \
   --stage2-plateau-discr-min-lr 1e-7 \
   --stage2-plateau-stft-discr-min-lr 1e-7 \
   --waveform-discr-lrs 5e-7 5e-7 2.5e-7 \

@@ -33,7 +33,7 @@ import pytorch_warmup as warmup
 
 from einops import rearrange
 
-from audiolm_pytorch.optimizer import get_optimizer
+from audiolm_pytorch.optimizer import get_optimizer, separate_weight_decayable_params
 import wandb
 from ema_pytorch import EMA
 
@@ -266,6 +266,8 @@ class SoundStreamTrainer(nn.Module):
         train_dataloader: DataLoader | None = None,
         val_dataloader: DataLoader | None = None,
         lr: float = 2e-4,
+        encoder_lr: float | None = None,
+        exclude_rq_from_generator_optimizer: bool = False,
         discr_lr: float | None = None,
         stft_discr_lr: float | None = None,
         waveform_discr_lrs: tuple[float, ...] | None = None,
@@ -357,6 +359,7 @@ class SoundStreamTrainer(nn.Module):
         quality_retention_max_click_score_rise: float = 0.30,
         quality_retention_max_ac320_isolated_rise: float = 0.005,
         quality_retention_max_comb_median_excess_db_rise: float = 0.25,
+        balanced_checkpoint_max_aligned_si_sdr_drop: float = 0.05,
         quality_retention_q00_min_active_ratio: float = 0.70,
         quality_retention_q00_min_perplexity: float = 50.,
         quality_retention_q00_warn_active_ratio: float = 0.80,
@@ -559,6 +562,10 @@ class SoundStreamTrainer(nn.Module):
         self.quality_retention_max_click_score_rise = quality_retention_max_click_score_rise
         self.quality_retention_max_ac320_isolated_rise = quality_retention_max_ac320_isolated_rise
         self.quality_retention_max_comb_median_excess_db_rise = quality_retention_max_comb_median_excess_db_rise
+        assert balanced_checkpoint_max_aligned_si_sdr_drop >= 0.
+        self.balanced_checkpoint_max_aligned_si_sdr_drop = (
+            balanced_checkpoint_max_aligned_si_sdr_drop
+        )
         self.quality_retention_q00_min_active_ratio = quality_retention_q00_min_active_ratio
         self.quality_retention_q00_min_perplexity = quality_retention_q00_min_perplexity
         self.quality_retention_q00_warn_active_ratio = quality_retention_q00_warn_active_ratio
@@ -589,6 +596,7 @@ class SoundStreamTrainer(nn.Module):
             "batch_size": batch_size,
             "gradient_accum_every": grad_accum_every,
             "learning_rate": lr,
+            "encoder_learning_rate": encoder_lr,
             "discriminator_learning_rate": discr_lr,
             "stft_discriminator_learning_rate": stft_discr_lr,
             "target_sample_hz": soundstream.target_sample_hz,
@@ -596,9 +604,78 @@ class SoundStreamTrainer(nn.Module):
 
         # optimizers
 
+        generator_parameters = list(soundstream.non_discr_parameters())
+        rq_parameter_ids = {id(parameter) for parameter in soundstream.rq.parameters()}
+        if exclude_rq_from_generator_optimizer:
+            # Keep the quantizer a differentiable path for Encoder inputs while
+            # preventing parameter-gradient accumulation and optimizer updates.
+            soundstream.rq.requires_grad_(False)
+            generator_parameters = [
+                parameter for parameter in generator_parameters
+                if id(parameter) not in rq_parameter_ids
+            ]
+
+        if exists(encoder_lr):
+            if encoder_lr <= 0.:
+                raise ValueError('encoder_lr must be positive when specified')
+
+            encoder_modules = [soundstream.encoder, soundstream.encoder_film]
+            if exists(soundstream.encoder_attn):
+                encoder_modules.append(soundstream.encoder_attn)
+            encoder_parameter_ids = {
+                id(parameter)
+                for module in encoder_modules
+                for parameter in module.parameters()
+            }
+            encoder_parameters = [
+                parameter for parameter in generator_parameters
+                if id(parameter) in encoder_parameter_ids
+            ]
+            decoder_parameters = [
+                parameter for parameter in generator_parameters
+                if id(parameter) not in encoder_parameter_ids
+            ]
+            if not encoder_parameters or not decoder_parameters:
+                raise RuntimeError(
+                    'separate Encoder/Decoder optimizer groups require both parameter sets'
+                )
+
+            generator_parameter_groups = []
+            for group_name, parameters, group_lr in (
+                ('decoder', decoder_parameters, lr),
+                ('encoder', encoder_parameters, encoder_lr),
+            ):
+                wd_parameters, no_wd_parameters = separate_weight_decayable_params(parameters)
+                if wd_parameters:
+                    generator_parameter_groups.append(dict(
+                        params = wd_parameters,
+                        lr = group_lr,
+                        weight_decay = wd,
+                        group_name = group_name,
+                    ))
+                if no_wd_parameters:
+                    generator_parameter_groups.append(dict(
+                        params = no_wd_parameters,
+                        lr = group_lr,
+                        weight_decay = 0.,
+                        group_name = group_name,
+                    ))
+            generator_optimizer = get_optimizer(
+                generator_parameter_groups,
+                lr = lr,
+                wd = wd,
+                group_wd_params = False,
+            )
+        else:
+            generator_optimizer = get_optimizer(
+                generator_parameters,
+                lr = lr,
+                wd = wd,
+            )
+
         self.optim = OptimizerWithWarmupSchedule(
             self.accelerator,
-            get_optimizer(soundstream.non_discr_parameters(), lr = lr, wd = wd),
+            generator_optimizer,
             scheduler = scheduler,
             scheduler_kwargs = scheduler_kwargs,
             warmup_steps = warmup_steps
@@ -2657,7 +2734,11 @@ class SoundStreamTrainer(nn.Module):
             # baseline. They remain resumable, but cannot claim a balanced best.
             return [*reasons, 'missing_balanced_baseline']
         tolerance = 1e-6
-        if metrics.get('aligned_si_sdr', float('-inf')) < baseline['aligned_si_sdr'] - 0.05 - tolerance:
+        if metrics.get('aligned_si_sdr', float('-inf')) < (
+            baseline['aligned_si_sdr'] -
+            self.balanced_checkpoint_max_aligned_si_sdr_drop -
+            tolerance
+        ):
             reasons.append('balanced_si_sdr')
         if metrics.get('ac_320_isolated', float('inf')) > (
             baseline['ac_320_isolated'] +
@@ -4133,6 +4214,11 @@ class SoundStreamTrainer(nn.Module):
 
         model = self.unwrapped_soundstream
         generator_lr = self.optim.optimizer.param_groups[0]['lr']
+        encoder_generator_lr = next((
+            group['lr']
+            for group in self.optim.optimizer.param_groups
+            if group.get('group_name') == 'encoder'
+        ), generator_lr)
         stft_discriminator_lr = self.discr_optim.optimizer.param_groups[0]['lr']
         waveform_discriminator_lrs = {
             name: optimizer.optimizer.param_groups[0]['lr']
@@ -4143,6 +4229,7 @@ class SoundStreamTrainer(nn.Module):
             stft_discriminator_lr
         )
         logs['lr_g'] = generator_lr
+        logs['lr_g_encoder'] = encoder_generator_lr
         logs['lr_d_stft'] = stft_discriminator_lr
         for index, lr in enumerate(waveform_discriminator_lrs.values()):
             logs[f'lr_d_wave_{index}'] = lr
@@ -4208,6 +4295,7 @@ class SoundStreamTrainer(nn.Module):
             f"gan_ramp={gan_progress:.4f} | "
             f"lr_g_update={generator_update_lr:.3e} | "
             f"lr_g_next={generator_lr:.3e} | "
+            f"lr_g_encoder_next={encoder_generator_lr:.3e} | "
             f"lr_d_stft_update={discriminator_update_lr:.3e} | "
             f"lr_d_stft_next={stft_discriminator_lr:.3e} | "
             f"lr_d_wave_next={waveform_discriminator_lr:.3e}"
@@ -4594,6 +4682,10 @@ class SoundStreamTrainer(nn.Module):
                 ",".join(self.clean_gate_failure_reasons(online_score)) or
                 "none"
             )
+            online_balanced_fail = (
+                ",".join(self.balanced_checkpoint_failure_reasons(online_score)) or
+                "none"
+            )
             ema_clean_fail = (
                 ",".join(self.clean_gate_failure_reasons(ema_score)) or
                 "none"
@@ -4685,6 +4777,7 @@ class SoundStreamTrainer(nn.Module):
                 f"online_click_fail_margin={online_score.get('click_fail_margin', 0.):+.4f}, "
                 f"online_clean_ok={online_score.get('clean_validation_eligible', 0.):.0f}, "
                 f"online_clean_fail={online_clean_fail}, "
+                f"online_balanced_fail={online_balanced_fail}, "
                 f"online_active_codes={online_score['active_code_ratio']:.3f}, "
                 f"online_perplexity={online_score['codebook_perplexity']:.1f}, "
                 f"online_q00_ok={online_score.get('q00_validation_eligible', 0.):.0f}, "

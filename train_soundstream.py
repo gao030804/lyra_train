@@ -159,7 +159,10 @@ STAGE_DEFAULTS = {
         # Preserve the deterministic clarity learned in Stage 1.  Stage 2 GAN
         # gradients may add natural detail, but must not replace the paired
         # voiced high-band objective entirely.
-        voiced_highband_loss_weight=0.07,
+        # Total voiced-band energy is already close to the target in the
+        # latest Stage-2 run.  Keep this as a retention term, but leave more
+        # room for the discriminators to recover fine harmonic texture.
+        voiced_highband_loss_weight=0.06,
         voiced_hf_retention_loss_weight=0.02,
         voiced_highband_loss_start_steps=0,
         voiced_highband_loss_warmup_steps=0,
@@ -169,13 +172,18 @@ STAGE_DEFAULTS = {
         frame_phase_loss_weight=0.,
         frame_phase_loss_start_steps=0,
         frame_phase_loss_warmup_steps=0,
-        si_sdr_loss_weight=0.07,
+        # SI-SDR protects intelligibility and waveform alignment, while the
+        # slightly lower Stage-2 weight avoids over-constraining perceptual
+        # high-frequency detail learned by the GAN.
+        si_sdr_loss_weight=0.05,
         si_sdr_loss_start_steps=0,
         si_sdr_loss_warmup_steps=0,
         # Warm up fresh discriminators against a frozen Stage-1 generator for
-        # 1k steps. Then introduce GAN gradients slowly over 20k steps.
-        gan_start=1_000, gan_ramp=20_000,
-        gan_adversarial_max=2e-4, gan_feature_max=1.25,
+        # 1k steps. Then introduce GAN gradients slowly over 15k steps.  Favor
+        # feature matching over a stronger adversarial term: it is the safer
+        # route to natural detail without raising the learned noise floor.
+        gan_start=1_000, gan_ramp=15_000,
+        gan_adversarial_max=2e-4, gan_feature_max=1.50,
     ),
     "stream_finetune": dict(
         steps=20_000, batch_size=4, segment_seconds=4.,
@@ -602,7 +610,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage2-plateau-min-lr",
         type=float,
-        default=1e-7,
+        default=2e-7,
         help="Minimum Stage-2 generator LR.",
     )
     parser.add_argument(
@@ -944,11 +952,26 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--stage2-targeted-refine",
+        "--stage25-encoder-refine",
+        dest="stage2_targeted_refine",
         action="store_true",
         help=(
-            "Use the conservative 10k decoder-only Stage-2 diagnostic preset: "
-            "fresh discriminators, balanced per-D update rates, and no plateau scheduler."
+            "Run the short Stage-2.5 refinement preset from a Stage-2 checkpoint: "
+            "inherit discriminators, train Decoder at 2e-7 and Encoder at 1e-7, "
+            "keep RVQ frozen, and disable the plateau scheduler."
         ),
+    )
+    parser.add_argument(
+        "--stage25-decoder-lr",
+        type=float,
+        default=2e-7,
+        help="Decoder learning rate for --stage25-encoder-refine.",
+    )
+    parser.add_argument(
+        "--stage25-encoder-lr",
+        type=float,
+        default=1e-7,
+        help="Encoder learning rate for --stage25-encoder-refine.",
     )
     parser.add_argument(
         "--stream-context-frames",
@@ -1348,6 +1371,7 @@ def load_model_weights_only(
         )
     else:
         model.load_state_dict(state_dict, strict=True)
+        print("Loaded complete checkpoint state, including all discriminators.")
     if checkpoint_config and hasattr(model, "restore_decoder_runtime_state"):
         model.restore_decoder_runtime_state(checkpoint_config)
     return checkpoint_config
@@ -1483,46 +1507,42 @@ def main() -> None:
             steps=10_000,
             save_every=1_000,
             eval_every=500,
-            min_steps=10_000,
-            patience=20,
+            min_steps=5_000,
+            patience=12,
             early_stopping_min_delta=0.003,
-            lr=2e-7,
-            discr_lr=1e-6,
+            lr=args.stage25_decoder_lr,
+            encoder_lr=args.stage25_encoder_lr,
+            discr_lr=5e-7,
             stft_discr_lr=2.5e-7,
             waveform_discr_lrs=(5e-7, 5e-7, 2.5e-7),
             waveform_discr_update_every=(2, 4, 4),
             waveform_discr_loss_weights=(1.0, 0.25, 0.25),
             stft_discr_update_every=4,
             stft_discr_loss_weight=0.5,
-            gan_start=1_000,
-            gan_ramp=10_000,
+            gan_start=0,
+            gan_ramp=0,
             gan_adversarial_max=2e-4,
-            gan_feature_max=5.0,
+            gan_feature_max=1.5,
             noise_floor_loss_weight=0.03,
             spectral_envelope_loss_weight=0.05,
-            voiced_highband_loss_weight=0.07,
+            voiced_highband_loss_weight=0.06,
             voiced_hf_retention_loss_weight=0.02,
             frame_phase_loss_weight=0.,
             frame_phase_loss_warmup_steps=0,
-            si_sdr_loss_weight=0.07,
+            si_sdr_loss_weight=0.05,
         )
-        # The targeted preset is decoder-only by design.  Ignore an old launch
-        # argument that would otherwise unfreeze Encoder/RVQ mid-run.
+        # Stage 2.5 trains Encoder and Decoder with separate conservative LRs,
+        # while the RVQ codebook and its EMA/dead-code state remain fixed.
         args.stage2_unfreeze_encoder_rvq_step = -1
-        args.stage2_generator_freeze_steps = 1_000
+        args.stage2_generator_freeze_steps = 0
+        args.stage2_generator_hold_steps = 0
+        args.stage2_discriminator_hold_steps = 0
         args.stage2_discriminator_start_steps = 0
-        args.stage2_max_aligned_si_sdr_drop = min(
-            args.stage2_max_aligned_si_sdr_drop,
-            0.05,
-        )
-        # Keep checkpoint eligibility strict from the beginning, but allow the
-        # diagnostic to reach GAN ramp >= 0.5 before hard-stop patience can end
-        # the whole run.  The trainer's candidate gate remains unchanged.
-        args.stage2_quality_gate_start_steps = 6_000
-        args.stage2_best_checkpoint_min_step = min(
-            args.stage2_best_checkpoint_min_step,
-            1_000,
-        )
+        args.stage2_recon_transition_start_steps = None
+        args.stage2_recon_transition_end_steps = None
+        args.stage2_max_aligned_si_sdr_drop = min(args.stage2_max_aligned_si_sdr_drop, 0.10)
+        args.stage2_quality_gate_start_steps = 1_000
+        args.stage2_best_checkpoint_min_step = 1_000
 
     args.boundary_loss_weight = (
         args.boundary_loss_weight
@@ -1776,6 +1796,15 @@ def main() -> None:
     ):
         if getattr(args, name) < 0:
             raise ValueError(f"--{name.replace('_', '-')} cannot be negative.")
+    if args.stage2_targeted_refine:
+        if stage_defaults["lr"] <= 0:
+            raise ValueError("Stage-2.5 Decoder LR must be positive.")
+        if stage_defaults["encoder_lr"] <= 0:
+            raise ValueError("--stage25-encoder-lr must be positive.")
+        if stage_defaults["encoder_lr"] > stage_defaults["lr"]:
+            raise ValueError(
+                "Stage-2.5 Encoder LR must not exceed the effective Decoder LR."
+            )
     for name in (
         "stage1_rvq_retention_patience",
         "stage2_quality_retention_patience",
@@ -2074,6 +2103,13 @@ def main() -> None:
     print(f"Best eval every: {best_eval_every} steps")
     print(f"Maximum training steps: {num_train_steps}")
     print(f"Generator learning rate: {stage_defaults['lr']}")
+    if args.stage2_targeted_refine:
+        print(
+            "Stage-2.5 optimizer groups: "
+            f"Decoder LR={stage_defaults['lr']:.3e}, "
+            f"Encoder LR={stage_defaults['encoder_lr']:.3e}, "
+            "RVQ excluded from the generator optimizer."
+        )
     if args.stage == "recon_pretrain":
         if stage1_plateau_lr_enabled:
             print(
@@ -2135,21 +2171,29 @@ def main() -> None:
             f"{'/'.join(f'{weight:g}' for weight in waveform_discr_loss_weights)}/"
             f"{stft_discr_loss_weight:g}."
         )
-        print(
-            "Stage-2 retention phase: Generator frozen through step "
-            f"{args.stage2_generator_freeze_steps}; discriminator updates begin at step "
-            f"{args.stage2_discriminator_start_steps if args.stage2_discriminator_start_steps is not None else stage_defaults['gan_start']}. "
-            "Encoder and RVQ are "
-            + (
-                "frozen throughout decoder-only training"
-                if args.stage2_unfreeze_encoder_rvq_step < 0
-                else f"jointly frozen through step {args.stage2_unfreeze_encoder_rvq_step}"
+        if args.stage2_targeted_refine:
+            print(
+                "Stage-2.5 transition: Encoder and Decoder update from step 0; "
+                "RVQ remains frozen; inherited waveform/STFT discriminator weights "
+                "continue from step 0 with fresh optimizer states; GAN weights stay "
+                "at their Stage-2 endpoint values."
             )
-            + "; generator adversarial/feature losses begin after step "
-            f"{stage_defaults['gan_start']}; generator LR releases linearly from "
-            f"{args.stage2_generator_hold_lr:.3e} to {stage_defaults['lr']:.3e} "
-            f"by step {args.stage2_generator_hold_steps}."
-        )
+        else:
+            print(
+                "Stage-2 retention phase: Generator frozen through step "
+                f"{args.stage2_generator_freeze_steps}; discriminator updates begin at step "
+                f"{args.stage2_discriminator_start_steps if args.stage2_discriminator_start_steps is not None else stage_defaults['gan_start']}. "
+                "Encoder and RVQ are "
+                + (
+                    "frozen throughout decoder-only training"
+                    if args.stage2_unfreeze_encoder_rvq_step < 0
+                    else f"jointly frozen through step {args.stage2_unfreeze_encoder_rvq_step}"
+                )
+                + "; generator adversarial/feature losses begin after step "
+                f"{stage_defaults['gan_start']}; generator LR releases linearly from "
+                f"{args.stage2_generator_hold_lr:.3e} to {stage_defaults['lr']:.3e} "
+                f"by step {args.stage2_generator_hold_steps}."
+            )
         if args.stage2_recon_transition_start_steps is None:
             print(
                 "Stage-2 reconstruction weights: fixed for the full run "
@@ -2452,10 +2496,12 @@ def main() -> None:
         decoder_upsample_mode=args.decoder_upsample_mode,
         decoder_residual_scale=decoder_residual_scale_start,
         decoder_linear_upsample_kernel_min=args.decoder_linear_upsample_kernel_min,
-        # With frozen Encoder/RVQ the commitment term has no trainable target.
-        # Restore it automatically if the user explicitly unfreezes that path.
+        # A fixed RVQ still supplies a useful commitment target when Stage 2.5
+        # updates the Encoder. Decoder-only Stage 2 keeps this term disabled.
         commitment_loss_weight=(
-            0.
+            0.1
+            if args.stage2_targeted_refine
+            else 0.
             if (
                 args.stage in ("stream_finetune", "stream_finetune_long") or
                 (
@@ -2490,6 +2536,8 @@ def main() -> None:
         dataset_fixed_crop=(args.stage == "overfit"),
         num_train_steps=num_train_steps,
         lr=stage_defaults["lr"],
+        encoder_lr=stage_defaults.get("encoder_lr"),
+        exclude_rq_from_generator_optimizer=args.stage2_targeted_refine,
         discr_lr=stage_defaults["discr_lr"],
         stft_discr_lr=stft_discr_lr,
         waveform_discr_lrs=waveform_discr_lrs,
@@ -2758,6 +2806,9 @@ def main() -> None:
             if args.stage in ("stream_finetune", "stream_finetune_long")
             else args.stage2_max_comb_median_excess_db_rise
         ),
+        balanced_checkpoint_max_aligned_si_sdr_drop=(
+            0.10 if args.stage2_targeted_refine else 0.05
+        ),
         quality_retention_patience=args.stage2_quality_retention_patience,
         quality_retention_rvq_patience=args.stage2_rvq_retention_patience,
         stage1_rvq_retention_patience=args.stage1_rvq_retention_patience,
@@ -2774,6 +2825,9 @@ def main() -> None:
             num_train_steps + 1
             if args.stage in ("stream_finetune", "stream_finetune_long")
             else
+            None
+            if args.stage2_targeted_refine
+            else
             (
                 num_train_steps + 1
                 if args.stage2_unfreeze_encoder_rvq_step < 0
@@ -2784,6 +2838,7 @@ def main() -> None:
         ),
         freeze_codebook_during_training=(
             args.stage in ("stream_finetune", "stream_finetune_long") or
+            args.stage2_targeted_refine or
             (
                 args.stage == "gan_pretrain" and
                 args.stage2_unfreeze_encoder_rvq_step < 0
@@ -2884,6 +2939,12 @@ def main() -> None:
         }.get(args.stage)
         init_checkpoint = args.init_checkpoint
 
+        if args.stage2_targeted_refine and init_checkpoint is None:
+            raise FileNotFoundError(
+                "--stage25-encoder-refine requires --init-checkpoint pointing "
+                "to a trained Stage-2 checkpoint with discriminator weights."
+            )
+
         if init_checkpoint is None and predecessor_stage is not None:
             predecessor_dir = (
                 args.predecessor_results_dir
@@ -2925,7 +2986,14 @@ def main() -> None:
             checkpoint_config = load_model_weights_only(
                 trainer.unwrapped_soundstream,
                 init_checkpoint,
-                generator_only=(predecessor_stage is not None),
+                # Stage 2.5 is a continuation of an already adversarially
+                # trained Stage-2 model, so its discriminator weights must be
+                # inherited. Other staged transitions intentionally start new
+                # discriminators and load generator weights only.
+                generator_only=(
+                    predecessor_stage is not None and
+                    not args.stage2_targeted_refine
+                ),
             )
             if args.stage in (
                 "spectral_refine",
