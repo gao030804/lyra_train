@@ -268,6 +268,8 @@ class SoundStreamTrainer(nn.Module):
         lr: float = 2e-4,
         encoder_lr: float | None = None,
         exclude_rq_from_generator_optimizer: bool = False,
+        exclude_encoder_from_generator_optimizer: bool = False,
+        exclude_first_decoder_block_from_generator_optimizer: bool = False,
         discr_lr: float | None = None,
         stft_discr_lr: float | None = None,
         waveform_discr_lrs: tuple[float, ...] | None = None,
@@ -323,6 +325,11 @@ class SoundStreamTrainer(nn.Module):
         spectral_envelope_loss_warmup_steps: int = 0,
         voiced_highband_loss_start_steps: int = 0,
         voiced_highband_loss_warmup_steps: int = 0,
+        upper_highband_loss_start_steps: int = 0,
+        upper_highband_loss_warmup_steps: int = 0,
+        active_spectral_detail_loss_start_steps: int = 0,
+        active_spectral_detail_loss_initial_weight: float = 0.,
+        active_spectral_detail_loss_warmup_steps: int = 0,
         stft_recon_loss_start_steps: int = 0,
         stft_recon_loss_warmup_steps: int = 0,
         frame_phase_loss_start_steps: int = 0,
@@ -336,6 +343,7 @@ class SoundStreamTrainer(nn.Module):
         decoder_x8_residual_scale_ramp_steps: int = 0,
         best_checkpoint_min_step: int = 0,
         frame_leakage_checkpoint: bool = False,
+        midband_checkpoint: bool = False,
         clean_gate: bool = True,
         clean_gate_min_aligned_si_sdr: float = 0.,
         clean_gate_min_aligned_corr: float = 0.65,
@@ -359,11 +367,18 @@ class SoundStreamTrainer(nn.Module):
         quality_retention_max_click_score_rise: float = 0.30,
         quality_retention_max_ac320_isolated_rise: float = 0.005,
         quality_retention_max_comb_median_excess_db_rise: float = 0.25,
-        balanced_checkpoint_max_aligned_si_sdr_drop: float = 0.05,
+        balanced_checkpoint_max_aligned_si_sdr_drop: float = 0.10,
+        balanced_checkpoint_min_upper_hf_ratio_db: float | None = None,
+        balanced_checkpoint_max_upper_hf_ratio_db: float | None = None,
+        balanced_checkpoint_max_quiet_upper_hf_excess_db_rise: float = 0.30,
+        quality_retention_upper_hf_score_weight: float = 0.,
+        quality_retention_active_spectral_score_weight: float = 0.,
         quality_retention_q00_min_active_ratio: float = 0.70,
         quality_retention_q00_min_perplexity: float = 50.,
         quality_retention_q00_warn_active_ratio: float = 0.80,
         quality_retention_q00_warn_perplexity: float = 70.,
+        quality_retention_max_q00_active_ratio_drop: float | None = None,
+        quality_retention_max_q00_perplexity_fraction_drop: float | None = None,
         quality_retention_patience: int = 3,
         quality_retention_rvq_patience: int = 2,
         stage1_rvq_retention_patience: int = 8,
@@ -381,6 +396,7 @@ class SoundStreamTrainer(nn.Module):
         freeze_codebook_before_step: int | None = None,
         freeze_codebook_during_training: bool = False,
         freeze_encoder_before_step: int | None = None,
+        freeze_decoder_before_step: int | None = None,
         log_losses_every: int = 1,
         results_folder: str = './results',
         valid_frac: float = 0.05,
@@ -462,8 +478,30 @@ class SoundStreamTrainer(nn.Module):
         self.voiced_highband_loss_max_weight = float(
             getattr(soundstream, 'voiced_highband_loss_weight', 0.)
         )
+        self.upper_highband_loss_max_weight = float(
+            getattr(soundstream, 'upper_highband_loss_weight', 0.)
+        )
         self.voiced_highband_loss_start_steps = voiced_highband_loss_start_steps
         self.voiced_highband_loss_warmup_steps = voiced_highband_loss_warmup_steps
+        self.upper_highband_loss_start_steps = upper_highband_loss_start_steps
+        self.upper_highband_loss_warmup_steps = upper_highband_loss_warmup_steps
+        self.active_spectral_detail_loss_max_weight = float(
+            getattr(soundstream, 'active_spectral_detail_loss_weight', 0.)
+        )
+        assert 0. <= active_spectral_detail_loss_initial_weight
+        assert (
+            active_spectral_detail_loss_initial_weight <=
+            self.active_spectral_detail_loss_max_weight
+        )
+        self.active_spectral_detail_loss_initial_weight = float(
+            active_spectral_detail_loss_initial_weight
+        )
+        self.active_spectral_detail_loss_start_steps = (
+            active_spectral_detail_loss_start_steps
+        )
+        self.active_spectral_detail_loss_warmup_steps = (
+            active_spectral_detail_loss_warmup_steps
+        )
         self.stft_recon_loss_max_weight = float(
             getattr(soundstream, 'stft_recon_loss_weight', 0.)
         )
@@ -512,6 +550,7 @@ class SoundStreamTrainer(nn.Module):
         )
         self.best_checkpoint_min_step = best_checkpoint_min_step
         self.frame_leakage_checkpoint = frame_leakage_checkpoint
+        self.midband_checkpoint = midband_checkpoint
         self.clean_gate = clean_gate
         self.clean_gate_min_aligned_si_sdr = clean_gate_min_aligned_si_sdr
         self.clean_gate_min_aligned_corr = clean_gate_min_aligned_corr
@@ -544,10 +583,29 @@ class SoundStreamTrainer(nn.Module):
         assert quality_retention_max_click_score_rise >= 0.
         assert quality_retention_max_ac320_isolated_rise >= 0.
         assert quality_retention_max_comb_median_excess_db_rise >= 0.
+        assert quality_retention_upper_hf_score_weight >= 0.
+        assert quality_retention_active_spectral_score_weight >= 0.
+        assert balanced_checkpoint_max_quiet_upper_hf_excess_db_rise >= 0.
+        if (
+            exists(balanced_checkpoint_min_upper_hf_ratio_db) and
+            exists(balanced_checkpoint_max_upper_hf_ratio_db)
+        ):
+            assert (
+                balanced_checkpoint_min_upper_hf_ratio_db <
+                balanced_checkpoint_max_upper_hf_ratio_db
+            )
         assert 0. <= quality_retention_q00_min_active_ratio <= 1.
         assert quality_retention_q00_min_perplexity >= 0.
         assert 0. <= quality_retention_q00_warn_active_ratio <= 1.
         assert quality_retention_q00_warn_perplexity >= 0.
+        assert (
+            not exists(quality_retention_max_q00_active_ratio_drop) or
+            0. <= quality_retention_max_q00_active_ratio_drop <= 1.
+        )
+        assert (
+            not exists(quality_retention_max_q00_perplexity_fraction_drop) or
+            0. <= quality_retention_max_q00_perplexity_fraction_drop < 1.
+        )
         assert quality_retention_patience > 0
         assert quality_retention_rvq_patience > 0
         assert quality_retention_hf_score_weight >= 0.
@@ -562,14 +620,35 @@ class SoundStreamTrainer(nn.Module):
         self.quality_retention_max_click_score_rise = quality_retention_max_click_score_rise
         self.quality_retention_max_ac320_isolated_rise = quality_retention_max_ac320_isolated_rise
         self.quality_retention_max_comb_median_excess_db_rise = quality_retention_max_comb_median_excess_db_rise
+        self.quality_retention_upper_hf_score_weight = (
+            quality_retention_upper_hf_score_weight
+        )
+        self.quality_retention_active_spectral_score_weight = (
+            quality_retention_active_spectral_score_weight
+        )
         assert balanced_checkpoint_max_aligned_si_sdr_drop >= 0.
         self.balanced_checkpoint_max_aligned_si_sdr_drop = (
             balanced_checkpoint_max_aligned_si_sdr_drop
+        )
+        self.balanced_checkpoint_min_upper_hf_ratio_db = (
+            balanced_checkpoint_min_upper_hf_ratio_db
+        )
+        self.balanced_checkpoint_max_upper_hf_ratio_db = (
+            balanced_checkpoint_max_upper_hf_ratio_db
+        )
+        self.balanced_checkpoint_max_quiet_upper_hf_excess_db_rise = (
+            balanced_checkpoint_max_quiet_upper_hf_excess_db_rise
         )
         self.quality_retention_q00_min_active_ratio = quality_retention_q00_min_active_ratio
         self.quality_retention_q00_min_perplexity = quality_retention_q00_min_perplexity
         self.quality_retention_q00_warn_active_ratio = quality_retention_q00_warn_active_ratio
         self.quality_retention_q00_warn_perplexity = quality_retention_q00_warn_perplexity
+        self.quality_retention_max_q00_active_ratio_drop = (
+            quality_retention_max_q00_active_ratio_drop
+        )
+        self.quality_retention_max_q00_perplexity_fraction_drop = (
+            quality_retention_max_q00_perplexity_fraction_drop
+        )
         self.quality_retention_patience = quality_retention_patience
         self.quality_retention_rvq_patience = quality_retention_rvq_patience
         self.quality_retention_baseline = None
@@ -597,10 +676,23 @@ class SoundStreamTrainer(nn.Module):
             "gradient_accum_every": grad_accum_every,
             "learning_rate": lr,
             "encoder_learning_rate": encoder_lr,
+            "rq_excluded_from_generator_optimizer": exclude_rq_from_generator_optimizer,
+            "encoder_excluded_from_generator_optimizer": (
+                exclude_encoder_from_generator_optimizer
+            ),
+            "first_decoder_block_excluded_from_generator_optimizer": (
+                exclude_first_decoder_block_from_generator_optimizer
+            ),
             "discriminator_learning_rate": discr_lr,
             "stft_discriminator_learning_rate": stft_discr_lr,
             "target_sample_hz": soundstream.target_sample_hz,
         }
+        self.encoder_excluded_from_generator_optimizer = bool(
+            exclude_encoder_from_generator_optimizer
+        )
+        self.first_decoder_block_excluded_from_generator_optimizer = bool(
+            exclude_first_decoder_block_from_generator_optimizer
+        )
 
         # optimizers
 
@@ -615,18 +707,57 @@ class SoundStreamTrainer(nn.Module):
                 if id(parameter) not in rq_parameter_ids
             ]
 
+        encoder_modules = [soundstream.encoder, soundstream.encoder_film]
+        if exists(soundstream.encoder_attn):
+            encoder_modules.append(soundstream.encoder_attn)
+        encoder_parameter_ids = {
+            id(parameter)
+            for module in encoder_modules
+            for parameter in module.parameters()
+        }
+        if exclude_encoder_from_generator_optimizer:
+            for module in encoder_modules:
+                module.requires_grad_(False)
+            generator_parameters = [
+                parameter for parameter in generator_parameters
+                if id(parameter) not in encoder_parameter_ids
+            ]
+            if exists(encoder_lr):
+                raise ValueError(
+                    "encoder_lr must be None when Encoder is excluded from "
+                    "the generator optimizer"
+                )
+            if not generator_parameters:
+                raise RuntimeError(
+                    "Decoder-only optimizer has no trainable parameters."
+                )
+
+        if exclude_first_decoder_block_from_generator_optimizer:
+            decoder = soundstream.decoder
+            if not isinstance(decoder, nn.Sequential) or len(decoder) < 3:
+                raise RuntimeError(
+                    "Cannot freeze the first decoder upsampling block: "
+                    "expected decoder to be a Sequential with input, upsample, "
+                    "and output modules."
+                )
+            first_decoder_block = decoder[1]
+            first_decoder_parameter_ids = {
+                id(parameter) for parameter in first_decoder_block.parameters()
+            }
+            if not first_decoder_parameter_ids:
+                raise RuntimeError(
+                    "First decoder upsampling block has no parameters to freeze."
+                )
+            first_decoder_block.requires_grad_(False)
+            generator_parameters = [
+                parameter for parameter in generator_parameters
+                if id(parameter) not in first_decoder_parameter_ids
+            ]
+
         if exists(encoder_lr):
             if encoder_lr <= 0.:
                 raise ValueError('encoder_lr must be positive when specified')
 
-            encoder_modules = [soundstream.encoder, soundstream.encoder_film]
-            if exists(soundstream.encoder_attn):
-                encoder_modules.append(soundstream.encoder_attn)
-            encoder_parameter_ids = {
-                id(parameter)
-                for module in encoder_modules
-                for parameter in module.parameters()
-            }
             encoder_parameters = [
                 parameter for parameter in generator_parameters
                 if id(parameter) in encoder_parameter_ids
@@ -1064,6 +1195,7 @@ class SoundStreamTrainer(nn.Module):
         self.best_raw_online_clarity_score = float('-inf')
         self.best_clean_online_clarity_score = float('-inf')
         self.best_frame_leakage_score = float('inf')
+        self.best_midband_score = float('inf')
         self.best_balanced_score = float('inf')
         self.best_gan_balanced_score = float('inf')
         self.best_full_gan_balanced_score = float('inf')
@@ -1102,10 +1234,12 @@ class SoundStreamTrainer(nn.Module):
         assert not exists(freeze_codebook_after_step) or freeze_codebook_after_step >= 0
         assert not exists(freeze_codebook_before_step) or freeze_codebook_before_step >= 0
         assert not exists(freeze_encoder_before_step) or freeze_encoder_before_step >= 0
+        assert not exists(freeze_decoder_before_step) or freeze_decoder_before_step >= 0
         self.freeze_codebook_after_step = freeze_codebook_after_step
         self.freeze_codebook_before_step = freeze_codebook_before_step
         self.freeze_codebook_during_training = freeze_codebook_during_training
         self.freeze_encoder_before_step = freeze_encoder_before_step
+        self.freeze_decoder_before_step = freeze_decoder_before_step
 
         assert apply_grad_penalty_every >= 0
         assert waveform_grad_penalty_gamma >= 0.
@@ -1178,6 +1312,8 @@ class SoundStreamTrainer(nn.Module):
             'si_sdr_loss_weight',
             'spectral_envelope_loss_weight',
             'voiced_highband_loss_weight',
+            'upper_highband_loss_weight',
+            'active_spectral_detail_loss_weight',
             'stft_recon_loss_weight',
             'frame_phase_loss_weight',
             'click_loss_weight',
@@ -1212,6 +1348,7 @@ class SoundStreamTrainer(nn.Module):
             best_raw_online_clarity_score = self.best_raw_online_clarity_score,
             best_clean_online_clarity_score = self.best_clean_online_clarity_score,
             best_frame_leakage_score = self.best_frame_leakage_score,
+            best_midband_score = self.best_midband_score,
             best_balanced_score = self.best_balanced_score,
             best_gan_balanced_score = self.best_gan_balanced_score,
             best_full_gan_balanced_score = self.best_full_gan_balanced_score,
@@ -1357,6 +1494,15 @@ class SoundStreamTrainer(nn.Module):
             self.best_frame_leakage_score = min(
                 self.best_frame_leakage_score,
                 best_frame_leakage_score
+            )
+
+        best_midband_score = self.saved_model_only_score(
+            self.results_folder / 'best_by_midband.pt'
+        )
+        if exists(best_midband_score):
+            self.best_midband_score = min(
+                self.best_midband_score,
+                best_midband_score,
             )
 
         best_balanced_score = self.saved_model_only_score(
@@ -1816,8 +1962,17 @@ class SoundStreamTrainer(nn.Module):
             voiced_hf_energy_deficit,
             spectral_centroid_delta_hz,
             spectral_slope_delta,
-            voiced_hf_retention_loss
+            voiced_hf_retention_loss,
+            upper_highband_loss,
+            voiced_upper_logmag_error,
+            voiced_upper_energy_deficit,
+            voiced_upper_energy_ratio_db,
+            quiet_upper_excess_db
         ) = model.voiced_highband_metrics(target, recon)
+        (
+            active_spectral_detail_loss,
+            active_spectral_band_metrics
+        ) = model.active_spectral_detail_metrics(target, recon)
         _, quiet_hf_excess_db = model.quiet_multiband_noise_metrics(
             target,
             recon
@@ -1928,6 +2083,59 @@ class SoundStreamTrainer(nn.Module):
             voiced_hf_logmag_error = float(voiced_hf_logmag_error.detach().cpu()),
             voiced_hf_energy_deficit = float(voiced_hf_energy_deficit.detach().cpu()),
             voiced_hf_retention_loss = float(voiced_hf_retention_loss.detach().cpu()),
+            upper_highband_loss = float(upper_highband_loss.detach().cpu()),
+            voiced_7k_7p8k_logmag_error = float(voiced_upper_logmag_error.detach().cpu()),
+            voiced_7k_7p8k_energy_deficit = float(voiced_upper_energy_deficit.detach().cpu()),
+            voiced_7k_7p8k_ratio_db = float(voiced_upper_energy_ratio_db.detach().cpu()),
+            quiet_7k_7p8k_excess_db = float(quiet_upper_excess_db.detach().cpu()),
+            active_spectral_detail_loss = float(
+                active_spectral_detail_loss.detach().cpu()
+            ),
+            active_spec_200_1k_logmag_error = float(
+                active_spectral_band_metrics['200_1k'][0].detach().cpu()
+            ),
+            active_spec_200_1k_energy_ratio_db = float(
+                active_spectral_band_metrics['200_1k'][1].detach().cpu()
+            ),
+            active_spec_200_1k_spectral_convergence = float(
+                active_spectral_band_metrics['200_1k'][2].detach().cpu()
+            ),
+            active_spec_1k_3k_logmag_error = float(
+                active_spectral_band_metrics['1k_3k'][0].detach().cpu()
+            ),
+            active_spec_1k_3k_energy_ratio_db = float(
+                active_spectral_band_metrics['1k_3k'][1].detach().cpu()
+            ),
+            active_spec_1k_3k_spectral_convergence = float(
+                active_spectral_band_metrics['1k_3k'][2].detach().cpu()
+            ),
+            active_spec_3k_5k_logmag_error = float(
+                active_spectral_band_metrics['3k_5k'][0].detach().cpu()
+            ),
+            active_spec_3k_5k_energy_ratio_db = float(
+                active_spectral_band_metrics['3k_5k'][1].detach().cpu()
+            ),
+            active_spec_3k_5k_spectral_convergence = float(
+                active_spectral_band_metrics['3k_5k'][2].detach().cpu()
+            ),
+            active_spec_5k_7k_logmag_error = float(
+                active_spectral_band_metrics['5k_7k'][0].detach().cpu()
+            ),
+            active_spec_5k_7k_energy_ratio_db = float(
+                active_spectral_band_metrics['5k_7k'][1].detach().cpu()
+            ),
+            active_spec_5k_7k_spectral_convergence = float(
+                active_spectral_band_metrics['5k_7k'][2].detach().cpu()
+            ),
+            active_spec_7k_7p8k_logmag_error = float(
+                active_spectral_band_metrics['7k_7p8k'][0].detach().cpu()
+            ),
+            active_spec_7k_7p8k_energy_ratio_db = float(
+                active_spectral_band_metrics['7k_7p8k'][1].detach().cpu()
+            ),
+            active_spec_7k_7p8k_spectral_convergence = float(
+                active_spectral_band_metrics['7k_7p8k'][2].detach().cpu()
+            ),
             spectral_centroid_delta_hz = float(spectral_centroid_delta_hz.detach().cpu()),
             spectral_slope_delta = float(spectral_slope_delta.detach().cpu()),
             quiet_hf_excess_db = float(quiet_hf_excess_db.detach().cpu()),
@@ -2285,6 +2493,8 @@ class SoundStreamTrainer(nn.Module):
         hf_score_penalty = 0.
         hf_low_score_penalty = 0.
         hf_high_score_penalty = 0.
+        upper_hf_low_score_penalty = 0.
+        upper_hf_high_score_penalty = 0.
         if (
             apply_quality_retention_penalty and
             self.quality_retention_gate and
@@ -2298,11 +2508,41 @@ class SoundStreamTrainer(nn.Module):
                 averaged_metrics['voiced_hf_energy_ratio_db']
             )
             hf_score_penalty = hf_low_score_penalty + hf_high_score_penalty
-            averaged_metrics['score'] += hf_score_penalty
+        if (
+            apply_quality_retention_penalty and
+            self.quality_retention_gate and
+            self.quality_retention_upper_hf_score_weight > 0.
+        ):
+            (
+                upper_hf_low_score_penalty,
+                upper_hf_high_score_penalty,
+            ) = self.quality_retention_upper_hf_score_penalties(
+                averaged_metrics['voiced_7k_7p8k_ratio_db']
+            )
+        upper_hf_score_penalty = (
+            upper_hf_low_score_penalty + upper_hf_high_score_penalty
+        )
+        active_spectral_score_penalty = (
+            self.quality_retention_active_spectral_score_weight *
+            averaged_metrics.get('active_spectral_detail_loss', 0.)
+            if apply_quality_retention_penalty
+            else 0.
+        )
+        averaged_metrics['score'] += (
+            hf_score_penalty +
+            upper_hf_score_penalty +
+            active_spectral_score_penalty
+        )
         averaged_metrics['selection_score'] = averaged_metrics['score']
         averaged_metrics['voiced_hf_score_penalty'] = hf_score_penalty
         averaged_metrics['voiced_hf_low_score_penalty'] = hf_low_score_penalty
         averaged_metrics['voiced_hf_high_score_penalty'] = hf_high_score_penalty
+        averaged_metrics['upper_hf_score_penalty'] = upper_hf_score_penalty
+        averaged_metrics['upper_hf_low_score_penalty'] = upper_hf_low_score_penalty
+        averaged_metrics['upper_hf_high_score_penalty'] = upper_hf_high_score_penalty
+        averaged_metrics['active_spectral_score_penalty'] = (
+            active_spectral_score_penalty
+        )
         hf_bounds = (
             self.quality_retention_voiced_hf_bounds()
             if apply_quality_retention_penalty
@@ -2323,6 +2563,30 @@ class SoundStreamTrainer(nn.Module):
         averaged_metrics['voiced_hf_gate_min_db'] = hf_gate_min_db
         averaged_metrics['voiced_hf_gate_max_db'] = hf_gate_max_db
         averaged_metrics['voiced_hf_gate_violation_db'] = hf_gate_violation_db
+        upper_hf_bounds = (
+            self.upper_hf_score_bounds()
+            if apply_quality_retention_penalty
+            else None
+        )
+        if upper_hf_bounds is None:
+            upper_hf_gate_min_db = float('nan')
+            upper_hf_gate_max_db = float('nan')
+            upper_hf_gate_violation_db = 0.
+        else:
+            upper_hf_gate_min_db, upper_hf_gate_max_db = upper_hf_bounds
+            current_upper_hf_ratio_db = averaged_metrics[
+                'voiced_7k_7p8k_ratio_db'
+            ]
+            upper_hf_gate_violation_db = max(
+                0.,
+                upper_hf_gate_min_db - current_upper_hf_ratio_db,
+                current_upper_hf_ratio_db - upper_hf_gate_max_db,
+            )
+        averaged_metrics['upper_hf_gate_min_db'] = upper_hf_gate_min_db
+        averaged_metrics['upper_hf_gate_max_db'] = upper_hf_gate_max_db
+        averaged_metrics['upper_hf_gate_violation_db'] = (
+            upper_hf_gate_violation_db
+        )
         averaged_metrics['code_counts'] = total_code_counts.detach().cpu()
         averaged_metrics['num_samples'] = total_samples
         return averaged_metrics
@@ -2692,6 +2956,14 @@ class SoundStreamTrainer(nn.Module):
         self.quality_retention_baseline = {
             key: float(metrics[key]) for key in required
         }
+        for key in (
+            'voiced_7k_7p8k_ratio_db',
+            'quiet_7k_7p8k_excess_db',
+            'codebook_q00_active_ratio',
+            'codebook_q00_perplexity',
+        ):
+            if key in metrics:
+                self.quality_retention_baseline[key] = float(metrics[key])
         if 'score' in metrics:
             self.quality_retention_baseline['score'] = float(metrics['score'])
         self.quality_retention_bad_evals = 0
@@ -2719,6 +2991,23 @@ class SoundStreamTrainer(nn.Module):
         shortfall_db = max(0., minimum_ratio - current_ratio)
         excess_db = max(0., current_ratio - maximum_ratio)
         weight = self.quality_retention_hf_score_weight
+        return weight * shortfall_db ** 2, weight * excess_db ** 2
+
+    def upper_hf_score_bounds(self):
+        minimum = self.balanced_checkpoint_min_upper_hf_ratio_db
+        maximum = self.balanced_checkpoint_max_upper_hf_ratio_db
+        if not exists(minimum) or not exists(maximum):
+            return None
+        return minimum, maximum
+
+    def quality_retention_upper_hf_score_penalties(self, current_ratio):
+        bounds = self.upper_hf_score_bounds()
+        if bounds is None or self.quality_retention_upper_hf_score_weight <= 0.:
+            return 0., 0.
+        minimum_ratio, maximum_ratio = bounds
+        shortfall_db = max(0., minimum_ratio - current_ratio)
+        excess_db = max(0., current_ratio - maximum_ratio)
+        weight = self.quality_retention_upper_hf_score_weight
         return weight * shortfall_db ** 2, weight * excess_db ** 2
 
     def balanced_checkpoint_failure_reasons(self, metrics):
@@ -2752,6 +3041,28 @@ class SoundStreamTrainer(nn.Module):
             tolerance
         ):
             reasons.append('balanced_comb')
+        upper_bounds = self.upper_hf_score_bounds()
+        if upper_bounds is not None:
+            minimum_upper_ratio, maximum_upper_ratio = upper_bounds
+            upper_ratio = metrics.get(
+                'voiced_7k_7p8k_ratio_db',
+                float('-inf')
+            )
+            if upper_ratio < minimum_upper_ratio - tolerance:
+                reasons.append('balanced_upper_hf_low')
+            if upper_ratio > maximum_upper_ratio + tolerance:
+                reasons.append('balanced_upper_hf_high')
+            baseline_quiet_upper = baseline.get(
+                'quiet_7k_7p8k_excess_db'
+            )
+            if baseline_quiet_upper is None:
+                reasons.append('missing_upper_hf_baseline')
+            elif metrics.get('quiet_7k_7p8k_excess_db', float('inf')) > (
+                baseline_quiet_upper +
+                self.balanced_checkpoint_max_quiet_upper_hf_excess_db_rise +
+                tolerance
+            ):
+                reasons.append('balanced_quiet_upper_hf')
         return reasons
 
     def quality_retention_failure_reasons(self, metrics):
@@ -2815,6 +3126,33 @@ class SoundStreamTrainer(nn.Module):
             self.quality_retention_q00_min_perplexity
         ):
             reasons.append('q00')
+        baseline_q00_active = baseline.get('codebook_q00_active_ratio')
+        if (
+            exists(self.quality_retention_max_q00_active_ratio_drop) and
+            exists(baseline_q00_active) and
+            metrics.get('codebook_q00_active_ratio', 0.) < (
+                baseline_q00_active -
+                self.quality_retention_max_q00_active_ratio_drop -
+                tolerance
+            )
+        ):
+            reasons.append('q00_active_drop')
+        baseline_q00_perplexity = baseline.get('codebook_q00_perplexity')
+        if (
+            exists(
+                self.quality_retention_max_q00_perplexity_fraction_drop
+            ) and
+            exists(baseline_q00_perplexity) and
+            metrics.get('codebook_q00_perplexity', 0.) < (
+                baseline_q00_perplexity *
+                (
+                    1. -
+                    self.quality_retention_max_q00_perplexity_fraction_drop
+                )
+                - tolerance
+            )
+        ):
+            reasons.append('q00_perplexity_drop')
         if metrics.get('q01_validation_eligible', 0.) < 0.5:
             reasons.append('q01')
         return reasons
@@ -2845,6 +3183,8 @@ class SoundStreamTrainer(nn.Module):
         averaged_metrics['reconstruction_score'] = averaged_metrics['score']
         hf_low_score_penalty = 0.
         hf_high_score_penalty = 0.
+        upper_hf_low_score_penalty = 0.
+        upper_hf_high_score_penalty = 0.
         if (
             self.quality_retention_gate and
             self.has_quality_retention_baseline and
@@ -2857,13 +3197,39 @@ class SoundStreamTrainer(nn.Module):
                 averaged_metrics['voiced_hf_energy_ratio_db']
             )
         hf_score_penalty = hf_low_score_penalty + hf_high_score_penalty
+        if (
+            self.quality_retention_gate and
+            self.quality_retention_upper_hf_score_weight > 0.
+        ):
+            (
+                upper_hf_low_score_penalty,
+                upper_hf_high_score_penalty,
+            ) = self.quality_retention_upper_hf_score_penalties(
+                averaged_metrics['voiced_7k_7p8k_ratio_db']
+            )
+        upper_hf_score_penalty = (
+            upper_hf_low_score_penalty + upper_hf_high_score_penalty
+        )
+        active_spectral_score_penalty = (
+            self.quality_retention_active_spectral_score_weight *
+            averaged_metrics.get('active_spectral_detail_loss', 0.)
+        )
         averaged_metrics['selection_score'] = (
-            averaged_metrics['reconstruction_score'] + hf_score_penalty
+            averaged_metrics['reconstruction_score'] +
+            hf_score_penalty +
+            upper_hf_score_penalty +
+            active_spectral_score_penalty
         )
         averaged_metrics['score'] = averaged_metrics['selection_score']
         averaged_metrics['voiced_hf_score_penalty'] = hf_score_penalty
         averaged_metrics['voiced_hf_low_score_penalty'] = hf_low_score_penalty
         averaged_metrics['voiced_hf_high_score_penalty'] = hf_high_score_penalty
+        averaged_metrics['upper_hf_score_penalty'] = upper_hf_score_penalty
+        averaged_metrics['upper_hf_low_score_penalty'] = upper_hf_low_score_penalty
+        averaged_metrics['upper_hf_high_score_penalty'] = upper_hf_high_score_penalty
+        averaged_metrics['active_spectral_score_penalty'] = (
+            active_spectral_score_penalty
+        )
         hf_bounds = self.quality_retention_voiced_hf_bounds()
         if hf_bounds is None:
             hf_gate_min_db = float('nan')
@@ -2880,6 +3246,26 @@ class SoundStreamTrainer(nn.Module):
         averaged_metrics['voiced_hf_gate_min_db'] = hf_gate_min_db
         averaged_metrics['voiced_hf_gate_max_db'] = hf_gate_max_db
         averaged_metrics['voiced_hf_gate_violation_db'] = hf_gate_violation_db
+        upper_hf_bounds = self.upper_hf_score_bounds()
+        if upper_hf_bounds is None:
+            upper_hf_gate_min_db = float('nan')
+            upper_hf_gate_max_db = float('nan')
+            upper_hf_gate_violation_db = 0.
+        else:
+            upper_hf_gate_min_db, upper_hf_gate_max_db = upper_hf_bounds
+            current_upper_hf_ratio_db = averaged_metrics[
+                'voiced_7k_7p8k_ratio_db'
+            ]
+            upper_hf_gate_violation_db = max(
+                0.,
+                upper_hf_gate_min_db - current_upper_hf_ratio_db,
+                current_upper_hf_ratio_db - upper_hf_gate_max_db,
+            )
+        averaged_metrics['upper_hf_gate_min_db'] = upper_hf_gate_min_db
+        averaged_metrics['upper_hf_gate_max_db'] = upper_hf_gate_max_db
+        averaged_metrics['upper_hf_gate_violation_db'] = (
+            upper_hf_gate_violation_db
+        )
         # Eligibility must be evaluated from the final aggregate. Averaging
         # per-wave booleans allowed checkpoints whose reported mean
         # correlation and SI-SDR were both below their required thresholds.
@@ -3234,6 +3620,7 @@ class SoundStreamTrainer(nn.Module):
             float('-inf')
         )
         self.best_frame_leakage_score = pkg.get('best_frame_leakage_score', float('inf'))
+        self.best_midband_score = pkg.get('best_midband_score', float('inf'))
         self.best_balanced_score = pkg.get('best_balanced_score', float('inf'))
         self.best_gan_balanced_score = pkg.get('best_gan_balanced_score', float('inf'))
         self.best_full_gan_balanced_score = pkg.get(
@@ -3417,14 +3804,49 @@ class SoundStreamTrainer(nn.Module):
 
     def update_voiced_highband_loss_weight(self, steps):
         model = self.unwrapped_soundstream
-        weight, progress = self.scheduled_loss_weight(
+        weight, voiced_progress = self.scheduled_loss_weight(
             steps,
             self.voiced_highband_loss_start_steps,
             self.voiced_highband_loss_warmup_steps,
             self.voiced_highband_loss_max_weight
         )
         model.voiced_highband_loss_weight = weight
-        return progress
+        (
+            model.upper_highband_loss_weight,
+            upper_progress
+        ) = self.scheduled_loss_weight(
+            steps,
+            self.upper_highband_loss_start_steps,
+            self.upper_highband_loss_warmup_steps,
+            self.upper_highband_loss_max_weight
+        )
+        (
+            model.active_spectral_detail_loss_weight,
+            active_detail_progress
+        ) = self.scheduled_loss_weight_from_initial(
+            steps,
+            self.active_spectral_detail_loss_start_steps,
+            self.active_spectral_detail_loss_warmup_steps,
+            self.active_spectral_detail_loss_initial_weight,
+            self.active_spectral_detail_loss_max_weight
+        )
+        return voiced_progress, upper_progress, active_detail_progress
+
+    @staticmethod
+    def scheduled_loss_weight_from_initial(
+        steps,
+        start_steps,
+        warmup_steps,
+        initial_weight,
+        max_weight,
+    ):
+        if max_weight <= 0 or steps < start_steps:
+            return 0., 0.
+        progress = 1. if warmup_steps <= 0 else min(
+            1., max(0., (steps - start_steps) / warmup_steps)
+        )
+        weight = initial_weight + (max_weight - initial_weight) * progress
+        return weight, progress
 
     @staticmethod
     def scheduled_loss_weight(steps, start_steps, warmup_steps, max_weight):
@@ -3434,6 +3856,15 @@ class SoundStreamTrainer(nn.Module):
             1., max(0., (steps - start_steps) / warmup_steps)
         )
         return max_weight * progress, progress
+
+    @staticmethod
+    def midband_checkpoint_score(metrics):
+        return (
+            metrics.get('reconstruction_score', metrics['score']) +
+            0.10 * metrics.get('active_spec_200_1k_logmag_error', 0.) +
+            0.15 * metrics.get('active_spec_1k_3k_logmag_error', 0.) +
+            0.05 * metrics.get('active_spec_3k_5k_logmag_error', 0.)
+        )
 
     def update_spectral_refinement_weights(self, steps):
         model = self.unwrapped_soundstream
@@ -3987,6 +4418,35 @@ class SoundStreamTrainer(nn.Module):
             for parameter, requires_grad in zip(parameters, original_requires_grad):
                 parameter.requires_grad_(requires_grad)
 
+    @contextmanager
+    def frozen_decoder_stack(self):
+        """Temporarily update Encoder/RVQ while keeping all Decoder modules fixed."""
+        model = self.unwrapped_soundstream
+        modules = [
+            getattr(model, name, None)
+            for name in ('decoder', 'decoder_attn', 'decoder_film')
+        ]
+        parameters = [
+            parameter
+            for module in modules
+            if isinstance(module, nn.Module)
+            for parameter in module.parameters()
+        ]
+        original_requires_grad = [
+            parameter.requires_grad for parameter in parameters
+        ]
+        for parameter in parameters:
+            parameter.requires_grad_(False)
+
+        try:
+            yield
+        finally:
+            for parameter, requires_grad in zip(
+                parameters,
+                original_requires_grad,
+            ):
+                parameter.requires_grad_(requires_grad)
+
     @staticmethod
     def ensure_finite_optimizer_lrs(name, optimizer):
         lrs = [float(group['lr']) for group in optimizer.optimizer.param_groups]
@@ -4022,7 +4482,11 @@ class SoundStreamTrainer(nn.Module):
         gan_progress = self.update_gan_weights(steps)
         si_sdr_loss_progress = self.update_si_sdr_loss_weight(steps)
         spectral_envelope_loss_progress = self.update_spectral_envelope_loss_weight(steps)
-        voiced_highband_loss_progress = self.update_voiced_highband_loss_weight(steps)
+        (
+            voiced_highband_loss_progress,
+            upper_highband_loss_progress,
+            active_spectral_detail_loss_progress
+        ) = self.update_voiced_highband_loss_weight(steps)
         stft_loss_progress, frame_phase_loss_progress = self.update_spectral_refinement_weights(steps)
         stage2_recon_transition_progress = self.update_stage2_reconstruction_transition(steps)
         transient_loss_progress = self.update_transient_loss_weights(steps)
@@ -4034,6 +4498,10 @@ class SoundStreamTrainer(nn.Module):
         freeze_encoder = (
             exists(self.freeze_encoder_before_step) and
             steps < self.freeze_encoder_before_step
+        )
+        freeze_decoder = (
+            exists(self.freeze_decoder_before_step) and
+            steps < self.freeze_decoder_before_step
         )
         generator_frozen = steps < self.generator_freeze_steps
         generator_released = self.release_generator_freeze(steps)
@@ -4071,12 +4539,18 @@ class SoundStreamTrainer(nn.Module):
                 if freeze_encoder
                 else nullcontext
             )
+            freeze_decoder_stack = (
+                self.frozen_decoder_stack
+                if freeze_decoder
+                else nullcontext
+            )
             generator_grad_context = torch.no_grad if generator_frozen else nullcontext
             with (
                 self.accelerator.autocast(),
                 context(),
                 freeze_discriminators(),
                 freeze_encoder_and_rvq(),
+                freeze_decoder_stack(),
                 generator_grad_context()
             ):
                 loss, loss_breakdown = self.soundstream(
@@ -4102,9 +4576,27 @@ class SoundStreamTrainer(nn.Module):
                     noise_floor_loss,
                     frame_phase_or_boundary_loss
                 ) = loss_breakdown[:16]
+                is_streaming_model = hasattr(
+                    self.unwrapped_soundstream,
+                    'frame_boundary_loss'
+                )
                 stream_consistency_loss = (
                     loss_breakdown[16]
-                    if len(loss_breakdown) > 16
+                    if is_streaming_model and len(loss_breakdown) > 16
+                    else loss.new_zeros(())
+                )
+                upper_highband_index = 17 if is_streaming_model else 16
+                active_spectral_detail_index = (
+                    18 if is_streaming_model else 17
+                )
+                upper_highband_loss = (
+                    loss_breakdown[upper_highband_index]
+                    if len(loss_breakdown) > upper_highband_index
+                    else loss.new_zeros(())
+                )
+                active_spectral_detail_loss = (
+                    loss_breakdown[active_spectral_detail_index]
+                    if len(loss_breakdown) > active_spectral_detail_index
                     else loss.new_zeros(())
                 )
 
@@ -4170,6 +4662,11 @@ class SoundStreamTrainer(nn.Module):
                 spectral_envelope_loss = spectral_envelope_loss.item() / self.grad_accum_every,
                 voiced_highband_loss = voiced_highband_loss.item() / self.grad_accum_every,
                 voiced_hf_retention_loss = voiced_hf_retention_loss.item() / self.grad_accum_every,
+                upper_highband_loss = upper_highband_loss.item() / self.grad_accum_every,
+                active_spectral_detail_loss = (
+                    active_spectral_detail_loss.item() /
+                    self.grad_accum_every
+                ),
                 adversarial_loss = adversarial_loss.item() / self.grad_accum_every,
                 feature_loss = feature_loss.item() / self.grad_accum_every,
                 weighted_adversarial_loss = weighted_adversarial_loss.item() / self.grad_accum_every,
@@ -4218,7 +4715,7 @@ class SoundStreamTrainer(nn.Module):
             group['lr']
             for group in self.optim.optimizer.param_groups
             if group.get('group_name') == 'encoder'
-        ), generator_lr)
+        ), 0. if self.encoder_excluded_from_generator_optimizer else generator_lr)
         stft_discriminator_lr = self.discr_optim.optimizer.param_groups[0]['lr']
         waveform_discriminator_lrs = {
             name: optimizer.optimizer.param_groups[0]['lr']
@@ -4247,6 +4744,12 @@ class SoundStreamTrainer(nn.Module):
             f"(w={model.spectral_envelope_loss_weight:.4g},ramp={spectral_envelope_loss_progress:.4f}) | "
             f"voiced_highband={logs['voiced_highband_loss']:.6f}"
             f"(w={model.voiced_highband_loss_weight:.4g},ramp={voiced_highband_loss_progress:.4f}) | "
+            f"upper_7k_7p8k={logs['upper_highband_loss']:.6f}"
+            f"(w={getattr(model, 'upper_highband_loss_weight', 0.):.4g},"
+            f"ramp={upper_highband_loss_progress:.4f}) | "
+            f"active_spec={logs['active_spectral_detail_loss']:.6f}"
+            f"(w={getattr(model, 'active_spectral_detail_loss_weight', 0.):.4g},"
+            f"ramp={active_spectral_detail_loss_progress:.4f}) | "
             f"hf_retain={logs['voiced_hf_retention_loss']:.6f}"
             f"(w={getattr(model, 'voiced_hf_retention_loss_weight', 0.):.4g}) | "
             f"corr_loss={logs['correlation_loss']:.6f}"
@@ -4267,6 +4770,7 @@ class SoundStreamTrainer(nn.Module):
             f"discriminator_warmup={int(steps < self.gan_start_step and steps >= self.discriminator_start_step)} | "
             f"rvq_frozen={int(freeze_codebook)} | "
             f"encoder_frozen={int(freeze_encoder)} | "
+            f"decoder_frozen={int(freeze_decoder)} | "
             f"commit={logs['all_commitment_loss']:.6f}"
         )
 
@@ -4570,6 +5074,26 @@ class SoundStreamTrainer(nn.Module):
                 leakage_selected_model = None
                 leakage_selected_metrics = None
 
+            if self.midband_checkpoint and eligible_candidates:
+                (
+                    midband_selected_name,
+                    midband_selected_model,
+                    midband_selected_metrics,
+                ) = min(
+                    eligible_candidates,
+                    key = lambda candidate: self.midband_checkpoint_score(
+                        candidate[2]
+                    ),
+                )
+                midband_selected_score = self.midband_checkpoint_score(
+                    midband_selected_metrics
+                )
+            else:
+                midband_selected_name = 'none'
+                midband_selected_model = None
+                midband_selected_metrics = None
+                midband_selected_score = float('inf')
+
             balanced_candidates = [
                 candidate for candidate in eligible_candidates
                 if not self.balanced_checkpoint_failure_reasons(candidate[2])
@@ -4708,6 +5232,10 @@ class SoundStreamTrainer(nn.Module):
                 f"ema_voiced_hf_ratio_db={ema_score.get('voiced_hf_energy_ratio_db', 0.):+.2f}, "
                 f"ema_voiced_hf_error={ema_score.get('voiced_hf_logmag_error', 0.):.4f}, "
                 f"ema_voiced_hf_deficit={ema_score.get('voiced_hf_energy_deficit', 0.):.4f}, "
+                f"ema_voiced_7k_7p8k_error={ema_score.get('voiced_7k_7p8k_logmag_error', 0.):.4f}, "
+                f"ema_voiced_7k_7p8k_deficit={ema_score.get('voiced_7k_7p8k_energy_deficit', 0.):.4f}, "
+                f"ema_voiced_7k_7p8k_ratio_db={ema_score.get('voiced_7k_7p8k_ratio_db', 0.):+.2f}, "
+                f"ema_quiet_7k_7p8k_excess_db={ema_score.get('quiet_7k_7p8k_excess_db', 0.):.2f}, "
                 f"ema_centroid_delta_hz={ema_score.get('spectral_centroid_delta_hz', 0.):+.1f}, "
                 f"ema_slope_delta={ema_score.get('spectral_slope_delta', 0.):+.3f}, "
                 f"ema_quiet_hf_excess_db={ema_score.get('quiet_hf_excess_db', 0.):.2f}, "
@@ -4739,6 +5267,14 @@ class SoundStreamTrainer(nn.Module):
                 f"{online_score.get('voiced_hf_gate_max_db', float('nan')):+.2f}], "
                 f"online_hf_gate_violation_db="
                 f"{online_score.get('voiced_hf_gate_violation_db', 0.):.3f}, "
+                f"online_upper_hf_penalty={online_score.get('upper_hf_score_penalty', 0.):.6f}, "
+                f"online_active_spec_penalty="
+                f"{online_score.get('active_spectral_score_penalty', 0.):.6f}, "
+                f"online_upper_hf_gate=["
+                f"{online_score.get('upper_hf_gate_min_db', float('nan')):+.2f},"
+                f"{online_score.get('upper_hf_gate_max_db', float('nan')):+.2f}], "
+                f"online_upper_hf_gate_violation_db="
+                f"{online_score.get('upper_hf_gate_violation_db', 0.):.3f}, "
                 f"{ema_summary}, best={self.best_valid_score:.6f}, "
                 f"selected={selected_name} | "
                 f"online_rms={online_score['rms_ratio']:.3f}, "
@@ -4757,6 +5293,26 @@ class SoundStreamTrainer(nn.Module):
                 f"online_voiced_hf_ratio_db={online_score.get('voiced_hf_energy_ratio_db', 0.):+.2f}, "
                 f"online_voiced_hf_error={online_score.get('voiced_hf_logmag_error', 0.):.4f}, "
                 f"online_voiced_hf_deficit={online_score.get('voiced_hf_energy_deficit', 0.):.4f}, "
+                f"online_voiced_7k_7p8k_error={online_score.get('voiced_7k_7p8k_logmag_error', 0.):.4f}, "
+                f"online_voiced_7k_7p8k_deficit={online_score.get('voiced_7k_7p8k_energy_deficit', 0.):.4f}, "
+                f"online_voiced_7k_7p8k_ratio_db={online_score.get('voiced_7k_7p8k_ratio_db', 0.):+.2f}, "
+                f"online_quiet_7k_7p8k_excess_db={online_score.get('quiet_7k_7p8k_excess_db', 0.):.2f}, "
+                f"online_active_spec={online_score.get('active_spectral_detail_loss', 0.):.4f}, "
+                f"online_active_200_1k="
+                f"{online_score.get('active_spec_200_1k_logmag_error', 0.):.3f}/"
+                f"{online_score.get('active_spec_200_1k_energy_ratio_db', 0.):+.2f}dB, "
+                f"online_active_1k_3k="
+                f"{online_score.get('active_spec_1k_3k_logmag_error', 0.):.3f}/"
+                f"{online_score.get('active_spec_1k_3k_energy_ratio_db', 0.):+.2f}dB, "
+                f"online_active_3k_5k="
+                f"{online_score.get('active_spec_3k_5k_logmag_error', 0.):.3f}/"
+                f"{online_score.get('active_spec_3k_5k_energy_ratio_db', 0.):+.2f}dB, "
+                f"online_active_5k_7k="
+                f"{online_score.get('active_spec_5k_7k_logmag_error', 0.):.3f}/"
+                f"{online_score.get('active_spec_5k_7k_energy_ratio_db', 0.):+.2f}dB, "
+                f"online_active_7k_7p8k="
+                f"{online_score.get('active_spec_7k_7p8k_logmag_error', 0.):.3f}/"
+                f"{online_score.get('active_spec_7k_7p8k_energy_ratio_db', 0.):+.2f}dB, "
                 f"online_centroid_delta_hz={online_score.get('spectral_centroid_delta_hz', 0.):+.1f}, "
                 f"online_slope_delta={online_score.get('spectral_slope_delta', 0.):+.3f}, "
                 f"online_quiet_hf_excess_db={online_score.get('quiet_hf_excess_db', 0.):.2f}, "
@@ -4799,7 +5355,12 @@ class SoundStreamTrainer(nn.Module):
                     f"aligned_si_sdr={online_score['aligned_si_sdr'] - baseline['aligned_si_sdr']:+.3f} dB, "
                     f"ac320_iso={online_score.get('ac_320_isolated', 0.) - baseline['ac_320_isolated']:+.4f}, "
                     f"comb_median={online_score.get('comb_median_excess_db', 0.) - baseline['comb_median_excess_db']:+.2f} dB, "
+                    "q00_active="
+                    f"{online_score.get('codebook_q00_active_ratio', 0.) - baseline.get('codebook_q00_active_ratio', 0.):+.3f}, "
+                    "q00_perplexity="
+                    f"{online_score.get('codebook_q00_perplexity', 0.) - baseline.get('codebook_q00_perplexity', 0.):+.1f}, "
                     f"generator_frozen={int(steps < self.generator_freeze_steps)}, "
+                    f"decoder_frozen={int(freeze_decoder)}, "
                     f"discriminator_warmup={int(steps < self.gan_start_step and steps >= self.discriminator_start_step)}, "
                     f"gan_ramp={gan_progress:.4f}"
                 )
@@ -4854,7 +5415,13 @@ class SoundStreamTrainer(nn.Module):
                 else:
                     self.quality_retention_bad_evals += 1
                     rvq_bad = all(
-                        ('q00' in quality_reasons[name] or 'q01' in quality_reasons[name])
+                        (
+                            any(
+                                reason.startswith('q00')
+                                for reason in quality_reasons[name]
+                            ) or
+                            'q01' in quality_reasons[name]
+                        )
                         for name, _, _ in candidate_models
                     )
                     self.quality_retention_rvq_bad_evals = (
@@ -4889,8 +5456,9 @@ class SoundStreamTrainer(nn.Module):
                         self.save(str(self.results_folder / 'latest.pt'))
                         self.print(
                             f"{steps}: quality retention hard stop triggered; "
-                            "no fine-tuned candidate preserved the initialized baseline; "
-                            "baseline_init.pt is retained only as the initialization reference."
+                            "the current validation candidates failed the retention gate. "
+                            "Any previously saved gated best checkpoint remains valid; "
+                            "baseline_init.pt remains the initialization reference."
                         )
                     elif quality_patience_exhausted:
                         self.print(
@@ -4976,6 +5544,11 @@ class SoundStreamTrainer(nn.Module):
                 self.frame_leakage_checkpoint and
                 exists(leakage_selected_model) and
                 leakage_selected_metrics['ac_320_isolated'] < self.best_frame_leakage_score
+            )
+            midband_improved = (
+                self.midband_checkpoint and
+                exists(midband_selected_model) and
+                midband_selected_score < self.best_midband_score
             )
             balanced_improved = (
                 exists(balanced_selected_model) and
@@ -5104,6 +5677,30 @@ class SoundStreamTrainer(nn.Module):
                     f"{steps}: saving best_by_frame_leakage.pt "
                     f"({leakage_selected_name}, ac_320_isolated="
                     f"{self.best_frame_leakage_score:+.5f})"
+                )
+
+            if midband_improved:
+                self.best_midband_score = midband_selected_score
+                self.save_model_only(
+                    self.results_folder / 'best_by_midband.pt',
+                    midband_selected_model,
+                    score = self.best_midband_score,
+                    step = steps,
+                    weight_source = midband_selected_name,
+                )
+                self.save(str(self.results_folder / 'latest.pt'))
+                self.print(
+                    f"{steps}: saving best_by_midband.pt "
+                    f"({midband_selected_name}, score={self.best_midband_score:.6f}, "
+                    "components="
+                    f"{midband_selected_metrics.get('reconstruction_score', midband_selected_metrics['score']):.6f}+"
+                    "0.10*"
+                    f"{midband_selected_metrics.get('active_spec_200_1k_logmag_error', 0.):.4f}+"
+                    "0.15*"
+                    f"{midband_selected_metrics.get('active_spec_1k_3k_logmag_error', 0.):.4f}+"
+                    "0.05*"
+                    f"{midband_selected_metrics.get('active_spec_3k_5k_logmag_error', 0.):.4f}; "
+                    "quality gate passed)"
                 )
 
             if si_sdr_improved:

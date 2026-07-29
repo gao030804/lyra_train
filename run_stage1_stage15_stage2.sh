@@ -18,6 +18,37 @@ NUM_PROCESSES="${NUM_PROCESSES:-7}"
 AUDIO_DIR="${AUDIO_DIR:-$PWD/data/librispeech/LibriSpeech/train-clean-100}"
 SEED="${SEED:-42}"
 STAGE2_STEPS="${STAGE2_STEPS:-50000}"
+# Controlled Stage-2 GAN ablations. Keep the production baseline unchanged
+# unless one explicit single-variable experiment is selected:
+#   baseline: unchanged G LR=5e-7 and adversarial max=2e-4
+#   adv0003:  only adversarial max becomes 3e-4
+#   glr075:   only post-hold G LR becomes 7.5e-7
+STAGE2_ABLATION="${STAGE2_ABLATION:-baseline}"
+case "$STAGE2_ABLATION" in
+  baseline)
+    STAGE2_GENERATOR_LR=5e-7
+    STAGE2_GAN_ADVERSARIAL_MAX=2e-4
+    ;;
+  adv0003)
+    STAGE2_GENERATOR_LR=5e-7
+    STAGE2_GAN_ADVERSARIAL_MAX=3e-4
+    ;;
+  glr075)
+    STAGE2_GENERATOR_LR=7.5e-7
+    STAGE2_GAN_ADVERSARIAL_MAX=2e-4
+    ;;
+  *)
+    echo "ERROR: STAGE2_ABLATION must be baseline, adv0003, or glr075." >&2
+    exit 2
+    ;;
+esac
+STAGE2_GAN_FEATURE_MAX=1.5
+# Decoder experiment controls:
+#   production baseline: DECODER_INTERPOLATION_MODE=linear, DECODER_SPLIT_FIRST_UPSAMPLE=0
+#   split ablation:      DECODER_INTERPOLATION_MODE=linear, DECODER_SPLIT_FIRST_UPSAMPLE=1
+#   cubic ablation:      DECODER_INTERPOLATION_MODE=cubic,  DECODER_SPLIT_FIRST_UPSAMPLE=0
+DECODER_INTERPOLATION_MODE="${DECODER_INTERPOLATION_MODE:-linear}"
+DECODER_SPLIT_FIRST_UPSAMPLE="${DECODER_SPLIT_FIRST_UPSAMPLE:-0}"
 SKIP_STAGE1="${SKIP_STAGE1:-0}"
 RESUME_STAGE1="${RESUME_STAGE1:-0}"
 FALLBACK_STAGE1_CKPT="${FALLBACK_STAGE1_CKPT:-}"
@@ -48,8 +79,24 @@ STAGE2_EARLY_STOP_MIN_STEPS="${STAGE2_EARLY_STOP_MIN_STEPS:-$DEFAULT_STAGE2_EARL
 STAGE2_PLATEAU_START_STEPS="${STAGE2_PLATEAU_START_STEPS:-$DEFAULT_STAGE2_PLATEAU_START_STEPS}"
 
 if [[ "$SKIP_STAGE1" != "0" && "$SKIP_STAGE1" != "1" ]]; then
-  echo "ERROR: SKIP_STAGE1 must be 0 or 1." >&2
+    echo "ERROR: SKIP_STAGE1 must be 0 or 1." >&2
+    exit 2
+fi
+
+if [[ "$DECODER_INTERPOLATION_MODE" != "linear" && "$DECODER_INTERPOLATION_MODE" != "cubic" ]]; then
+  echo "ERROR: DECODER_INTERPOLATION_MODE must be linear or cubic." >&2
   exit 2
+fi
+
+if [[ "$DECODER_SPLIT_FIRST_UPSAMPLE" != "0" && "$DECODER_SPLIT_FIRST_UPSAMPLE" != "1" ]]; then
+  echo "ERROR: DECODER_SPLIT_FIRST_UPSAMPLE must be 0 or 1." >&2
+  exit 2
+fi
+
+if [[ "$DECODER_SPLIT_FIRST_UPSAMPLE" == "1" ]]; then
+  DECODER_SPLIT_FLAG="--decoder-split-first-upsample"
+else
+  DECODER_SPLIT_FLAG="--no-decoder-split-first-upsample"
 fi
 
 if [[ "$RESUME_STAGE1" != "0" && "$RESUME_STAGE1" != "1" ]]; then
@@ -80,7 +127,7 @@ fi
 # Defaults include a timestamp, so --no-resume cannot accidentally reuse an
 # older checkpoint's best-score state.  Set explicit names only when needed.
 STAGE1_NAME="${STAGE1_NAME:-recon-pretrain-full-${RUN_TAG}-7gpu-4s}"
-STAGE2_NAME="${STAGE2_NAME:-gan-pretrain-direct-s1-${RUN_TAG}-s2-50k-hfretain-7gpu-4s}"
+STAGE2_NAME="${STAGE2_NAME:-gan-pretrain-direct-s1-${RUN_TAG}-s2-${STAGE2_ABLATION}-50k-hfretain-7gpu-4s}"
 
 STAGE1_DIR="$PWD/results/$STAGE1_NAME"
 STAGE2_DIR="$PWD/results/$STAGE2_NAME"
@@ -125,7 +172,7 @@ checkpoint_decoder_args() {
   mapfile -t output_array < <(
     "$PYTHON_BIN" tools/checkpoint_decoder_config.py "$checkpoint"
   )
-  if (( ${#output_array[@]} != 2 )); then
+  if (( ${#output_array[@]} != 4 )); then
     echo "ERROR: could not read decoder architecture from $checkpoint" >&2
     return 1
   fi
@@ -135,8 +182,14 @@ evaluate_stage1_checkpoint() {
   local checkpoint="$1"
   local report_file="$2"
   local -a decoder_args
+  local decoder_split_flag
 
   checkpoint_decoder_args "$checkpoint" decoder_args
+  if [[ "${decoder_args[3]}" == "1" ]]; then
+    decoder_split_flag="--decoder-split-first-upsample"
+  else
+    decoder_split_flag="--no-decoder-split-first-upsample"
+  fi
   echo "Fixed-validation evaluation: $checkpoint"
   CUDA_VISIBLE_DEVICES="${GPU_IDS[0]}" "$PYTHON_BIN" train_soundstream.py \
     --stage recon_pretrain \
@@ -148,6 +201,8 @@ evaluate_stage1_checkpoint() {
     --seed "$SEED" \
     --decoder-upsample-mode "${decoder_args[0]}" \
     --decoder-linear-upsample-kernel-min "${decoder_args[1]}" \
+    --decoder-interpolation-mode "${decoder_args[2]}" \
+    "$decoder_split_flag" \
     --validation-only \
     --validation-checkpoint "$checkpoint" \
     --validation-report-file "$report_file" \
@@ -206,6 +261,7 @@ else
 fi
 echo "STAGE1_DIR=$STAGE1_DIR"
 echo "STAGE1_LOG=$STAGE1_LOG"
+echo "Stage 1 decoder architecture: interpolation=$DECODER_INTERPOLATION_MODE, split_first_x8=$DECODER_SPLIT_FIRST_UPSAMPLE"
 run_and_log "$STAGE1_LOG" "$RESUME_STAGE1" run_stage "Stage 1: recon_pretrain" 29501 \
   --stage recon_pretrain \
   --audio-dir "$AUDIO_DIR" \
@@ -216,6 +272,8 @@ run_and_log "$STAGE1_LOG" "$RESUME_STAGE1" run_stage "Stage 1: recon_pretrain" 2
   --segment-seconds 4.0 \
   --dl-num-workers 6 \
   --seed "$SEED" \
+  --decoder-interpolation-mode "$DECODER_INTERPOLATION_MODE" \
+  "$DECODER_SPLIT_FLAG" \
   --decoder-residual-scale-start 0.2 \
   --decoder-residual-scale-end 1.0 \
   --decoder-residual-scale-warmup-start-steps 0 \
@@ -314,14 +372,23 @@ evaluate_stage1_checkpoint "$STAGE1_CKPT" "$STAGE2_PREFLIGHT_REPORT"
 
 declare -a STAGE2_DECODER_ARGS
 checkpoint_decoder_args "$STAGE1_CKPT" STAGE2_DECODER_ARGS
+if [[ "${STAGE2_DECODER_ARGS[3]}" == "1" ]]; then
+  STAGE2_DECODER_SPLIT_FLAG="--decoder-split-first-upsample"
+else
+  STAGE2_DECODER_SPLIT_FLAG="--no-decoder-split-first-upsample"
+fi
 echo "Stage 2 initialization checkpoint: $STAGE1_CKPT"
-echo "Stage 2 decoder architecture: mode=${STAGE2_DECODER_ARGS[0]}, kernel_min=${STAGE2_DECODER_ARGS[1]}"
+echo "Stage 2 decoder architecture: mode=${STAGE2_DECODER_ARGS[0]}, kernel_min=${STAGE2_DECODER_ARGS[1]}, interpolation=${STAGE2_DECODER_ARGS[2]}, split_first_x8=${STAGE2_DECODER_ARGS[3]}"
 
 # ----- Stage 2: direct GAN refinement from the Stage-1 validation best -----
 require_fresh_dir "$STAGE2_DIR" "Stage 2"
 echo "STAGE2_DIR=$STAGE2_DIR"
 echo "STAGE2_LOG=$STAGE2_LOG"
 echo "STAGE2_STEPS=$STAGE2_STEPS"
+echo "STAGE2_ABLATION=$STAGE2_ABLATION"
+echo "STAGE2_GENERATOR_LR=$STAGE2_GENERATOR_LR"
+echo "STAGE2_GAN_ADVERSARIAL_MAX=$STAGE2_GAN_ADVERSARIAL_MAX"
+echo "STAGE2_GAN_FEATURE_MAX=$STAGE2_GAN_FEATURE_MAX"
 echo "STAGE2_EARLY_STOP_MIN_STEPS=$STAGE2_EARLY_STOP_MIN_STEPS"
 echo "STAGE2_PLATEAU_START_STEPS=$STAGE2_PLATEAU_START_STEPS"
 run_stage "Stage 2: gan_pretrain" 29503 \
@@ -331,8 +398,12 @@ run_stage "Stage 2: gan_pretrain" 29503 \
   --init-checkpoint "$STAGE1_CKPT" \
   --decoder-upsample-mode "${STAGE2_DECODER_ARGS[0]}" \
   --decoder-linear-upsample-kernel-min "${STAGE2_DECODER_ARGS[1]}" \
+  --decoder-interpolation-mode "${STAGE2_DECODER_ARGS[2]}" \
+  "$STAGE2_DECODER_SPLIT_FLAG" \
   --num-train-steps "$STAGE2_STEPS" \
-  --generator-lr 5e-7 \
+  --generator-lr "$STAGE2_GENERATOR_LR" \
+  --gan-adversarial-max "$STAGE2_GAN_ADVERSARIAL_MAX" \
+  --gan-feature-max "$STAGE2_GAN_FEATURE_MAX" \
   --batch-size 4 \
   --grad-accum-every 1 \
   --segment-seconds 4.0 \
@@ -353,6 +424,15 @@ run_stage "Stage 2: gan_pretrain" 29503 \
   --voiced-hf-retention-margin-db 0.50 \
   --voiced-highband-loss-start-steps 0 \
   --voiced-highband-loss-warmup-steps 0 \
+  --upper-highband-loss-weight 0.0025 \
+  --upper-highband-energy-deficit-weight 0.20 \
+  --upper-highband-energy-margin-db 0.50 \
+  --upper-highband-loss-start-steps 1000 \
+  --upper-highband-loss-warmup-steps 5000 \
+  --active-spectral-detail-loss-weight 0.02 \
+  --active-spectral-detail-loss-start-steps 2000 \
+  --active-spectral-detail-loss-warmup-steps 8000 \
+  --stage2-active-spectral-score-weight 0.05 \
   --noise-floor-loss-weight 0.03 \
   --click-loss-weight 0 \
   --jump-loss-weight 0 \
@@ -388,6 +468,11 @@ run_stage "Stage 2: gan_pretrain" 29503 \
   --stage2-max-voiced-hf-ratio-db-drop 0.30 \
   --stage2-max-voiced-hf-ratio-db-rise 1.50 \
   --stage2-voiced-hf-score-weight 3.0 \
+  --stage2-balanced-max-aligned-si-sdr-drop 0.10 \
+  --stage2-min-voiced-7k-7p8k-ratio-db -1.0 \
+  --stage2-max-voiced-7k-7p8k-ratio-db 0.50 \
+  --stage2-max-quiet-7k-7p8k-excess-db-rise 0.30 \
+  --stage2-upper-highband-score-weight 0.10 \
   --stage2-max-click-score-rise 0.30 \
   --clean-gate-max-click-score 6.0 \
   --clean-gate-max-click-excess 0.5 \

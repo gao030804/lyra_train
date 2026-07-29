@@ -461,20 +461,50 @@ class CausalConvTranspose1d(Module):
         return out, next_state
 
 class CausalLinearUpsampleConv1d(Module):
-    def __init__(self, chan_in, chan_out, kernel_size, stride, pad_mode = 'reflect', **kwargs):
+    def __init__(
+        self,
+        chan_in,
+        chan_out,
+        kernel_size,
+        stride,
+        pad_mode = 'reflect',
+        interpolation_mode = 'linear',
+        **kwargs
+    ):
         super().__init__()
+        if interpolation_mode not in ('linear', 'cubic'):
+            raise ValueError(
+                f'unknown causal interpolation mode: {interpolation_mode}'
+            )
         self.upsample_factor = stride
+        self.interpolation_mode = interpolation_mode
         self.conv = CausalConv1d(chan_in, chan_out, kernel_size, pad_mode = pad_mode, **kwargs)
 
-    def _upsample(self, x, prev = None):
+    @property
+    def history_size(self):
+        return 1 if self.interpolation_mode == 'linear' else 2
+
+    def _initial_history(self, x):
+        return x[..., :1].expand(
+            *x.shape[:-1],
+            self.history_size
+        )
+
+    def _upsample(self, x, history = None):
         factor = self.upsample_factor
 
         if factor == 1:
             return x
 
-        if not exists(prev):
-            prev = x[..., :1]
+        if not exists(history):
+            history = self._initial_history(x)
+        elif history.shape[-1] != self.history_size:
+            raise ValueError(
+                'causal interpolation history has the wrong length: '
+                f'expected {self.history_size}, got {history.shape[-1]}'
+            )
 
+        prev = history[..., -1:]
         start = torch.cat((prev, x[..., :-1]), dim = -1)
         end = x
         weights = torch.linspace(
@@ -486,7 +516,34 @@ class CausalLinearUpsampleConv1d(Module):
         )
         weights = rearrange(weights, 's -> 1 1 1 s')
 
-        out = start[..., None] * (1. - weights) + end[..., None] * weights
+        if self.interpolation_mode == 'linear':
+            out = start[..., None] * (1. - weights) + end[..., None] * weights
+        else:
+            # Causal cubic Hermite interpolation.  The tangent at each latent
+            # knot is its backward difference, so the end tangent of one
+            # interval exactly matches the start tangent of the next interval.
+            # This removes the repeated first-derivative discontinuity that
+            # ordinary piecewise-linear interpolation introduces at the
+            # 50 Hz codec-frame boundary, without looking at future latents.
+            interpolation_input = torch.cat((history, x), dim = -1)
+            prev_prev = interpolation_input[..., :-2]
+            start_tangent = start - prev_prev
+            end_tangent = end - start
+
+            t = weights
+            t2 = t.square()
+            t3 = t2 * t
+            h00 = 2. * t3 - 3. * t2 + 1.
+            h10 = t3 - 2. * t2 + t
+            h01 = -2. * t3 + 3. * t2
+            h11 = t3 - t2
+            out = (
+                h00 * start[..., None] +
+                h10 * start_tangent[..., None] +
+                h01 * end[..., None] +
+                h11 * end_tangent[..., None]
+            )
+
         return rearrange(out, 'b c n s -> b c (n s)')
 
     def forward(self, x):
@@ -494,17 +551,24 @@ class CausalLinearUpsampleConv1d(Module):
         return self.conv(x)
 
     def forward_stream(self, x, state = None):
-        prev = None
+        history = None
         conv_state = None
 
         if exists(state):
-            prev, conv_state = state
+            history, conv_state = state
 
-        upsampled = self._upsample(x, prev = prev)
+        upsampled = self._upsample(x, history = history)
         out, next_conv_state = self.conv.forward_stream(upsampled, conv_state)
-        next_prev = x[..., -1:]
+        history_source = torch.cat(
+            (
+                self._initial_history(x) if not exists(history) else history,
+                x
+            ),
+            dim = -1
+        )
+        next_history = history_source[..., -self.history_size:]
 
-        return out, (next_prev, next_conv_state)
+        return out, (next_history, next_conv_state)
 
 def ResidualUnit(chan_in, chan_out, dilation, kernel_size = 7, squeeze_excite = False, pad_mode = 'reflect', residual_scale = 1.):
     return Residual(Sequential(
@@ -535,7 +599,9 @@ def DecoderBlock(
     pad_mode = 'reflect',
     upsample_mode = 'convtranspose',
     residual_scale = 1.,
-    linear_upsample_kernel_min = 0
+    linear_upsample_kernel_min = 0,
+    interpolation_mode = 'linear',
+    split_upsample = False
 ):
     even_stride = (stride % 2 == 0)
     padding = (stride + (0 if even_stride else 1)) // 2
@@ -548,11 +614,54 @@ def DecoderBlock(
         residual_scale = residual_scale
     )
 
-    if upsample_mode == 'convtranspose':
+    if split_upsample:
+        if upsample_mode != 'linear':
+            raise ValueError(
+                'split decoder upsampling requires causal interpolation mode'
+            )
+        if stride != 8:
+            raise ValueError(
+                f'split decoder upsampling expects stride 8, got {stride}'
+            )
+
+        # Replace the abrupt first x8 expansion with x4 -> shaping -> x2.
+        # Both stages keep a causal convolution, and ELU between them gives the
+        # second stage a chance to reshape interpolation images before the
+        # ordinary residual stack.  The total temporal factor remains x8.
+        first_stride, second_stride = 4, 2
+        first_kernel = max(2 * first_stride, linear_upsample_kernel_min)
+        second_kernel = max(2 * second_stride, linear_upsample_kernel_min)
+        upsample = nn.Sequential(
+            CausalLinearUpsampleConv1d(
+                chan_in,
+                chan_out,
+                first_kernel,
+                stride = first_stride,
+                pad_mode = pad_mode,
+                interpolation_mode = interpolation_mode
+            ),
+            nn.ELU(),
+            CausalLinearUpsampleConv1d(
+                chan_out,
+                chan_out,
+                second_kernel,
+                stride = second_stride,
+                pad_mode = pad_mode,
+                interpolation_mode = interpolation_mode
+            )
+        )
+    elif upsample_mode == 'convtranspose':
         upsample = CausalConvTranspose1d(chan_in, chan_out, 2 * stride, stride = stride)
     elif upsample_mode == 'linear':
         upsample_kernel_size = max(2 * stride, linear_upsample_kernel_min)
-        upsample = CausalLinearUpsampleConv1d(chan_in, chan_out, upsample_kernel_size, stride = stride, pad_mode = pad_mode)
+        upsample = CausalLinearUpsampleConv1d(
+            chan_in,
+            chan_out,
+            upsample_kernel_size,
+            stride = stride,
+            pad_mode = pad_mode,
+            interpolation_mode = interpolation_mode
+        )
     else:
         raise ValueError(f'unknown decoder upsample mode: {upsample_mode}')
 
@@ -670,6 +779,8 @@ class SoundStream(Module):
         decoder_residual_scale = 1.,
         decoder_block_residual_scales: tuple[float, ...] | None = None,
         decoder_linear_upsample_kernel_min = 0,
+        decoder_interpolation_mode = 'linear',
+        decoder_split_first_upsample = False,
         multi_spectral_window_powers_of_two = tuple(range(6, 12)),
         multi_spectral_n_ffts = 512,
         multi_spectral_n_mels = 64,
@@ -678,6 +789,13 @@ class SoundStream(Module):
         stft_recon_loss_weight = 0.,
         spectral_envelope_loss_weight = 0.,
         voiced_highband_loss_weight = 0.,
+        upper_highband_loss_weight = 0.,
+        active_spectral_detail_loss_weight = 0.,
+        active_spectral_detail_band_weights = (
+            0.50, 1.00, 1.00, 1.25, 1.50
+        ),
+        upper_highband_energy_deficit_weight = 0.,
+        upper_highband_energy_margin_db = 0.50,
         voiced_highband_energy_deficit_weight = 0.35,
         voiced_highband_energy_margin_db = 0.10,
         voiced_hf_retention_loss_weight = 0.,
@@ -739,6 +857,20 @@ class SoundStream(Module):
                 raise ValueError('decoder block residual scales must all be >= 0')
         if decoder_linear_upsample_kernel_min < 0:
             raise ValueError(f'decoder_linear_upsample_kernel_min must be >= 0, got {decoder_linear_upsample_kernel_min}')
+        if decoder_interpolation_mode not in ('linear', 'cubic'):
+            raise ValueError(
+                f'unknown decoder interpolation mode: {decoder_interpolation_mode}'
+            )
+        if decoder_split_first_upsample:
+            if decoder_upsample_mode != 'linear':
+                raise ValueError(
+                    'decoder_split_first_upsample requires decoder_upsample_mode="linear"'
+                )
+            if strides[-1] != 8:
+                raise ValueError(
+                    'decoder_split_first_upsample requires the first decoder '
+                    f'upsampling stride to be 8, got {strides[-1]}'
+                )
         self.decoder_upsample_mode = decoder_upsample_mode
         self.decoder_residual_scale = float(decoder_residual_scale)
         self.decoder_block_residual_scales = tuple(
@@ -748,6 +880,8 @@ class SoundStream(Module):
             )
         )
         self.decoder_linear_upsample_kernel_min = int(decoder_linear_upsample_kernel_min)
+        self.decoder_interpolation_mode = decoder_interpolation_mode
+        self.decoder_split_first_upsample = bool(decoder_split_first_upsample)
 
         layer_channels = tuple(map(lambda t: t * channels, channel_mults))
         layer_channels = (channels, *layer_channels)
@@ -851,10 +985,10 @@ class SoundStream(Module):
 
         decoder_blocks = []
 
-        for ((chan_in, chan_out), layer_stride), residual_scale in zip(
+        for block_index, (((chan_in, chan_out), layer_stride), residual_scale) in enumerate(zip(
             zip(reversed(chan_in_out_pairs), reversed(strides)),
             self.decoder_block_residual_scales
-        ):
+        )):
             decoder_blocks.append(DecoderBlock(
                 chan_out,
                 chan_in,
@@ -864,7 +998,11 @@ class SoundStream(Module):
                 pad_mode,
                 upsample_mode = decoder_upsample_mode,
                 residual_scale = residual_scale,
-                linear_upsample_kernel_min = decoder_linear_upsample_kernel_min
+                linear_upsample_kernel_min = decoder_linear_upsample_kernel_min,
+                interpolation_mode = decoder_interpolation_mode,
+                split_upsample = (
+                    decoder_split_first_upsample and block_index == 0
+                )
             ))
 
             if use_gate_loop_layers:
@@ -927,10 +1065,67 @@ class SoundStream(Module):
         self.voiced_highband_max_hz = min(7000., target_sample_hz / 2.)
         self.voiced_highband_reference_min_hz = 200.
         self.voiced_highband_slope_min_hz = 1000.
+        # The 16 kHz model has only a narrow octave-edge band between 7 kHz
+        # and Nyquist.  Keep it separate from the established 2.5-7 kHz
+        # objective so a small, target-activity-gated term can recover real
+        # upper-band detail without rewarding broadband hiss.  The last
+        # 200 Hz is tapered to zero before Nyquist.
+        self.upper_highband_min_hz = 7000.
+        self.upper_highband_taper_start_hz = 7600.
+        self.upper_highband_max_hz = min(7800., target_sample_hz / 2.)
+        self.upper_highband_relative_power_floor_db = -30.
+        self.upper_highband_reference_ratio_floor_db = -40.
+        # A lightweight multi-resolution detail objective for target-supported
+        # voiced bins.  Unlike the full MR-STFT loss, it ignores quiet bins and
+        # short 64/128-sample windows, so it does not reward broadband hiss.
+        self.active_spectral_detail_settings = (
+            (256, 256, 64, 0.50),
+            (512, 512, 128, 1.00),
+            (1024, 1024, 256, 1.00),
+            (2048, 2048, 512, 0.50),
+        )
+        self.active_spectral_detail_relative_db = -50.
+        self.active_spectral_detail_min_hz = 200.
+        self.active_spectral_detail_max_hz = min(
+            7800.,
+            target_sample_hz / 2.
+        )
+        if len(active_spectral_detail_band_weights) != 5:
+            raise ValueError(
+                'active_spectral_detail_band_weights must contain exactly '
+                'five values for 200-1k, 1-3k, 3-5k, 5-7k, and 7-7.8k'
+            )
+        active_spectral_detail_band_weights = tuple(
+            float(weight) for weight in active_spectral_detail_band_weights
+        )
+        if any(weight < 0. for weight in active_spectral_detail_band_weights):
+            raise ValueError(
+                'active_spectral_detail_band_weights must all be >= 0'
+            )
+        self.active_spectral_detail_band_weights = (
+            active_spectral_detail_band_weights
+        )
+        self.active_spectral_detail_bands = tuple(
+            (name, min_hz, max_hz, weight)
+            for (name, min_hz, max_hz), weight in zip(
+                (
+                    ('200_1k', 200., 1000.),
+                    ('1k_3k', 1000., 3000.),
+                    ('3k_5k', 3000., 5000.),
+                    ('5k_7k', 5000., 7000.),
+                    ('7k_7p8k', 7000., 7800.),
+                ),
+                active_spectral_detail_band_weights,
+            )
+        )
         if voiced_highband_energy_deficit_weight < 0:
             raise ValueError('voiced_highband_energy_deficit_weight must be >= 0')
         if voiced_highband_energy_margin_db < 0:
             raise ValueError('voiced_highband_energy_margin_db must be >= 0')
+        if upper_highband_energy_deficit_weight < 0:
+            raise ValueError('upper_highband_energy_deficit_weight must be >= 0')
+        if upper_highband_energy_margin_db < 0:
+            raise ValueError('upper_highband_energy_margin_db must be >= 0')
         if voiced_hf_retention_loss_weight < 0:
             raise ValueError('voiced_hf_retention_loss_weight must be >= 0')
         if voiced_hf_retention_margin_db < 0:
@@ -940,6 +1135,12 @@ class SoundStream(Module):
         )
         self.voiced_highband_energy_margin_db = float(
             voiced_highband_energy_margin_db
+        )
+        self.upper_highband_energy_deficit_weight = float(
+            upper_highband_energy_deficit_weight
+        )
+        self.upper_highband_energy_margin_db = float(
+            upper_highband_energy_margin_db
         )
         self.voiced_hf_retention_loss_weight = float(
             voiced_hf_retention_loss_weight
@@ -1013,6 +1214,10 @@ class SoundStream(Module):
         self.stft_recon_loss_weight = stft_recon_loss_weight
         self.spectral_envelope_loss_weight = spectral_envelope_loss_weight
         self.voiced_highband_loss_weight = voiced_highband_loss_weight
+        self.upper_highband_loss_weight = upper_highband_loss_weight
+        self.active_spectral_detail_loss_weight = (
+            active_spectral_detail_loss_weight
+        )
         self.si_sdr_loss_weight = si_sdr_loss_weight
         self.correlation_loss_weight = correlation_loss_weight
         self.energy_loss_weight = energy_loss_weight
@@ -1106,7 +1311,15 @@ class SoundStream(Module):
         return self.get_decoder_block_residual_scales()
 
     def frame_phase_residual_loss(self, target, recon):
-        """Penalize residual energy that is phase-locked to the codec frame period."""
+        """Penalize *additional* codec-frame periodicity in the residual.
+
+        The loss is evaluated on ``recon - target``, rather than on the
+        reconstruction alone.  Real 50 Hz structure already present in the
+        source therefore cancels when it is reconstructed correctly.  Besides
+        the mean phase pattern, use differentiable counterparts of the fixed
+        validation diagnostics: the isolated lag-320 autocorrelation peak and
+        50 Hz comb-line excess over adjacent FFT bins.
+        """
         frame_samples = self.frame_phase_samples
         usable_samples = (min(target.shape[-1], recon.shape[-1]) // frame_samples) * frame_samples
         if usable_samples < frame_samples * 2:
@@ -1128,7 +1341,64 @@ class SoundStream(Module):
             .sqrt()
             .clamp_min(1e-3)
         )
-        return (phase_rms / target_rms).mean()
+        phase_pattern_loss = (phase_rms / target_rms).mean()
+
+        # Match the validation AC320 diagnostic: first-difference the
+        # residual, remove DC, then measure how much the lag-320 correlation
+        # exceeds the average of its immediate neighbours.  A small positive
+        # margin avoids optimizing harmless numerical fluctuations.
+        residual_rows = residual.reshape(-1, usable_samples)
+        residual_hp = residual_rows[..., 1:] - residual_rows[..., :-1]
+        residual_hp = residual_hp - residual_hp.mean(dim = -1, keepdim = True)
+
+        def normalized_ac(lag):
+            left = residual_hp[..., :-lag]
+            right = residual_hp[..., lag:]
+            numerator = (left * right).sum(dim = -1)
+            denominator = (
+                left.square().sum(dim = -1) *
+                right.square().sum(dim = -1)
+            ).clamp_min(1e-12).sqrt()
+            return numerator / denominator
+
+        ac_319 = normalized_ac(frame_samples - 1)
+        ac_320 = normalized_ac(frame_samples)
+        ac_321 = normalized_ac(frame_samples + 1)
+        ac_320_isolated = ac_320 - 0.5 * (ac_319 + ac_321)
+        ac_excess_loss = F.relu(ac_320_isolated - 0.01).mean()
+
+        # FFT-bin spacing is sample_rate / usable_samples.  Advancing by the
+        # number of codec frames therefore advances exactly one codec-frame
+        # rate (50 Hz for 16 kHz / 320 samples).  Penalize only positive line
+        # excess above a 1 dB margin and normalize the dB scale so this remains
+        # an auxiliary term.
+        comb_excess_loss = self.zero
+        if usable_samples >= frame_samples * 4:
+            spectrum_db = 20. * torch.log10(
+                torch.fft.rfft(residual_rows, dim = -1).abs().clamp_min(1e-8)
+            )
+            frame_count = usable_samples // frame_samples
+            harmonic_bins = torch.arange(
+                frame_count,
+                spectrum_db.shape[-1] - 1,
+                frame_count,
+                device = spectrum_db.device,
+            )
+            if harmonic_bins.numel() > 0:
+                line_db = spectrum_db[:, harmonic_bins]
+                neighbour_db = 0.5 * (
+                    spectrum_db[:, harmonic_bins - 1] +
+                    spectrum_db[:, harmonic_bins + 1]
+                )
+                comb_excess_loss = (
+                    F.relu(line_db - neighbour_db - 1.).mean() / 6.
+                )
+
+        return (
+            phase_pattern_loss +
+            0.5 * ac_excess_loss +
+            0.1 * comb_excess_loss
+        )
 
     def reconstruction_losses(self, target, recon):
         wave_l1 = F.l1_loss(recon, target)
@@ -1405,7 +1675,7 @@ class SoundStream(Module):
         return total_loss, low_loss, mid_loss, high_loss, voiced_fraction
 
     def voiced_highband_metrics(self, target, recon):
-        """Measure voiced 3-7 kHz spectral detail without rewarding noise.
+        """Measure voiced high-frequency detail without rewarding noise.
 
         Voicing is selected only from target-frame RMS.  Per-frame log spectra
         are normalized by their 200-7000 Hz mean before the high-band error is
@@ -1414,7 +1684,9 @@ class SoundStream(Module):
         penalizes high-band power that remains more than the configured margin
         below the target; excess high-frequency power receives no reward.  The
         remaining values are diagnostics and do not participate in checkpoint
-        gates by default.
+        gates by default.  A separate target-active 7-7.8 kHz objective uses a
+        cosine taper above 7.6 kHz and reports voiced log-magnitude error,
+        voiced energy ratio, and quiet-frame excess independently.
         """
         target_rows = target.float()
         recon_rows = recon.float()
@@ -1470,6 +1742,10 @@ class SoundStream(Module):
             (frequencies >= self.voiced_highband_slope_min_hz) &
             (frequencies <= self.voiced_highband_max_hz)
         )
+        upper_highband = (
+            (frequencies > self.upper_highband_min_hz) &
+            (frequencies <= self.upper_highband_max_hz)
+        )
         if (
             not reference_band.any() or
             not highband.any() or
@@ -1478,7 +1754,8 @@ class SoundStream(Module):
         ):
             return (
                 self.zero, self.zero, self.zero,
-                self.zero, self.zero, self.zero, self.zero
+                self.zero, self.zero, self.zero, self.zero,
+                self.zero, self.zero, self.zero, self.zero, self.zero
             )
 
         frame_rms = F.avg_pool1d(
@@ -1504,6 +1781,11 @@ class SoundStream(Module):
         )
         voiced_weight = voiced_mask.to(target_mag.dtype)
         voiced_count = voiced_weight.sum().clamp_min(1.)
+        quiet_threshold = torch.quantile(
+            frame_rms.detach(), 0.30, dim = -1, keepdim = True
+        ).clamp_max(0.03)
+        quiet_weight = (frame_rms <= quiet_threshold).to(target_mag.dtype)
+        quiet_count = quiet_weight.sum().clamp_min(1.)
 
         # Normalize each frame with the same broad speech-band statistic.  A
         # lower loss therefore requires structured high-band agreement rather
@@ -1540,6 +1822,102 @@ class SoundStream(Module):
             recon_mag[:, loss_highband].square() *
             highband_bin_weights[None, :, None]
         ).sum(dim = 1) / highband_weight_sum
+
+        upper_highband_loss = self.zero
+        voiced_upper_logmag_error = self.zero
+        voiced_upper_energy_deficit = self.zero
+        voiced_upper_energy_ratio_db = self.zero
+        quiet_upper_excess_db = self.zero
+        if upper_highband.any():
+            upper_frequencies = frequencies[upper_highband]
+            upper_bin_weights = torch.ones_like(upper_frequencies)
+            taper_mask = upper_frequencies > self.upper_highband_taper_start_hz
+            if taper_mask.any():
+                taper_position = (
+                    (
+                        upper_frequencies[taper_mask] -
+                        self.upper_highband_taper_start_hz
+                    ) /
+                    max(
+                        self.upper_highband_max_hz -
+                        self.upper_highband_taper_start_hz,
+                        1.
+                    )
+                ).clamp(0., 1.)
+                upper_bin_weights[taper_mask] = (
+                    0.5 * (1. + torch.cos(math.pi * taper_position))
+                )
+            upper_weight_sum = upper_bin_weights.sum().clamp_min(1e-8)
+
+            target_upper_power = (
+                target_mag[:, upper_highband].square() *
+                upper_bin_weights[None, :, None]
+            ).sum(dim = 1) / upper_weight_sum
+            recon_upper_power = (
+                recon_mag[:, upper_highband].square() *
+                upper_bin_weights[None, :, None]
+            ).sum(dim = 1) / upper_weight_sum
+            target_reference_power = (
+                target_mag[:, reference_band].square().mean(dim = 1)
+            )
+
+            relative_upper_floor = (
+                target_upper_power.amax(dim = -1, keepdim = True) *
+                10. ** (
+                    self.upper_highband_relative_power_floor_db / 10.
+                )
+            )
+            reference_ratio_floor = 10. ** (
+                self.upper_highband_reference_ratio_floor_db / 10.
+            )
+            upper_active_mask = (
+                voiced_mask &
+                (target_upper_power >= relative_upper_floor) &
+                (
+                    target_upper_power >=
+                    target_reference_power * reference_ratio_floor
+                )
+            )
+            upper_active_weight = upper_active_mask.to(target_mag.dtype)
+            upper_active_count = upper_active_weight.sum().clamp_min(1.)
+
+            target_upper_logmag = (
+                target_log_mag[:, upper_highband] - target_frame_gain
+            )
+            recon_upper_logmag = (
+                recon_log_mag[:, upper_highband] - recon_frame_gain
+            )
+            upper_logmag_error = (
+                target_upper_logmag - recon_upper_logmag
+            ).abs()
+            voiced_upper_logmag_error = (
+                upper_logmag_error *
+                upper_bin_weights[None, :, None] *
+                upper_active_weight.unsqueeze(1)
+            ).sum() / (upper_active_count * upper_weight_sum)
+
+            upper_ratio_db = 10. * torch.log10(
+                (recon_upper_power + 1e-10) /
+                (target_upper_power + 1e-10)
+            )
+            upper_deficit_db = F.relu(
+                -self.upper_highband_energy_margin_db - upper_ratio_db
+            )
+            voiced_upper_energy_deficit = (
+                upper_deficit_db.square() * upper_active_weight
+            ).sum() / upper_active_count
+            upper_highband_loss = (
+                voiced_upper_logmag_error +
+                self.upper_highband_energy_deficit_weight *
+                voiced_upper_energy_deficit
+            )
+            voiced_upper_energy_ratio_db = (
+                upper_ratio_db.clamp(-40., 40.) * upper_active_weight
+            ).sum() / upper_active_count
+            quiet_upper_excess_db = (
+                F.relu(upper_ratio_db) * quiet_weight
+            ).sum() / quiet_count
+
         target_hf_power = target_mag[:, highband].square().mean(dim = 1)
         recon_hf_power = recon_mag[:, highband].square().mean(dim = 1)
         log_power_deficit = F.relu(
@@ -1607,8 +1985,270 @@ class SoundStream(Module):
             voiced_hf_energy_deficit,
             spectral_centroid_delta_hz,
             spectral_slope_delta,
-            voiced_hf_retention_loss
+            voiced_hf_retention_loss,
+            upper_highband_loss,
+            voiced_upper_logmag_error,
+            voiced_upper_energy_deficit,
+            voiced_upper_energy_ratio_db,
+            quiet_upper_excess_db
         )
+
+    def active_spectral_detail_metrics(self, target, recon):
+        """Compare voiced, target-supported spectral detail across speech bands.
+
+        The training value is normalized first across speech bands and then
+        across STFT resolutions. Each band combines target-supported log
+        magnitude, its frame-to-frame delta, and spectral convergence with
+        weights 0.7 / 0.2 / 0.1. A bin contributes only when its target
+        magnitude is within 50 dB of that frame's target peak and the target
+        frame is voiced. Diagnostics use the 1024-sample scale and report each
+        speech band independently, which makes broad yellow spectrogram
+        differences easier to localize without turning every quiet
+        time-frequency bin into a loss.
+        """
+        target_rows = target.float()
+        recon_rows = recon.float()
+        if target_rows.ndim == 3:
+            target_rows = rearrange(target_rows, 'b c n -> (b c) n')
+        if recon_rows.ndim == 3:
+            recon_rows = rearrange(recon_rows, 'b c n -> (b c) n')
+
+        num_samples = min(target_rows.shape[-1], recon_rows.shape[-1])
+        target_rows = target_rows[..., :num_samples]
+        recon_rows = recon_rows[..., :num_samples]
+
+        weighted_losses = []
+        scale_weights = []
+        band_metrics = {}
+
+        for n_fft, win_length, hop_length, alpha in (
+            self.active_spectral_detail_settings
+        ):
+            target_padded = target_rows
+            recon_padded = recon_rows
+            if num_samples < n_fft:
+                padding = n_fft - num_samples
+                target_padded = F.pad(target_padded, (0, padding))
+                recon_padded = F.pad(recon_padded, (0, padding))
+
+            window = torch.hann_window(
+                win_length,
+                device = target_rows.device,
+                dtype = target_rows.dtype
+            )
+            stft_kwargs = dict(
+                n_fft = n_fft,
+                hop_length = hop_length,
+                win_length = win_length,
+                window = window,
+                center = True,
+                pad_mode = 'constant',
+                return_complex = True
+            )
+            target_mag = torch.stft(target_padded, **stft_kwargs).abs()
+            recon_mag = torch.stft(recon_padded, **stft_kwargs).abs()
+            target_log_mag = log(target_mag, eps = 1e-5)
+            recon_log_mag = log(recon_mag, eps = 1e-5)
+
+            frequencies = torch.fft.rfftfreq(
+                n_fft,
+                d = 1. / self.target_sample_hz,
+                device = target_rows.device
+            )
+            detail_band = (
+                (frequencies >= self.active_spectral_detail_min_hz) &
+                (frequencies <= self.active_spectral_detail_max_hz)
+            )
+            if not detail_band.any():
+                continue
+
+            frame_rms = F.avg_pool1d(
+                target_padded.square().unsqueeze(1),
+                kernel_size = win_length,
+                stride = hop_length,
+                padding = win_length // 2,
+                count_include_pad = False
+            ).squeeze(1).clamp_min(1e-12).sqrt()
+            num_frames = min(
+                frame_rms.shape[-1],
+                target_mag.shape[-1],
+                recon_mag.shape[-1]
+            )
+            frame_rms = frame_rms[..., :num_frames]
+            target_mag = target_mag[..., :num_frames]
+            recon_mag = recon_mag[..., :num_frames]
+            target_log_mag = target_log_mag[..., :num_frames]
+            recon_log_mag = recon_log_mag[..., :num_frames]
+
+            relative_rms_floor = (
+                frame_rms.amax(dim = -1, keepdim = True) *
+                (10. ** (self.spectral_envelope_relative_rms_db / 20.))
+            )
+            voiced_mask = (
+                (frame_rms >= relative_rms_floor) &
+                (frame_rms >= self.spectral_envelope_absolute_rms)
+            )
+            target_detail_log = target_log_mag[:, detail_band]
+            frame_peak = target_detail_log.amax(dim = 1, keepdim = True)
+            active_mask = (
+                target_detail_log >=
+                frame_peak + self.active_spectral_detail_relative_db * (
+                    math.log(10.) / 20.
+                )
+            )
+            active_mask = active_mask & voiced_mask.unsqueeze(1)
+            active_weight = active_mask.to(target_mag.dtype)
+
+            detail_frequencies = frequencies[detail_band]
+            target_detail_mag = target_mag[:, detail_band]
+            recon_detail_mag = recon_mag[:, detail_band]
+            recon_detail_log = recon_log_mag[:, detail_band]
+            band_losses = []
+            band_weights = []
+            for _, min_hz, max_hz, band_alpha in (
+                self.active_spectral_detail_bands
+            ):
+                band = (
+                    (detail_frequencies >= min_hz) &
+                    (
+                        detail_frequencies <= max_hz
+                        if max_hz >= self.active_spectral_detail_max_hz
+                        else detail_frequencies < max_hz
+                    )
+                )
+                if not band.any():
+                    continue
+
+                band_weight = active_weight[:, band]
+                band_count = band_weight.sum().clamp_min(1.)
+                target_band_log = target_detail_log[:, band]
+                recon_band_log = recon_detail_log[:, band]
+                target_band_mag = target_detail_mag[:, band]
+                recon_band_mag = recon_detail_mag[:, band]
+
+                logmag_loss = (
+                    F.smooth_l1_loss(
+                        recon_band_log,
+                        target_band_log,
+                        reduction = 'none',
+                        beta = 0.10
+                    ) *
+                    band_weight
+                ).sum() / band_count
+
+                pair_weight = (
+                    band_weight[..., 1:] *
+                    band_weight[..., :-1]
+                )
+                pair_count = pair_weight.sum().clamp_min(1.)
+                target_log_delta = (
+                    target_band_log[..., 1:] -
+                    target_band_log[..., :-1]
+                )
+                recon_log_delta = (
+                    recon_band_log[..., 1:] -
+                    recon_band_log[..., :-1]
+                )
+                temporal_delta_loss = (
+                    F.smooth_l1_loss(
+                        recon_log_delta,
+                        target_log_delta,
+                        reduction = 'none',
+                        beta = 0.10
+                    ) *
+                    pair_weight
+                ).sum() / pair_count
+
+                spectral_convergence = torch.sqrt(
+                    (
+                        (recon_band_mag - target_band_mag).square() *
+                        band_weight
+                    ).sum() /
+                    (
+                        target_band_mag.square() * band_weight
+                    ).sum().clamp_min(1e-10)
+                )
+                band_loss = (
+                    0.70 * logmag_loss +
+                    0.20 * temporal_delta_loss +
+                    0.10 * spectral_convergence
+                )
+                band_losses.append(float(band_alpha) * band_loss)
+                band_weights.append(float(band_alpha))
+
+            scale_loss = (
+                torch.stack(band_losses).sum() /
+                max(sum(band_weights), 1e-8)
+                if band_losses
+                else self.zero.to(target_rows)
+            )
+            weighted_losses.append(float(alpha) * scale_loss)
+            scale_weights.append(float(alpha))
+
+            # A single fixed diagnostic scale keeps validation values directly
+            # comparable while the training loss remains multi-resolution.
+            if win_length != 1024:
+                continue
+
+            for name, min_hz, max_hz, _ in self.active_spectral_detail_bands:
+                band = (
+                    (detail_frequencies >= min_hz) &
+                    (
+                        detail_frequencies <= max_hz
+                        if max_hz >= self.active_spectral_detail_max_hz
+                        else detail_frequencies < max_hz
+                    )
+                )
+                if not band.any():
+                    zero = self.zero.to(target_rows)
+                    band_metrics[name] = (zero, zero, zero)
+                    continue
+
+                band_weight = active_weight[:, band]
+                band_count = band_weight.sum().clamp_min(1.)
+                target_band_mag = target_detail_mag[:, band]
+                recon_band_mag = recon_detail_mag[:, band]
+                logmag_error = (
+                    (
+                        recon_log_mag[:, detail_band][:, band] -
+                        target_detail_log[:, band]
+                    ).abs() *
+                    band_weight
+                ).sum() / band_count
+                target_power = (
+                    target_band_mag.square() * band_weight
+                ).sum().clamp_min(1e-10)
+                recon_power = (
+                    recon_band_mag.square() * band_weight
+                ).sum().clamp_min(1e-10)
+                energy_ratio_db = 10. * torch.log10(
+                    recon_power / target_power
+                )
+                spectral_convergence = torch.sqrt(
+                    (
+                        (recon_band_mag - target_band_mag).square() *
+                        band_weight
+                    ).sum() /
+                    (
+                        target_band_mag.square() * band_weight
+                    ).sum().clamp_min(1e-10)
+                )
+                band_metrics[name] = (
+                    logmag_error,
+                    energy_ratio_db,
+                    spectral_convergence
+                )
+
+        total_loss = (
+            torch.stack(weighted_losses).sum() /
+            max(sum(scale_weights), 1e-8)
+            if weighted_losses
+            else self.zero.to(target_rows)
+        )
+        zero = self.zero.to(target_rows)
+        for name, _, _, _ in self.active_spectral_detail_bands:
+            band_metrics.setdefault(name, (zero, zero, zero))
+        return total_loss, band_metrics
 
     def transient_noise_losses(self, target, recon):
         if (
@@ -2225,12 +2865,19 @@ class SoundStream(Module):
             self.voiced_highband_metrics(target, recon_x)
             if (
                 self.voiced_highband_loss_weight > 0 or
-                self.voiced_hf_retention_loss_weight > 0
+                self.voiced_hf_retention_loss_weight > 0 or
+                self.upper_highband_loss_weight > 0
             )
-            else (self.zero,) * 7
+            else (self.zero,) * 12
         )
         voiced_highband_loss = voiced_highband_metrics[0]
         voiced_hf_retention_loss = voiced_highband_metrics[6]
+        upper_highband_loss = voiced_highband_metrics[7]
+        active_spectral_detail_loss = (
+            self.active_spectral_detail_metrics(target, recon_x)[0]
+            if self.active_spectral_detail_loss_weight > 0
+            else self.zero
+        )
         preemph_loss, noise_floor_loss = self.background_noise_losses(target, recon_x)
         frame_phase_loss = (
             self.frame_phase_residual_loss(target, recon_x)
@@ -2254,6 +2901,9 @@ class SoundStream(Module):
             spectral_envelope_loss * self.spectral_envelope_loss_weight +
             voiced_highband_loss * self.voiced_highband_loss_weight +
             voiced_hf_retention_loss * self.voiced_hf_retention_loss_weight +
+            upper_highband_loss * self.upper_highband_loss_weight +
+            active_spectral_detail_loss *
+            self.active_spectral_detail_loss_weight +
             correlation_loss * self.correlation_loss_weight +
             click_loss * self.click_loss_weight +
             jump_loss * self.jump_loss_weight +
@@ -2282,7 +2932,9 @@ class SoundStream(Module):
                 jump_loss,
                 preemph_loss,
                 noise_floor_loss,
-                frame_phase_loss
+                frame_phase_loss,
+                upper_highband_loss,
+                active_spectral_detail_loss
             )
 
         return total_loss
@@ -2809,12 +3461,19 @@ class FrameStreamingSoundStream(SoundStream):
             self.voiced_highband_metrics(target, recon_x)
             if (
                 self.voiced_highband_loss_weight > 0 or
-                self.voiced_hf_retention_loss_weight > 0
+                self.voiced_hf_retention_loss_weight > 0 or
+                self.upper_highband_loss_weight > 0
             )
-            else (self.zero,) * 7
+            else (self.zero,) * 12
         )
         voiced_highband_loss = voiced_highband_metrics[0]
         voiced_hf_retention_loss = voiced_highband_metrics[6]
+        upper_highband_loss = voiced_highband_metrics[7]
+        active_spectral_detail_loss = (
+            self.active_spectral_detail_metrics(target, recon_x)[0]
+            if self.active_spectral_detail_loss_weight > 0
+            else self.zero
+        )
         adversarial_loss, feature_loss = self.generator_perceptual_losses(
             orig_x,
             recon_x
@@ -2836,6 +3495,9 @@ class FrameStreamingSoundStream(SoundStream):
             spectral_envelope_loss * self.spectral_envelope_loss_weight +
             voiced_highband_loss * self.voiced_highband_loss_weight +
             voiced_hf_retention_loss * self.voiced_hf_retention_loss_weight +
+            upper_highband_loss * self.upper_highband_loss_weight +
+            active_spectral_detail_loss *
+            self.active_spectral_detail_loss_weight +
             correlation_loss * self.correlation_loss_weight +
             click_loss * self.click_loss_weight +
             jump_loss * self.jump_loss_weight +
@@ -2866,7 +3528,9 @@ class FrameStreamingSoundStream(SoundStream):
                 preemph_loss,
                 noise_floor_loss,
                 boundary_loss,
-                stream_consistency_loss
+                stream_consistency_loss,
+                upper_highband_loss,
+                active_spectral_detail_loss
             )
 
         return total_loss

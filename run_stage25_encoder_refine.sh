@@ -34,9 +34,14 @@ mkdir -p "$PWD/logs"
 printf '%s\n' "$LOG_FILE" > "$PWD/logs/current_stage25_log_file.txt"
 printf '%s\n' "$RESULTS_DIR" > "$PWD/logs/current_stage25_results_dir.txt"
 mapfile -t DECODER_CONFIG < <("$PYTHON_BIN" tools/checkpoint_decoder_config.py "$INIT_CHECKPOINT")
-if [[ "${#DECODER_CONFIG[@]}" -ne 2 ]]; then
+if [[ "${#DECODER_CONFIG[@]}" -ne 4 ]]; then
   echo "ERROR: 无法读取 checkpoint 的 Decoder 配置。" >&2
   exit 1
+fi
+if [[ "${DECODER_CONFIG[3]}" == "1" ]]; then
+  DECODER_SPLIT_FLAG="--decoder-split-first-upsample"
+else
+  DECODER_SPLIT_FLAG="--no-decoder-split-first-upsample"
 fi
 
 echo "===== Stage 2.5: short Encoder + Decoder refinement ====="
@@ -44,7 +49,7 @@ echo "INIT_CHECKPOINT=$INIT_CHECKPOINT"
 echo "RESULTS_DIR=$RESULTS_DIR"
 echo "LOG_FILE=$LOG_FILE"
 echo "GPU_LIST=$GPU_LIST"
-echo "Decoder architecture: mode=${DECODER_CONFIG[0]}, kernel_min=${DECODER_CONFIG[1]}"
+echo "Decoder architecture: mode=${DECODER_CONFIG[0]}, kernel_min=${DECODER_CONFIG[1]}, interpolation=${DECODER_CONFIG[2]}, split_first_x8=${DECODER_CONFIG[3]}"
 
 CUDA_VISIBLE_DEVICES="$GPU_LIST" accelerate launch \
   --multi_gpu \
@@ -61,6 +66,8 @@ CUDA_VISIBLE_DEVICES="$GPU_LIST" accelerate launch \
   --results-dir "$RESULTS_DIR" \
   --decoder-upsample-mode "${DECODER_CONFIG[0]}" \
   --decoder-linear-upsample-kernel-min "${DECODER_CONFIG[1]}" \
+  --decoder-interpolation-mode "${DECODER_CONFIG[2]}" \
+  "$DECODER_SPLIT_FLAG" \
   --num-train-steps 10000 \
   --stage25-decoder-lr 2e-7 \
   --stage25-encoder-lr 1e-7 \

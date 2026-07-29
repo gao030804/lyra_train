@@ -28,14 +28,28 @@ def main() -> None:
     config = pickle.loads(package["config"])
     mode = str(config.get("decoder_upsample_mode", "convtranspose"))
     kernel_min = int(config.get("decoder_linear_upsample_kernel_min", 0))
+    interpolation_mode = str(config.get("decoder_interpolation_mode", "linear"))
+    split_first_upsample = bool(
+        config.get("decoder_split_first_upsample", False)
+    )
     if mode not in ("convtranspose", "linear"):
         raise ValueError(f"Unsupported decoder_upsample_mode={mode!r}")
     if kernel_min < 0:
         raise ValueError(f"Invalid decoder_linear_upsample_kernel_min={kernel_min}")
+    if interpolation_mode not in ("linear", "cubic"):
+        raise ValueError(
+            f"Unsupported decoder_interpolation_mode={interpolation_mode!r}"
+        )
+    if split_first_upsample and mode != "linear":
+        raise ValueError(
+            "decoder_split_first_upsample requires decoder_upsample_mode='linear'"
+        )
 
     # One raw value per line keeps Bash mapfile parsing unambiguous.
     print(mode)
     print(kernel_min)
+    print(interpolation_mode)
+    print(1 if split_first_upsample else 0)
 
 
 if __name__ == "__main__":
