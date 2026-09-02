@@ -5,175 +5,117 @@ import torch
 
 import train_soundstream
 from train_soundstream import (
-    AC320_ABSOLUTE_GATE_STAGES,
     QUALITY_RETENTION_STAGES,
     STAGE_DEFAULTS,
-    build_model_from_checkpoint,
-    checkpoint_handoff_failure_reasons,
     load_model_weights_only,
 )
 
 
-def test_ac320_absolute_gate_is_stage1_only():
-    assert "recon_pretrain" in AC320_ABSOLUTE_GATE_STAGES
-    assert "spectral_refine" not in AC320_ABSOLUTE_GATE_STAGES
-    assert "gan_pretrain" not in AC320_ABSOLUTE_GATE_STAGES
-    assert "hardware_qat_finetune" not in AC320_ABSOLUTE_GATE_STAGES
+def test_ac320_is_diagnostic_only():
+    """The retired absolute gate must not silently return."""
+    assert not hasattr(train_soundstream, "AC320_ABSOLUTE_GATE_STAGES")
 
 
-def test_spectral_refine_is_two_phase_bounded_frame_leakage_repair():
+def test_stage1_formant_training_schedule():
+    stage1 = STAGE_DEFAULTS["recon_pretrain"]
+
+    assert stage1["spectral_envelope_loss_weight"] == pytest.approx(0.08)
+    assert stage1["spectral_envelope_loss_start_steps"] == 5_000
+    assert stage1["spectral_envelope_loss_warmup_steps"] == 15_000
+    assert stage1["formant_peak_loss_weight"] == pytest.approx(0.02)
+    assert stage1["formant_peak_loss_start_steps"] == 15_000
+    assert stage1["formant_peak_loss_warmup_steps"] == 20_000
+    assert stage1["stft_recon_loss_weight"] == pytest.approx(0.05)
+    assert stage1["stft_recon_loss_start_steps"] == 5_000
+    assert stage1["stft_recon_loss_warmup_steps"] == 15_000
+    assert stage1["voiced_highband_loss_weight"] == pytest.approx(0.04)
+    assert stage1["upper_highband_loss_weight"] == pytest.approx(0.0025)
+
+
+def test_spectral_refine_matches_current_optional_profile():
     refine = STAGE_DEFAULTS["spectral_refine"]
 
     assert "spectral_refine" in QUALITY_RETENTION_STAGES
-    assert refine["lr"] == 5e-6
-    assert refine["encoder_lr"] == 5e-7
-    assert refine["encoder_unfreeze_step"] == 3_000
-    assert refine["patience"] == 100
-    assert refine["quality_retention_patience"] == 100
-    assert refine["frame_phase_loss_weight"] == pytest.approx(0.05)
-    assert refine["frame_phase_loss_warmup_steps"] == 3_000
-    assert refine["voiced_highband_loss_weight"] == pytest.approx(0.15)
-    assert refine["voiced_highband_loss_warmup_steps"] == 0
-    assert refine["voiced_hf_retention_loss_weight"] == pytest.approx(0.005)
-    assert refine["stft_recon_loss_weight"] == pytest.approx(0.05)
-    assert refine["quality_retention_start_step"] == 3_000
-    assert refine["decoder_x8_residual_scale_target"] is None
-    assert refine["decoder_x8_residual_scale_ramp_steps"] == 0
+    assert refine["lr"] == pytest.approx(2e-5)
+    assert refine["patience"] == 30
+    assert refine["spectral_envelope_loss_weight"] == pytest.approx(0.05)
+    assert refine["formant_peak_loss_weight"] == pytest.approx(0.02)
+    assert refine["formant_peak_loss_warmup_steps"] == 5_000
+    assert refine["stft_recon_loss_weight"] == pytest.approx(0.10)
+    assert refine["frame_phase_loss_weight"] == pytest.approx(0.005)
+    assert refine["decoder_x8_residual_scale_target"] == pytest.approx(0.85)
+    assert refine["decoder_x8_residual_scale_ramp_steps"] == 3_000
 
 
-def test_spectral_gradient_diagnostic_defaults_to_validation_interval(monkeypatch):
+def test_loss_gradient_diagnostic_default(monkeypatch):
     monkeypatch.setattr("sys.argv", ["train_soundstream.py"])
     args = train_soundstream.parse_args()
 
-    assert args.spectral_grad_diagnostics_every == 250
+    assert args.loss_grad_diagnostics_every == 1_000
 
 
 class GeneratorOnlyModel:
-    def __init__(self, latent_context_frames):
-        self.decoder_latent_context_frames = latent_context_frames
+    decoder_upsample_mode = "linear"
+    decoder_linear_upsample_kernel_min = 4
+    decoder_interpolation_mode = "linear"
+    decoder_split_first_upsample = False
+    encoder_depthwise_separable_blocks = (2, 3)
+    encoder_depthwise_separable_revision = 2
 
-    def load_generator_state_dict(
-        self,
-        state_dict,
-        *,
-        allow_missing_latent_context=False,
-    ):
+    def load_generator_state_dict(self, state_dict):
         assert state_dict == {}
-        self.allow_missing_latent_context = allow_missing_latent_context
         return []
 
 
-class TinyCheckpointModel(torch.nn.Module):
-    def __init__(self, gain=1.):
-        super().__init__()
-        self.register_buffer("gain", torch.tensor(float(gain)))
-        self.runtime_restored = False
-
-    def restore_decoder_runtime_state(self, config):
-        self.runtime_restored = config["gain"] == float(self.gain)
-
-
-def test_streaming_stages_preserve_stage2_latent_context_structure():
-    assert STAGE_DEFAULTS["gan_pretrain"]["decoder_latent_context_frames"] == 4
-    assert STAGE_DEFAULTS["stream_finetune"]["decoder_latent_context_frames"] == 4
-    assert STAGE_DEFAULTS["stream_finetune_long"]["decoder_latent_context_frames"] == 4
-    assert STAGE_DEFAULTS["hardware_qat_finetune"]["decoder_latent_context_frames"] == 4
+def matching_config(**overrides):
+    config = {
+        "decoder_upsample_mode": "linear",
+        "decoder_linear_upsample_kernel_min": 4,
+        "decoder_interpolation_mode": "linear",
+        "decoder_split_first_upsample": False,
+        "encoder_depthwise_separable_blocks": (2, 3),
+        "encoder_depthwise_separable_revision": 2,
+    }
+    config.update(overrides)
+    return config
 
 
-def test_final_hardware_qat_uses_low_lr_and_fixed_full_rvq_profile():
-    qat = STAGE_DEFAULTS["hardware_qat_finetune"]
-    assert qat["lr"] == 5e-7
-    assert qat["encoder_lr"] == 3e-6
-    assert qat["gan_adversarial_max"] == 0.
+def save_generator_checkpoint(path, config):
+    torch.save({"config": pickle.dumps(config), "model": {}}, path)
 
 
-def test_checkpoint_loader_reports_latent_context_mismatch(tmp_path):
-    checkpoint = tmp_path / "checkpoint.pt"
-    torch.save(
-        {
-            "config": pickle.dumps({"decoder_latent_context_frames": 4}),
-            "model": {},
-        },
-        checkpoint,
+def test_generator_checkpoint_accepts_matching_current_topology(tmp_path):
+    checkpoint = tmp_path / "matching.pt"
+    save_generator_checkpoint(checkpoint, matching_config())
+
+    config = load_model_weights_only(
+        GeneratorOnlyModel(), checkpoint, generator_only=True
     )
 
-    with pytest.raises(ValueError, match="latent-context structure mismatch"):
+    assert config["encoder_depthwise_separable_revision"] == 2
+
+
+def test_generator_checkpoint_rejects_old_dscnn_activation_revision(tmp_path):
+    checkpoint = tmp_path / "old-revision.pt"
+    save_generator_checkpoint(
+        checkpoint,
+        matching_config(encoder_depthwise_separable_revision=1),
+    )
+
+    with pytest.raises(ValueError, match="activation topology mismatch"):
         load_model_weights_only(
-            GeneratorOnlyModel(latent_context_frames=0),
-            checkpoint,
-            generator_only=True,
+            GeneratorOnlyModel(), checkpoint, generator_only=True
         )
 
 
-def test_checkpoint_loader_allows_only_explicit_zero_to_four_context_expansion(tmp_path):
-    checkpoint = tmp_path / "stage1.pt"
-    torch.save(
-        {
-            "config": pickle.dumps({"decoder_latent_context_frames": 0}),
-            "model": {},
-        },
+def test_generator_checkpoint_rejects_decoder_interpolation_mismatch(tmp_path):
+    checkpoint = tmp_path / "cubic.pt"
+    save_generator_checkpoint(
         checkpoint,
-    )
-    model = GeneratorOnlyModel(latent_context_frames=4)
-
-    load_model_weights_only(
-        model,
-        checkpoint,
-        generator_only=True,
-        allow_latent_context_expansion=True,
+        matching_config(decoder_interpolation_mode="cubic"),
     )
 
-    assert model.allow_missing_latent_context is True
-
-
-def test_evaluation_model_is_rebuilt_from_checkpoint_config(monkeypatch, tmp_path):
-    checkpoint = tmp_path / "exact-config.pt"
-    reference = TinyCheckpointModel(gain=3.5)
-    torch.save(
-        {
-            "config": pickle.dumps({"gain": 3.5}),
-            "model": reference.state_dict(),
-        },
-        checkpoint,
-    )
-    monkeypatch.setattr(train_soundstream, "SoundStream", TinyCheckpointModel)
-
-    rebuilt, config, _ = build_model_from_checkpoint(checkpoint)
-
-    assert isinstance(rebuilt, TinyCheckpointModel)
-    assert config == {"gain": 3.5}
-    assert rebuilt.gain.item() == pytest.approx(3.5)
-    assert rebuilt.runtime_restored is True
-
-
-def test_handoff_gate_rejects_collapsed_readback_metrics():
-    reasons = checkpoint_handoff_failure_reasons({
-        "score": 1.,
-        "aligned_si_sdr": -38.,
-        "aligned_correlation": 0.02,
-        "active_code_ratio": 0.,
-        "codebook_perplexity": 0.,
-        "q00_validation_eligible": 0.,
-        "q01_validation_eligible": 0.,
-        "rvq_validation_eligible": 0.,
-    })
-
-    assert "aligned_si_sdr<-10dB" in reasons
-    assert "aligned_correlation<0.10" in reasons
-    assert "rvq_unhealthy" in reasons
-
-
-def test_handoff_gate_rejects_excess_320hz_leakage():
-    reasons = checkpoint_handoff_failure_reasons({
-        "score": 1.,
-        "aligned_si_sdr": 1.,
-        "aligned_correlation": 0.75,
-        "active_code_ratio": 0.99,
-        "codebook_perplexity": 200.,
-        "q00_validation_eligible": 1.,
-        "q01_validation_eligible": 1.,
-        "rvq_validation_eligible": 1.,
-        "ac_320_isolated": 0.1378,
-    })
-
-    assert "ac_320_isolated>0.1000" in reasons
+    with pytest.raises(ValueError, match="decoder interpolation mismatch"):
+        load_model_weights_only(
+            GeneratorOnlyModel(), checkpoint, generator_only=True
+        )
