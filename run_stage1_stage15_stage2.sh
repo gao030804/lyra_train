@@ -277,10 +277,17 @@ run_and_log "$STAGE1_LOG" "$RESUME_STAGE1" run_stage "Stage 1: recon_pretrain" 2
   --si-sdr-loss-weight 0.07 \
   --si-sdr-loss-start-steps 5000 \
   --si-sdr-loss-warmup-steps 15000 \
-  --spectral-envelope-loss-weight 0.05 \
+  --spectral-envelope-loss-weight 0.08 \
   --spectral-envelope-loss-start-steps 5000 \
-  --spectral-envelope-loss-warmup-steps 10000 \
-  --voiced-highband-loss-weight 0.06 \
+  --spectral-envelope-loss-warmup-steps 15000 \
+  --formant-peak-loss-weight 0.02 \
+  --formant-peak-loss-start-steps 15000 \
+  --formant-peak-loss-warmup-steps 20000 \
+  --stft-recon-loss-weight 0.05 \
+  --stft-recon-loss-start-steps 5000 \
+  --stft-recon-loss-warmup-steps 15000 \
+  --loss-grad-diagnostics-every 1000 \
+  --voiced-highband-loss-weight 0.04 \
   --voiced-highband-loss-start-steps 5000 \
   --voiced-highband-loss-warmup-steps 15000 \
   --voiced-highband-energy-deficit-weight 0.35 \
@@ -404,6 +411,10 @@ run_stage "Stage 2: gan_pretrain" 29503 \
   --si-sdr-loss-start-steps 0 \
   --si-sdr-loss-warmup-steps 0 \
   --spectral-envelope-loss-weight 0.05 \
+  --formant-peak-loss-weight 0.01 \
+  --formant-peak-loss-start-steps 0 \
+  --formant-peak-loss-warmup-steps 5000 \
+  --loss-grad-diagnostics-every 1000 \
   --voiced-highband-loss-weight 0.06 \
   --voiced-highband-energy-deficit-weight 0.40 \
   --voiced-highband-energy-margin-db 0.05 \

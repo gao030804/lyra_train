@@ -884,6 +884,7 @@ class SoundStream(Module):
         multi_spectral_recon_loss_weight = 1.,
         stft_recon_loss_weight = 0.,
         spectral_envelope_loss_weight = 0.,
+        formant_peak_loss_weight = 0.,
         voiced_highband_loss_weight = 0.,
         upper_highband_loss_weight = 0.,
         active_spectral_detail_loss_weight = 0.,
@@ -1178,11 +1179,24 @@ class SoundStream(Module):
         self.spectral_envelope_n_fft = 1024
         self.spectral_envelope_win_length = 640
         self.spectral_envelope_hop_length = 160
-        self.spectral_envelope_smoothing_bins = 9
+        # Dual-scale real-cepstral envelopes: the 48-coefficient branch keeps
+        # narrower formant shape, while the 32-coefficient branch suppresses
+        # harmonic ripple.  This weakens the old single 9-bin smoothing
+        # without removing the stable coarse-envelope reference.
+        self.spectral_envelope_fine_lifter = 48
+        self.spectral_envelope_coarse_lifter = 32
+        self.spectral_envelope_fine_weight = 0.55
+        self.spectral_envelope_coarse_weight = 0.45
+        self.spectral_envelope_slope_weight = 0.35
+        self.spectral_envelope_curvature_weight = 0.15
         self.spectral_envelope_min_hz = 200.
         self.spectral_envelope_max_hz = 4500.
         self.spectral_envelope_relative_rms_db = -35.
         self.spectral_envelope_absolute_rms = 0.003
+        self.spectral_envelope_periodicity_threshold = 0.35
+        self.spectral_envelope_f0_min_hz = 70.
+        self.spectral_envelope_f0_max_hz = 400.
+        self.formant_peak_softmax_temperature = 8.
         # Optimize the band that carries speech presence and consonant detail
         # more strongly than the upper "air" band.  A flat 3-7 kHz objective
         # left the k4-online checkpoint measurably dull, while uniformly
@@ -1259,6 +1273,8 @@ class SoundStream(Module):
             raise ValueError('upper_highband_energy_margin_db must be >= 0')
         if voiced_hf_retention_loss_weight < 0:
             raise ValueError('voiced_hf_retention_loss_weight must be >= 0')
+        if formant_peak_loss_weight < 0:
+            raise ValueError('formant_peak_loss_weight must be >= 0')
         if voiced_hf_retention_margin_db < 0:
             raise ValueError('voiced_hf_retention_margin_db must be >= 0')
         self.voiced_highband_energy_deficit_weight = float(
@@ -1301,7 +1317,7 @@ class SoundStream(Module):
         stft_weight_by_win_length = {
             64: 0.25,
             128: 0.50,
-            256: 1.00,
+            256: 0.75,
             512: 1.00,
             1024: 1.00,
             2048: 0.75
@@ -1344,6 +1360,7 @@ class SoundStream(Module):
         self.multi_spectral_recon_loss_weight = multi_spectral_recon_loss_weight
         self.stft_recon_loss_weight = stft_recon_loss_weight
         self.spectral_envelope_loss_weight = spectral_envelope_loss_weight
+        self.formant_peak_loss_weight = formant_peak_loss_weight
         self.voiced_highband_loss_weight = voiced_highband_loss_weight
         self.upper_highband_loss_weight = upper_highband_loss_weight
         self.active_spectral_detail_loss_weight = (
@@ -1588,6 +1605,7 @@ class SoundStream(Module):
         spectral_loss = linear_spectral_loss + 0.5 * log_spectral_loss
 
         stft_loss = self.zero
+        self._last_stft_scale_losses = {}
         if self.stft_recon_loss_weight > 0:
             stft_losses = []
             stft_weights = []
@@ -1652,6 +1670,7 @@ class SoundStream(Module):
                     0.5 * spectral_convergence +
                     1.0 * log_mag_loss
                 )
+                self._last_stft_scale_losses[str(win_length)] = one_stft_loss
                 stft_losses.append(alpha * one_stft_loss)
                 stft_weights.append(alpha)
 
@@ -1678,12 +1697,7 @@ class SoundStream(Module):
         return -si_sdr.mean()
 
     def spectral_envelope_metrics(self, target, recon):
-        """Return voiced, frequency-smoothed vocal-tract envelope errors.
-
-        The per-frame mean log magnitude is removed before comparison so this
-        objective follows the formant-envelope shape rather than absolute
-        loudness or a stationary recording-noise floor.
-        """
+        """Return periodic-voiced, dual-cepstral vocal-tract envelope errors."""
         target_rows = target.float()
         recon_rows = recon.float()
         if target_rows.ndim == 3:
@@ -1721,20 +1735,29 @@ class SoundStream(Module):
             eps = 1e-5
         )
 
-        smoothing_bins = self.spectral_envelope_smoothing_bins
-        smooth_padding = smoothing_bins // 2
-        target_envelope = F.avg_pool2d(
-            target_log_mag.unsqueeze(1),
-            kernel_size = (smoothing_bins, 1),
-            stride = 1,
-            padding = (smooth_padding, 0)
-        ).squeeze(1)
-        recon_envelope = F.avg_pool2d(
-            recon_log_mag.unsqueeze(1),
-            kernel_size = (smoothing_bins, 1),
-            stride = 1,
-            padding = (smooth_padding, 0)
-        ).squeeze(1)
+        def cepstral_envelope(log_magnitude, lifter_order):
+            cepstrum = torch.fft.irfft(
+                log_magnitude,
+                n = self.spectral_envelope_n_fft,
+                dim = 1
+            )
+            liftered = torch.zeros_like(cepstrum)
+            liftered[:, :lifter_order + 1] = cepstrum[:, :lifter_order + 1]
+            liftered[:, -lifter_order:] = cepstrum[:, -lifter_order:]
+            return torch.fft.rfft(liftered, dim = 1).real
+
+        target_fine = cepstral_envelope(
+            target_log_mag, self.spectral_envelope_fine_lifter
+        )
+        recon_fine = cepstral_envelope(
+            recon_log_mag, self.spectral_envelope_fine_lifter
+        )
+        target_coarse = cepstral_envelope(
+            target_log_mag, self.spectral_envelope_coarse_lifter
+        )
+        recon_coarse = cepstral_envelope(
+            recon_log_mag, self.spectral_envelope_coarse_lifter
+        )
 
         frequencies = torch.fft.rfftfreq(
             self.spectral_envelope_n_fft,
@@ -1745,64 +1768,234 @@ class SoundStream(Module):
             (frequencies >= self.spectral_envelope_min_hz) &
             (frequencies <= self.spectral_envelope_max_hz)
         )
-        target_envelope = target_envelope[:, voice_band]
-        recon_envelope = recon_envelope[:, voice_band]
+        target_fine = target_fine[:, voice_band]
+        recon_fine = recon_fine[:, voice_band]
+        target_coarse = target_coarse[:, voice_band]
+        recon_coarse = recon_coarse[:, voice_band]
 
-        # Remove frame-level gain so the loss focuses on envelope shape.
-        target_envelope = target_envelope - target_envelope.mean(
-            dim = 1,
-            keepdim = True
-        )
-        recon_envelope = recon_envelope - recon_envelope.mean(
-            dim = 1,
-            keepdim = True
-        )
-        envelope_error = (recon_envelope - target_envelope).abs()
+        def remove_frame_gain(envelope):
+            return envelope - envelope.mean(dim = 1, keepdim = True)
 
-        frame_rms = F.avg_pool1d(
-            target_rows.square().unsqueeze(1),
-            kernel_size = self.spectral_envelope_win_length,
-            stride = self.spectral_envelope_hop_length,
-            padding = self.spectral_envelope_win_length // 2,
-            count_include_pad = False
-        ).squeeze(1).clamp_min(1e-12).sqrt()
-        num_frames = min(frame_rms.shape[-1], envelope_error.shape[-1])
+        target_fine = remove_frame_gain(target_fine)
+        recon_fine = remove_frame_gain(recon_fine)
+        target_coarse = remove_frame_gain(target_coarse)
+        recon_coarse = remove_frame_gain(recon_coarse)
+
+        # Match torch.stft(center=True) frame centers exactly, then compute a
+        # normalized target autocorrelation.  This rejects energetic unvoiced
+        # fricatives that the previous RMS-only mask mislabeled as voiced.
+        with torch.no_grad():
+            padded = F.pad(
+                target_rows,
+                (self.spectral_envelope_n_fft // 2,) * 2
+            )
+            frames = padded.unfold(
+                -1,
+                self.spectral_envelope_n_fft,
+                self.spectral_envelope_hop_length
+            )
+            crop_start = (
+                self.spectral_envelope_n_fft -
+                self.spectral_envelope_win_length
+            ) // 2
+            frames = frames[..., crop_start:crop_start + self.spectral_envelope_win_length]
+            frame_rms = frames.square().mean(dim = -1).clamp_min(1e-12).sqrt()
+            centered_frames = frames - frames.mean(dim = -1, keepdim = True)
+            fft_size = 2 * self.spectral_envelope_win_length
+            autocorrelation = torch.fft.irfft(
+                torch.fft.rfft(centered_frames, n = fft_size).abs().square(),
+                n = fft_size
+            )[..., :self.spectral_envelope_win_length]
+            autocorrelation = autocorrelation / autocorrelation[..., :1].clamp_min(1e-8)
+            min_lag = max(1, int(self.target_sample_hz / self.spectral_envelope_f0_max_hz))
+            max_lag = min(
+                self.spectral_envelope_win_length - 1,
+                int(self.target_sample_hz / self.spectral_envelope_f0_min_hz)
+            )
+            periodicity = autocorrelation[..., min_lag:max_lag + 1].amax(dim = -1)
+
+        num_frames = min(
+            frame_rms.shape[-1],
+            target_fine.shape[-1],
+            target_coarse.shape[-1]
+        )
         frame_rms = frame_rms[..., :num_frames]
-        envelope_error = envelope_error[..., :num_frames]
+        periodicity = periodicity[..., :num_frames]
+        target_fine = target_fine[..., :num_frames]
+        recon_fine = recon_fine[..., :num_frames]
+        target_coarse = target_coarse[..., :num_frames]
+        recon_coarse = recon_coarse[..., :num_frames]
         relative_floor = (
             frame_rms.amax(dim = -1, keepdim = True) *
             (10. ** (self.spectral_envelope_relative_rms_db / 20.))
         )
         voiced_mask = (
             (frame_rms >= relative_floor) &
-            (frame_rms >= self.spectral_envelope_absolute_rms)
+            (frame_rms >= self.spectral_envelope_absolute_rms) &
+            (periodicity >= self.spectral_envelope_periodicity_threshold)
         )
-        voiced_weight = voiced_mask.unsqueeze(1).to(envelope_error.dtype)
-
-        def masked_band_mean(error, band_mask):
-            band_error = error[:, band_mask]
-            denominator = (
-                voiced_weight.sum() * max(band_error.shape[1], 1)).clamp_min(1.)
-            return (band_error * voiced_weight).sum() / denominator
+        voiced_weight = voiced_mask.unsqueeze(1).to(target_fine.dtype)
 
         voice_frequencies = frequencies[voice_band]
-        total_loss = masked_band_mean(
-            envelope_error,
-            torch.ones_like(voice_frequencies, dtype = torch.bool)
+        region_weights = torch.ones_like(voice_frequencies)
+        region_weights = torch.where(
+            (voice_frequencies >= 1000.) & (voice_frequencies < 2500.),
+            region_weights.new_tensor(1.30), region_weights
+        )
+        region_weights = torch.where(
+            voice_frequencies >= 2500.,
+            region_weights.new_tensor(1.15), region_weights
+        )
+
+        def masked_band_mean(error, band_mask, use_region_weights = False):
+            band_error = error[:, band_mask]
+            available_region_weights = region_weights[:error.shape[1]]
+            frequency_weight = (
+                available_region_weights[band_mask].view(1, -1, 1)
+                if use_region_weights
+                else band_error.new_ones((1, band_error.shape[1], 1))
+            )
+            denominator = (
+                voiced_weight.sum() * frequency_weight.sum()
+            ).clamp_min(1.)
+            return (band_error * voiced_weight * frequency_weight).sum() / denominator
+
+        all_frequencies = torch.ones_like(voice_frequencies, dtype = torch.bool)
+
+        def envelope_objective(target_envelope, recon_envelope):
+            value_error = (recon_envelope - target_envelope).abs()
+            slope_error = (
+                recon_envelope.diff(dim = 1) -
+                target_envelope.diff(dim = 1)
+            ).abs()
+            curvature_error = (
+                recon_envelope.diff(n = 2, dim = 1) -
+                target_envelope.diff(n = 2, dim = 1)
+            ).abs()
+            value_loss = masked_band_mean(value_error, all_frequencies, True)
+            slope_loss = masked_band_mean(
+                slope_error,
+                all_frequencies[:-1],
+                True
+            )
+            curvature_loss = masked_band_mean(
+                curvature_error,
+                all_frequencies[:-2],
+                True
+            )
+            return (
+                value_loss +
+                self.spectral_envelope_slope_weight * slope_loss +
+                self.spectral_envelope_curvature_weight * curvature_loss,
+                value_error,
+                value_loss,
+                slope_loss,
+                curvature_loss,
+            )
+
+        fine_loss, fine_error, fine_value, fine_slope, fine_curvature = envelope_objective(
+            target_fine, recon_fine
+        )
+        coarse_loss, coarse_error, coarse_value, coarse_slope, coarse_curvature = envelope_objective(
+            target_coarse, recon_coarse
+        )
+        total_loss = (
+            self.spectral_envelope_fine_weight * fine_loss +
+            self.spectral_envelope_coarse_weight * coarse_loss
+        )
+        combined_error = (
+            self.spectral_envelope_fine_weight * fine_error +
+            self.spectral_envelope_coarse_weight * coarse_error
         )
         low_loss = masked_band_mean(
-            envelope_error,
+            combined_error,
             (voice_frequencies >= 200.) & (voice_frequencies < 1000.)
         )
         mid_loss = masked_band_mean(
-            envelope_error,
+            combined_error,
             (voice_frequencies >= 1000.) & (voice_frequencies < 2500.)
         )
         high_loss = masked_band_mean(
-            envelope_error,
+            combined_error,
             (voice_frequencies >= 2500.) & (voice_frequencies <= 4500.)
         )
         voiced_fraction = voiced_mask.float().mean()
+
+        # Stage 1 of direct F1/F2/F3 supervision is always-on diagnostics.
+        # Stage 2 is activated only when formant_peak_loss_weight is ramped by
+        # the trainer.  Target peaks and confidence masks are detached.
+        formant_bands = (
+            ('f1', 200., 1000., 1.0),
+            ('f2', 1000., 2500., 1.3),
+            ('f3', 2500., 4500., 0.8),
+        )
+        peak_loss_terms = []
+        peak_weights = []
+        peak_diagnostics = {}
+        for name, minimum_hz, maximum_hz, formant_weight in formant_bands:
+            band_mask = (
+                (voice_frequencies >= minimum_hz) &
+                (voice_frequencies < maximum_hz)
+            )
+            band_frequencies = voice_frequencies[band_mask].view(1, -1, 1)
+            target_band = target_fine[:, band_mask]
+            recon_band = recon_fine[:, band_mask]
+            target_distribution = torch.softmax(
+                self.formant_peak_softmax_temperature * target_band.detach(),
+                dim = 1
+            )
+            recon_distribution = torch.softmax(
+                self.formant_peak_softmax_temperature * recon_band,
+                dim = 1
+            )
+            target_position = (target_distribution * band_frequencies).sum(dim = 1)
+            recon_position = (recon_distribution * band_frequencies).sum(dim = 1)
+            prominence = (
+                target_band.detach().amax(dim = 1) -
+                target_band.detach().mean(dim = 1)
+            )
+            confidence = (prominence >= 0.10) & voiced_mask
+            confidence_weight = confidence.to(target_band.dtype)
+            denominator = confidence_weight.sum().clamp_min(1.)
+            position_error_hz = (recon_position - target_position).abs()
+            position_loss = (
+                position_error_hz * confidence_weight
+            ).sum() / denominator / max(maximum_hz - minimum_hz, 1.)
+            target_amplitude = (target_distribution * target_band.detach()).sum(dim = 1)
+            recon_amplitude = (target_distribution * recon_band).sum(dim = 1)
+            amplitude_loss = (
+                (recon_amplitude - target_amplitude).abs() * confidence_weight
+            ).sum() / denominator
+            target_shape = target_band.detach() - target_band.detach().mean(dim = 1, keepdim = True)
+            recon_shape = recon_band - recon_band.mean(dim = 1, keepdim = True)
+            shape_error = (recon_shape - target_shape).abs().mean(dim = 1)
+            shape_loss = (shape_error * confidence_weight).sum() / denominator
+            one_peak_loss = position_loss + 0.30 * amplitude_loss + 0.30 * shape_loss
+            peak_loss_terms.append(formant_weight * one_peak_loss)
+            peak_weights.append(formant_weight)
+            peak_diagnostics[f'{name}_mae_hz'] = (
+                position_error_hz * confidence_weight
+            ).sum() / denominator
+            peak_diagnostics[f'{name}_valid_fraction'] = confidence.float().mean()
+
+        formant_peak_loss = sum(peak_loss_terms) / max(sum(peak_weights), 1e-8)
+        self._last_formant_metrics = {
+            'fine_loss': fine_loss,
+            'coarse_loss': coarse_loss,
+            'fine_value': fine_value,
+            'fine_slope': fine_slope,
+            'fine_curvature': fine_curvature,
+            'coarse_value': coarse_value,
+            'coarse_slope': coarse_slope,
+            'coarse_curvature': coarse_curvature,
+            'periodicity_mean': (
+                (periodicity * voiced_mask.float()).sum() /
+                voiced_mask.float().sum().clamp_min(1.)
+            ),
+            'voiced_fraction': voiced_fraction,
+            'peak_loss': formant_peak_loss,
+            **peak_diagnostics,
+        }
         return total_loss, low_loss, mid_loss, high_loss, voiced_fraction
 
     def voiced_highband_metrics(self, target, recon):
@@ -2989,7 +3182,15 @@ class SoundStream(Module):
         click_loss, jump_loss = self.transient_noise_losses(target, recon_x)
         spectral_envelope_loss = (
             self.spectral_envelope_metrics(target, recon_x)[0]
-            if self.spectral_envelope_loss_weight > 0
+            if (
+                self.spectral_envelope_loss_weight > 0 or
+                self.formant_peak_loss_weight > 0
+            )
+            else self.zero
+        )
+        formant_peak_loss = (
+            self._last_formant_metrics['peak_loss']
+            if hasattr(self, '_last_formant_metrics')
             else self.zero
         )
         voiced_highband_metrics = (
@@ -3030,6 +3231,7 @@ class SoundStream(Module):
             stft_recon_loss * self.stft_recon_loss_weight +
             si_sdr_loss * self.si_sdr_loss_weight +
             spectral_envelope_loss * self.spectral_envelope_loss_weight +
+            formant_peak_loss * self.formant_peak_loss_weight +
             voiced_highband_loss * self.voiced_highband_loss_weight +
             voiced_hf_retention_loss * self.voiced_hf_retention_loss_weight +
             upper_highband_loss * self.upper_highband_loss_weight +
@@ -3065,7 +3267,8 @@ class SoundStream(Module):
                 noise_floor_loss,
                 frame_phase_loss,
                 upper_highband_loss,
-                active_spectral_detail_loss
+                active_spectral_detail_loss,
+                formant_peak_loss
             )
 
         return total_loss
@@ -3585,7 +3788,15 @@ class FrameStreamingSoundStream(SoundStream):
         preemph_loss, noise_floor_loss = self.background_noise_losses(target, recon_x)
         spectral_envelope_loss = (
             self.spectral_envelope_metrics(target, recon_x)[0]
-            if self.spectral_envelope_loss_weight > 0
+            if (
+                self.spectral_envelope_loss_weight > 0 or
+                self.formant_peak_loss_weight > 0
+            )
+            else self.zero
+        )
+        formant_peak_loss = (
+            self._last_formant_metrics['peak_loss']
+            if hasattr(self, '_last_formant_metrics')
             else self.zero
         )
         voiced_highband_metrics = (
@@ -3624,6 +3835,7 @@ class FrameStreamingSoundStream(SoundStream):
             stft_recon_loss * self.stft_recon_loss_weight +
             si_sdr_loss * self.si_sdr_loss_weight +
             spectral_envelope_loss * self.spectral_envelope_loss_weight +
+            formant_peak_loss * self.formant_peak_loss_weight +
             voiced_highband_loss * self.voiced_highband_loss_weight +
             voiced_hf_retention_loss * self.voiced_hf_retention_loss_weight +
             upper_highband_loss * self.upper_highband_loss_weight +
@@ -3661,7 +3873,8 @@ class FrameStreamingSoundStream(SoundStream):
                 boundary_loss,
                 stream_consistency_loss,
                 upper_highband_loss,
-                active_spectral_detail_loss
+                active_spectral_detail_loss,
+                formant_peak_loss
             )
 
         return total_loss

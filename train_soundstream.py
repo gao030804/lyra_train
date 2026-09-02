@@ -87,25 +87,35 @@ STAGE_DEFAULTS = {
         click_loss_weight=0.002, jump_loss_weight=0.,
         preemph_loss_weight=0., noise_floor_loss_weight=0.03,
         transient_loss_warmup_steps=5_000,
-        spectral_envelope_loss_weight=0.05,
+        # Dual-scale cepstral envelope: the fine branch is deliberately only
+        # slightly stronger than the coarse fallback, so narrow formant detail
+        # can improve without forcing an over-smoothed decoder spectrum.
+        spectral_envelope_loss_weight=0.08,
         spectral_envelope_loss_start_steps=5_000,
-        spectral_envelope_loss_warmup_steps=10_000,
+        spectral_envelope_loss_warmup_steps=15_000,
+        # Step 2 of formant learning.  Peak locations are diagnostic from the
+        # start, but receive gradients only after the envelope has stabilized.
+        formant_peak_loss_weight=0.02,
+        formant_peak_loss_start_steps=15_000,
+        formant_peak_loss_warmup_steps=20_000,
         # The k4-online run retained a -2.2 dB voiced high-band deficit even
         # though SI-SDR and frame leakage improved.  Give the speech-clarity
         # band a little more influence without turning this into a broadband
         # high-frequency boost.
-        voiced_highband_loss_weight=0.06,
+        voiced_highband_loss_weight=0.04,
         # The 7-7.8 kHz band is otherwise outside the dedicated Stage-1
         # objective.  Keep this target-active term two orders of magnitude
         # below the main voiced-highband weight and share its ramp.
-        upper_highband_loss_weight=0.005,
+        upper_highband_loss_weight=0.0025,
         upper_highband_energy_deficit_weight=0.,
         upper_highband_energy_margin_db=0.50,
         upper_highband_loss_start_steps=5_000,
         upper_highband_loss_warmup_steps=15_000,
         voiced_highband_loss_start_steps=5_000,
         voiced_highband_loss_warmup_steps=15_000,
-        stft_recon_loss_weight=0.,
+        stft_recon_loss_weight=0.05,
+        stft_recon_loss_start_steps=5_000,
+        stft_recon_loss_warmup_steps=15_000,
         si_sdr_loss_weight=0.07,
         si_sdr_loss_start_steps=5_000,
         si_sdr_loss_warmup_steps=15_000,
@@ -126,6 +136,9 @@ STAGE_DEFAULTS = {
         spectral_envelope_loss_weight=0.05,
         spectral_envelope_loss_start_steps=0,
         spectral_envelope_loss_warmup_steps=0,
+        formant_peak_loss_weight=0.02,
+        formant_peak_loss_start_steps=0,
+        formant_peak_loss_warmup_steps=5_000,
         voiced_highband_loss_weight=0.02,
         voiced_highband_loss_start_steps=0,
         voiced_highband_loss_warmup_steps=5_000,
@@ -169,6 +182,9 @@ STAGE_DEFAULTS = {
         spectral_envelope_loss_weight=0.05,
         spectral_envelope_loss_start_steps=0,
         spectral_envelope_loss_warmup_steps=0,
+        formant_peak_loss_weight=0.01,
+        formant_peak_loss_start_steps=0,
+        formant_peak_loss_warmup_steps=5_000,
         # Preserve the deterministic clarity learned in Stage 1.  Stage 2 GAN
         # gradients may add natural detail, but must not replace the paired
         # voiced high-band objective entirely.
@@ -483,6 +499,36 @@ def parse_args() -> argparse.Namespace:
         help=(
             "After its start step, linearly ramp the voiced spectral-envelope "
             "loss to its maximum weight; defaults depend on --stage."
+        ),
+    )
+    parser.add_argument(
+        "--formant-peak-loss-weight",
+        type=float,
+        default=None,
+        help=(
+            "Maximum differentiable F1/F2/F3 regional peak loss weight. "
+            "The peak metrics are still reported when this is zero."
+        ),
+    )
+    parser.add_argument(
+        "--formant-peak-loss-start-steps",
+        type=int,
+        default=None,
+        help="Delay peak-loss gradients while the cepstral envelope stabilizes.",
+    )
+    parser.add_argument(
+        "--formant-peak-loss-warmup-steps",
+        type=int,
+        default=None,
+        help="Linear ramp duration for the differentiable formant-peak loss.",
+    )
+    parser.add_argument(
+        "--loss-grad-diagnostics-every",
+        type=int,
+        default=1_000,
+        help=(
+            "Measure decoder gradient norms for each weighted reconstruction "
+            "loss every N steps; zero disables the diagnostic."
         ),
     )
     parser.add_argument(
@@ -1248,6 +1294,12 @@ def parse_args() -> argparse.Namespace:
         help="Independent MR-STFT weight; defaults depend on --stage.",
     )
     parser.add_argument(
+        "--stft-recon-loss-start-steps",
+        type=int,
+        default=None,
+        help="Initial disabled steps for independent MR-STFT loss.",
+    )
+    parser.add_argument(
         "--stft-recon-loss-warmup-steps",
         type=int,
         default=None,
@@ -1676,6 +1728,7 @@ def build_model(
     num_quantizers: int,
     si_sdr_loss_weight: float,
     spectral_envelope_loss_weight: float,
+    formant_peak_loss_weight: float,
     voiced_highband_loss_weight: float,
     upper_highband_loss_weight: float,
     active_spectral_detail_loss_weight: float,
@@ -1735,6 +1788,7 @@ def build_model(
         multi_spectral_recon_loss_weight=multi_spectral_recon_loss_weight,
         stft_recon_loss_weight=stft_recon_loss_weight,
         spectral_envelope_loss_weight=spectral_envelope_loss_weight,
+        formant_peak_loss_weight=formant_peak_loss_weight,
         voiced_highband_loss_weight=voiced_highband_loss_weight,
         upper_highband_loss_weight=upper_highband_loss_weight,
         active_spectral_detail_loss_weight=active_spectral_detail_loss_weight,
@@ -2037,6 +2091,20 @@ def main() -> None:
         raise ValueError("Stream-consistency schedule steps cannot be negative.")
     if args.spectral_envelope_loss_weight is not None and args.spectral_envelope_loss_weight < 0:
         raise ValueError("--spectral-envelope-loss-weight cannot be negative.")
+    if args.formant_peak_loss_weight is not None and args.formant_peak_loss_weight < 0:
+        raise ValueError("--formant-peak-loss-weight cannot be negative.")
+    if (
+        args.formant_peak_loss_start_steps is not None and
+        args.formant_peak_loss_start_steps < 0
+    ):
+        raise ValueError("--formant-peak-loss-start-steps cannot be negative.")
+    if (
+        args.formant_peak_loss_warmup_steps is not None and
+        args.formant_peak_loss_warmup_steps < 0
+    ):
+        raise ValueError("--formant-peak-loss-warmup-steps cannot be negative.")
+    if args.loss_grad_diagnostics_every < 0:
+        raise ValueError("--loss-grad-diagnostics-every cannot be negative.")
     if args.voiced_highband_loss_weight is not None and args.voiced_highband_loss_weight < 0:
         raise ValueError("--voiced-highband-loss-weight cannot be negative.")
     if args.upper_highband_loss_weight is not None and args.upper_highband_loss_weight < 0:
@@ -2121,6 +2189,8 @@ def main() -> None:
         raise ValueError("--stage2-active-spectral-score-weight cannot be negative.")
     if args.stft_recon_loss_weight is not None and args.stft_recon_loss_weight < 0:
         raise ValueError("--stft-recon-loss-weight cannot be negative.")
+    if args.stft_recon_loss_start_steps is not None and args.stft_recon_loss_start_steps < 0:
+        raise ValueError("--stft-recon-loss-start-steps cannot be negative.")
     if args.stft_recon_loss_warmup_steps is not None and args.stft_recon_loss_warmup_steps < 0:
         raise ValueError("--stft-recon-loss-warmup-steps cannot be negative.")
     if args.frame_phase_loss_weight is not None and args.frame_phase_loss_weight < 0:
@@ -2536,6 +2606,21 @@ def main() -> None:
         if args.spectral_envelope_loss_warmup_steps is not None
         else stage_defaults.get("spectral_envelope_loss_warmup_steps", 0)
     )
+    formant_peak_loss_weight = (
+        args.formant_peak_loss_weight
+        if args.formant_peak_loss_weight is not None
+        else stage_defaults.get("formant_peak_loss_weight", 0.)
+    )
+    formant_peak_loss_start_steps = (
+        args.formant_peak_loss_start_steps
+        if args.formant_peak_loss_start_steps is not None
+        else stage_defaults.get("formant_peak_loss_start_steps", 0)
+    )
+    formant_peak_loss_warmup_steps = (
+        args.formant_peak_loss_warmup_steps
+        if args.formant_peak_loss_warmup_steps is not None
+        else stage_defaults.get("formant_peak_loss_warmup_steps", 0)
+    )
     voiced_highband_loss_weight = (
         args.voiced_highband_loss_weight
         if args.voiced_highband_loss_weight is not None
@@ -2606,6 +2691,11 @@ def main() -> None:
         args.stft_recon_loss_weight
         if args.stft_recon_loss_weight is not None
         else stage_defaults["stft_recon_loss_weight"]
+    )
+    stft_recon_loss_start_steps = (
+        args.stft_recon_loss_start_steps
+        if args.stft_recon_loss_start_steps is not None
+        else stage_defaults.get("stft_recon_loss_start_steps", 0)
     )
     stft_recon_loss_warmup_steps = (
         args.stft_recon_loss_warmup_steps
@@ -2846,7 +2936,18 @@ def main() -> None:
         f"max_weight={spectral_envelope_loss_weight}, "
         f"start_steps={spectral_envelope_loss_start_steps if spectral_envelope_loss_weight > 0 else 0}, "
         f"warmup_steps={spectral_envelope_loss_warmup_steps if spectral_envelope_loss_weight > 0 else 0}, "
-        "band=200-4500 Hz, smoothing_bins=9"
+        "band=200-4500 Hz, cepstral_lifters=fine48/coarse32, "
+        "scale_weights=0.55/0.45, shape_weights=value1/slope0.35/curvature0.15, "
+        "region_weights=F1:1.0/F2:1.3/F3:1.15, "
+        "voicing=target_periodicity_70-400Hz(threshold=0.35)+RMS"
+    )
+    print(
+        "Formant peak loss: "
+        f"max_weight={formant_peak_loss_weight}, "
+        f"start_steps={formant_peak_loss_start_steps if formant_peak_loss_weight > 0 else 0}, "
+        f"warmup_steps={formant_peak_loss_warmup_steps if formant_peak_loss_weight > 0 else 0}, "
+        "regions=F1(200-1000)/F2(1000-2500)/F3(2500-4500)Hz, "
+        "diagnostics_always_enabled=True, hard_gate=False"
     )
     print(
         "Voiced high-band detail loss: "
@@ -2957,7 +3058,16 @@ def main() -> None:
     )
     print(
         "STFT reconstruction loss weight: "
-        f"max={stft_recon_loss_weight}, warmup_steps={stft_recon_loss_warmup_steps}"
+        f"max={stft_recon_loss_weight}, start_steps={stft_recon_loss_start_steps}, "
+        f"warmup_steps={stft_recon_loss_warmup_steps}, "
+        "scales=64/128/256/512/1024/2048, "
+        "scale_weights=0.25/0.50/0.75/1.00/1.00/0.75, "
+        "per_scale_logging=True"
+    )
+    print(
+        "Per-loss decoder gradient diagnostics: "
+        f"every={args.loss_grad_diagnostics_every} step(s) "
+        "(wave/mel/MR-STFT/envelope/formant-peak/voiced-highband/SI-SDR; 0 disables)"
     )
     if args.stage == "recon_pretrain":
         print(
@@ -3127,6 +3237,7 @@ def main() -> None:
         click_loss_weight=click_loss_weight,
         jump_loss_weight=jump_loss_weight,
         spectral_envelope_loss_weight=spectral_envelope_loss_weight,
+        formant_peak_loss_weight=formant_peak_loss_weight,
         voiced_highband_loss_weight=voiced_highband_loss_weight,
         upper_highband_loss_weight=upper_highband_loss_weight,
         active_spectral_detail_loss_weight=(
@@ -3219,6 +3330,7 @@ def main() -> None:
             if args.stage == "gan_pretrain"
             else 0
         ),
+        loss_grad_diagnostics_every=args.loss_grad_diagnostics_every,
         discr_max_grad_norm=args.discr_max_grad_norm,
         warmup_steps=warmup_steps,
         scheduler=scheduler,
@@ -3360,6 +3472,16 @@ def main() -> None:
             if spectral_envelope_loss_weight > 0
             else 0
         ),
+        formant_peak_loss_start_steps=(
+            formant_peak_loss_start_steps
+            if formant_peak_loss_weight > 0
+            else 0
+        ),
+        formant_peak_loss_warmup_steps=(
+            formant_peak_loss_warmup_steps
+            if formant_peak_loss_weight > 0
+            else 0
+        ),
         voiced_highband_loss_start_steps=(
             voiced_highband_loss_start_steps
             if voiced_highband_loss_weight > 0
@@ -3393,7 +3515,9 @@ def main() -> None:
             if active_spectral_detail_loss_weight > 0
             else 0
         ),
-        stft_recon_loss_start_steps=stage_defaults.get("stft_recon_loss_start_steps", 0),
+        stft_recon_loss_start_steps=(
+            stft_recon_loss_start_steps if stft_recon_loss_weight > 0 else 0
+        ),
         stft_recon_loss_warmup_steps=(
             stft_recon_loss_warmup_steps if stft_recon_loss_weight > 0 else 0
         ),

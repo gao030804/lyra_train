@@ -302,6 +302,7 @@ class SoundStreamTrainer(nn.Module):
         stft_discr_update_every: int = 1,
         stft_discr_loss_weight: float = 1.,
         gan_grad_diagnostics_every: int = 0,
+        loss_grad_diagnostics_every: int = 0,
         grad_accum_every: int = 4,
         wd: float = 0.,
         warmup_steps: int = 1000,
@@ -347,6 +348,8 @@ class SoundStreamTrainer(nn.Module):
         si_sdr_loss_warmup_steps: int = 0,
         spectral_envelope_loss_start_steps: int = 0,
         spectral_envelope_loss_warmup_steps: int = 0,
+        formant_peak_loss_start_steps: int = 0,
+        formant_peak_loss_warmup_steps: int = 0,
         voiced_highband_loss_start_steps: int = 0,
         voiced_highband_loss_warmup_steps: int = 0,
         upper_highband_loss_start_steps: int = 0,
@@ -499,6 +502,11 @@ class SoundStreamTrainer(nn.Module):
         )
         self.spectral_envelope_loss_start_steps = spectral_envelope_loss_start_steps
         self.spectral_envelope_loss_warmup_steps = spectral_envelope_loss_warmup_steps
+        self.formant_peak_loss_max_weight = float(
+            getattr(soundstream, 'formant_peak_loss_weight', 0.)
+        )
+        self.formant_peak_loss_start_steps = formant_peak_loss_start_steps
+        self.formant_peak_loss_warmup_steps = formant_peak_loss_warmup_steps
         self.voiced_highband_loss_max_weight = float(
             getattr(soundstream, 'voiced_highband_loss_weight', 0.)
         )
@@ -930,6 +938,8 @@ class SoundStreamTrainer(nn.Module):
         self.stft_discr_update_every = int(stft_discr_update_every)
         self.stft_discr_loss_weight = float(stft_discr_loss_weight)
         self.gan_grad_diagnostics_every = int(gan_grad_diagnostics_every)
+        assert loss_grad_diagnostics_every >= 0
+        self.loss_grad_diagnostics_every = int(loss_grad_diagnostics_every)
         discr_warmup_steps = default(discr_warmup_steps, warmup_steps)
 
         for (discr_optimizer_key, discr), one_discr_lr in zip(
@@ -1979,6 +1989,8 @@ class SoundStreamTrainer(nn.Module):
             spectral_envelope_high,
             spectral_envelope_voiced_fraction
         ) = model.spectral_envelope_metrics(target, recon)
+        formant_diagnostics = getattr(model, '_last_formant_metrics', {})
+        stft_scale_diagnostics = getattr(model, '_last_stft_scale_losses', {})
         (
             voiced_highband_loss,
             voiced_hf_energy_ratio_db,
@@ -2102,6 +2114,54 @@ class SoundStreamTrainer(nn.Module):
             spectral_envelope_mid = float(spectral_envelope_mid.detach().cpu()),
             spectral_envelope_high = float(spectral_envelope_high.detach().cpu()),
             spectral_envelope_voiced_fraction = float(spectral_envelope_voiced_fraction.detach().cpu()),
+            spectral_envelope_fine = float(
+                formant_diagnostics.get('fine_loss', model.zero).detach().cpu()
+            ),
+            spectral_envelope_coarse = float(
+                formant_diagnostics.get('coarse_loss', model.zero).detach().cpu()
+            ),
+            formant_periodicity_mean = float(
+                formant_diagnostics.get('periodicity_mean', model.zero).detach().cpu()
+            ),
+            formant_peak_loss = float(
+                formant_diagnostics.get('peak_loss', model.zero).detach().cpu()
+            ),
+            formant_f1_mae_hz = float(
+                formant_diagnostics.get('f1_mae_hz', model.zero).detach().cpu()
+            ),
+            formant_f2_mae_hz = float(
+                formant_diagnostics.get('f2_mae_hz', model.zero).detach().cpu()
+            ),
+            formant_f3_mae_hz = float(
+                formant_diagnostics.get('f3_mae_hz', model.zero).detach().cpu()
+            ),
+            formant_f1_valid_fraction = float(
+                formant_diagnostics.get('f1_valid_fraction', model.zero).detach().cpu()
+            ),
+            formant_f2_valid_fraction = float(
+                formant_diagnostics.get('f2_valid_fraction', model.zero).detach().cpu()
+            ),
+            formant_f3_valid_fraction = float(
+                formant_diagnostics.get('f3_valid_fraction', model.zero).detach().cpu()
+            ),
+            stft_scale_256 = float(
+                stft_scale_diagnostics.get('256', model.zero).detach().cpu()
+            ),
+            stft_scale_64 = float(
+                stft_scale_diagnostics.get('64', model.zero).detach().cpu()
+            ),
+            stft_scale_128 = float(
+                stft_scale_diagnostics.get('128', model.zero).detach().cpu()
+            ),
+            stft_scale_512 = float(
+                stft_scale_diagnostics.get('512', model.zero).detach().cpu()
+            ),
+            stft_scale_1024 = float(
+                stft_scale_diagnostics.get('1024', model.zero).detach().cpu()
+            ),
+            stft_scale_2048 = float(
+                stft_scale_diagnostics.get('2048', model.zero).detach().cpu()
+            ),
             voiced_highband_loss = float(voiced_highband_loss.detach().cpu()),
             voiced_hf_energy_ratio_db = float(voiced_hf_energy_ratio_db.detach().cpu()),
             voiced_hf_logmag_error = float(voiced_hf_logmag_error.detach().cpu()),
@@ -3722,6 +3782,17 @@ class SoundStreamTrainer(nn.Module):
         model.spectral_envelope_loss_weight = self.spectral_envelope_loss_max_weight * progress
         return progress
 
+    def update_formant_peak_loss_weight(self, steps):
+        model = self.unwrapped_soundstream
+        weight, progress = self.scheduled_loss_weight(
+            steps,
+            self.formant_peak_loss_start_steps,
+            self.formant_peak_loss_warmup_steps,
+            self.formant_peak_loss_max_weight,
+        )
+        model.formant_peak_loss_weight = weight
+        return progress
+
     def update_voiced_highband_loss_weight(self, steps):
         model = self.unwrapped_soundstream
         weight, voiced_progress = self.scheduled_loss_weight(
@@ -4402,6 +4473,7 @@ class SoundStreamTrainer(nn.Module):
         gan_progress = self.update_gan_weights(steps)
         si_sdr_loss_progress = self.update_si_sdr_loss_weight(steps)
         spectral_envelope_loss_progress = self.update_spectral_envelope_loss_weight(steps)
+        formant_peak_loss_progress = self.update_formant_peak_loss_weight(steps)
         (
             voiced_highband_loss_progress,
             upper_highband_loss_progress,
@@ -4519,6 +4591,7 @@ class SoundStreamTrainer(nn.Module):
                     if len(loss_breakdown) > active_spectral_detail_index
                     else loss.new_zeros(())
                 )
+                formant_peak_loss = loss_breakdown[-1]
 
                 if not torch.isfinite(loss).all():
                     raise RuntimeError(
@@ -4534,6 +4607,50 @@ class SoundStreamTrainer(nn.Module):
                 )
                 weighted_gan_loss = weighted_adversarial_loss + weighted_feature_loss
                 weighted_reconstruction_loss = loss - weighted_gan_loss
+
+                stft_scale_losses = getattr(
+                    runtime_model, '_last_stft_scale_losses', {}
+                )
+                formant_diagnostics = getattr(
+                    runtime_model, '_last_formant_metrics', {}
+                )
+
+                run_loss_grad_diagnostic = (
+                    not generator_frozen and
+                    self.loss_grad_diagnostics_every > 0 and
+                    not (steps % self.loss_grad_diagnostics_every) and
+                    i == 0
+                )
+                if run_loss_grad_diagnostic:
+                    decoder_parameters = tuple(runtime_model.decoder.parameters())
+                    weighted_objectives = {
+                        'wave': recon_loss * runtime_model.recon_loss_weight,
+                        'mel': (
+                            multi_spectral_recon_loss *
+                            runtime_model.multi_spectral_recon_loss_weight
+                        ),
+                        'stft': stft_recon_loss * runtime_model.stft_recon_loss_weight,
+                        'formant_env': (
+                            spectral_envelope_loss *
+                            runtime_model.spectral_envelope_loss_weight
+                        ),
+                        'formant_peak': (
+                            formant_peak_loss *
+                            runtime_model.formant_peak_loss_weight
+                        ),
+                        'voiced_highband': (
+                            voiced_highband_loss *
+                            runtime_model.voiced_highband_loss_weight
+                        ),
+                        'si_sdr': si_sdr_loss * runtime_model.si_sdr_loss_weight,
+                    }
+                    for objective_name, objective in weighted_objectives.items():
+                        logs[f'grad_{objective_name}'] = self.objective_grad_norm(
+                            objective, decoder_parameters
+                        )
+                    logs['grad_reconstruction_total'] = self.objective_grad_norm(
+                        weighted_reconstruction_loss, decoder_parameters
+                    )
 
                 run_gan_grad_diagnostic = (
                     not generator_frozen and
@@ -4580,6 +4697,7 @@ class SoundStreamTrainer(nn.Module):
                 multi_spectral_recon_loss = multi_spectral_recon_loss.item() / self.grad_accum_every,
                 stft_recon_loss = stft_recon_loss.item() / self.grad_accum_every,
                 spectral_envelope_loss = spectral_envelope_loss.item() / self.grad_accum_every,
+                formant_peak_loss = formant_peak_loss.item() / self.grad_accum_every,
                 voiced_highband_loss = voiced_highband_loss.item() / self.grad_accum_every,
                 voiced_hf_retention_loss = voiced_hf_retention_loss.item() / self.grad_accum_every,
                 upper_highband_loss = upper_highband_loss.item() / self.grad_accum_every,
@@ -4612,6 +4730,16 @@ class SoundStreamTrainer(nn.Module):
                     stream_consistency_loss.item() / self.grad_accum_every
                 ),
             ))
+            for scale, scale_loss in stft_scale_losses.items():
+                accum_log(logs, {
+                    f'stft_scale_{scale}': (
+                        scale_loss.detach().item() / self.grad_accum_every
+                    )
+                })
+            for name, value in formant_diagnostics.items():
+                accum_log(logs, {
+                    f'formant_{name}': value.detach().item() / self.grad_accum_every
+                })
 
         if exists(self.max_grad_norm) and not generator_frozen:
             self.accelerator.clip_grad_norm_(self.soundstream.parameters(), self.max_grad_norm)
@@ -4662,6 +4790,9 @@ class SoundStreamTrainer(nn.Module):
             f"(w={getattr(model, 'frame_phase_loss_weight', 0.):.4g},ramp={frame_phase_loss_progress:.4f}) | "
             f"formant_env={logs['spectral_envelope_loss']:.6f}"
             f"(w={model.spectral_envelope_loss_weight:.4g},ramp={spectral_envelope_loss_progress:.4f}) | "
+            f"formant_peak={logs['formant_peak_loss']:.6f}"
+            f"(w={getattr(model, 'formant_peak_loss_weight', 0.):.4g},"
+            f"ramp={formant_peak_loss_progress:.4f}) | "
             f"voiced_highband={logs['voiced_highband_loss']:.6f}"
             f"(w={model.voiced_highband_loss_weight:.4g},ramp={voiced_highband_loss_progress:.4f}) | "
             f"upper_7k_7p8k={logs['upper_highband_loss']:.6f}"
@@ -4700,6 +4831,25 @@ class SoundStreamTrainer(nn.Module):
             )
             losses_str += f" | decoder_block_scales=[{block_scales}]"
 
+        stft_scale_parts = [
+            f"{scale}={logs[f'stft_scale_{scale}']:.5f}"
+            for scale in ('64', '128', '256', '512', '1024', '2048')
+            if f'stft_scale_{scale}' in logs
+        ]
+        if stft_scale_parts:
+            losses_str += " | stft_scales[" + ','.join(stft_scale_parts) + "]"
+
+        if 'formant_fine_loss' in logs:
+            losses_str += (
+                f" | formant_diag[fine={logs['formant_fine_loss']:.5f},"
+                f"coarse={logs['formant_coarse_loss']:.5f},"
+                f"periodicity={logs['formant_periodicity_mean']:.3f},"
+                f"voiced={logs['formant_voiced_fraction']:.3f},"
+                f"f1={logs['formant_f1_mae_hz']:.1f}Hz,"
+                f"f2={logs['formant_f2_mae_hz']:.1f}Hz,"
+                f"f3={logs['formant_f3_mae_hz']:.1f}Hz]"
+            )
+
         if hasattr(model, 'boundary_loss_weight'):
             losses_str += (
                 f" | boundary={logs['boundary_loss']:.6f}"
@@ -4732,6 +4882,20 @@ class SoundStreamTrainer(nn.Module):
                 f" | g_feature_grad={logs['g_feature_grad_norm']:.6f}"
                 f" | g_gan_grad={logs['g_gan_grad_norm']:.6f}"
                 f" | g_gan_grad_ratio={logs['g_gan_to_reconstruction_grad_ratio']:.6f}"
+            )
+
+        if 'grad_reconstruction_total' in logs:
+            total_grad = max(logs['grad_reconstruction_total'], 1e-12)
+            losses_str += (
+                f" | loss_grads[total={total_grad:.5f},"
+                f"wave={logs.get('grad_wave', 0.):.5f},"
+                f"mel={logs.get('grad_mel', 0.):.5f},"
+                f"stft={logs.get('grad_stft', 0.):.5f},"
+                f"env={logs.get('grad_formant_env', 0.):.5f},"
+                f"peak={logs.get('grad_formant_peak', 0.):.5f},"
+                f"hf={logs.get('grad_voiced_highband', 0.):.5f},"
+                f"sisdr={logs.get('grad_si_sdr', 0.):.5f},"
+                f"formant_ratio={(logs.get('grad_formant_env', 0.) + logs.get('grad_formant_peak', 0.)) / total_grad:.4f}]"
             )
 
         if exists(stage2_recon_transition_progress):
@@ -5210,6 +5374,23 @@ class SoundStreamTrainer(nn.Module):
                 f"online_env_mid={online_score.get('spectral_envelope_mid', 0.):.4f}, "
                 f"online_env_high={online_score.get('spectral_envelope_high', 0.):.4f}, "
                 f"online_voiced={online_score.get('spectral_envelope_voiced_fraction', 0.):.3f}, "
+                f"online_env_fine={online_score.get('spectral_envelope_fine', 0.):.4f}, "
+                f"online_env_coarse={online_score.get('spectral_envelope_coarse', 0.):.4f}, "
+                f"online_periodicity={online_score.get('formant_periodicity_mean', 0.):.3f}, "
+                f"online_f1_mae={online_score.get('formant_f1_mae_hz', 0.):.1f}Hz, "
+                f"online_f2_mae={online_score.get('formant_f2_mae_hz', 0.):.1f}Hz, "
+                f"online_f3_mae={online_score.get('formant_f3_mae_hz', 0.):.1f}Hz, "
+                f"online_formant_valid="
+                f"{online_score.get('formant_f1_valid_fraction', 0.):.2f}/"
+                f"{online_score.get('formant_f2_valid_fraction', 0.):.2f}/"
+                f"{online_score.get('formant_f3_valid_fraction', 0.):.2f}, "
+                f"online_stft_scales="
+                f"{online_score.get('stft_scale_64', 0.):.4f}/"
+                f"{online_score.get('stft_scale_128', 0.):.4f}/"
+                f"{online_score.get('stft_scale_256', 0.):.4f}/"
+                f"{online_score.get('stft_scale_512', 0.):.4f}/"
+                f"{online_score.get('stft_scale_1024', 0.):.4f}/"
+                f"{online_score.get('stft_scale_2048', 0.):.4f}, "
                 f"online_voiced_hf_ratio_db={online_score.get('voiced_hf_energy_ratio_db', 0.):+.2f}, "
                 f"online_voiced_hf_error={online_score.get('voiced_hf_logmag_error', 0.):.4f}, "
                 f"online_voiced_hf_deficit={online_score.get('voiced_hf_energy_deficit', 0.):.4f}, "
