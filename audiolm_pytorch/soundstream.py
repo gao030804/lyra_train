@@ -570,24 +570,113 @@ class CausalLinearUpsampleConv1d(Module):
 
         return out, (next_history, next_conv_state)
 
-def ResidualUnit(chan_in, chan_out, dilation, kernel_size = 7, squeeze_excite = False, pad_mode = 'reflect', residual_scale = 1.):
+class DepthwiseSeparableCausalConv1d(Module):
+    """Causal depthwise filtering followed directly by pointwise mixing."""
+
+    def __init__(
+        self,
+        chan_in,
+        chan_out,
+        kernel_size,
+        *,
+        stride = 1,
+        dilation = 1,
+        pad_mode = 'reflect'
+    ):
+        super().__init__()
+        self.net = nn.Sequential(
+            CausalConv1d(
+                chan_in,
+                chan_in,
+                kernel_size,
+                stride = stride,
+                dilation = dilation,
+                groups = chan_in,
+                pad_mode = pad_mode
+            ),
+            CausalConv1d(chan_in, chan_out, 1, pad_mode = pad_mode)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+    def forward_stream(self, x, state = None):
+        return stream_module(self.net, x, state)
+
+def ResidualUnit(
+    chan_in,
+    chan_out,
+    dilation,
+    kernel_size = 7,
+    squeeze_excite = False,
+    pad_mode = 'reflect',
+    residual_scale = 1.,
+    depthwise_separable = False
+):
+    temporal_conv = (
+        DepthwiseSeparableCausalConv1d(
+            chan_in,
+            chan_out,
+            kernel_size,
+            dilation = dilation,
+            pad_mode = pad_mode
+        )
+        if depthwise_separable
+        else CausalConv1d(
+            chan_in,
+            chan_out,
+            kernel_size,
+            dilation = dilation,
+            pad_mode = pad_mode
+        )
+    )
     return Residual(Sequential(
-        CausalConv1d(chan_in, chan_out, kernel_size, dilation = dilation, pad_mode = pad_mode),
-        nn.ELU(),
+        temporal_conv,
+        nn.ReLU(),
         CausalConv1d(chan_out, chan_out, 1, pad_mode = pad_mode),
-        nn.ELU(),
+        nn.ReLU(),
         SqueezeExcite(chan_out) if squeeze_excite else None
     ), scale = residual_scale)
 
-def EncoderBlock(chan_in, chan_out, stride, cycle_dilations = (1, 3, 9), squeeze_excite = False, pad_mode = 'reflect'):
+def EncoderBlock(
+    chan_in,
+    chan_out,
+    stride,
+    cycle_dilations = (1, 3, 9),
+    squeeze_excite = False,
+    pad_mode = 'reflect',
+    depthwise_separable = False
+):
     it = cycle(cycle_dilations)
-    residual_unit = partial(ResidualUnit, squeeze_excite = squeeze_excite, pad_mode = pad_mode)
+    residual_unit = partial(
+        ResidualUnit,
+        squeeze_excite = squeeze_excite,
+        pad_mode = pad_mode,
+        depthwise_separable = depthwise_separable
+    )
+    downsample = (
+        DepthwiseSeparableCausalConv1d(
+            chan_in,
+            chan_out,
+            2 * stride,
+            stride = stride,
+            pad_mode = pad_mode
+        )
+        if depthwise_separable
+        else CausalConv1d(
+            chan_in,
+            chan_out,
+            2 * stride,
+            stride = stride,
+            pad_mode = pad_mode
+        )
+    )
 
     return nn.Sequential(
         residual_unit(chan_in, chan_in, next(it)),
         residual_unit(chan_in, chan_in, next(it)),
         residual_unit(chan_in, chan_in, next(it)),
-        CausalConv1d(chan_in, chan_out, 2 * stride, stride = stride, pad_mode = pad_mode)
+        downsample
     )
 
 def DecoderBlock(
@@ -625,7 +714,7 @@ def DecoderBlock(
             )
 
         # Replace the abrupt first x8 expansion with x4 -> shaping -> x2.
-        # Both stages keep a causal convolution, and ELU between them gives the
+        # Both stages keep a causal convolution, and ReLU between them gives the
         # second stage a chance to reshape interpolation images before the
         # ordinary residual stack.  The total temporal factor remains x8.
         first_stride, second_stride = 4, 2
@@ -640,7 +729,7 @@ def DecoderBlock(
                 pad_mode = pad_mode,
                 interpolation_mode = interpolation_mode
             ),
-            nn.ELU(),
+            nn.ReLU(),
             CausalLinearUpsampleConv1d(
                 chan_out,
                 chan_out,
@@ -674,7 +763,12 @@ def DecoderBlock(
     )
 
 def stream_module(module, x, state = None):
-    if isinstance(module, (CausalConv1d, CausalConvTranspose1d, CausalLinearUpsampleConv1d)):
+    if isinstance(module, (
+        CausalConv1d,
+        CausalConvTranspose1d,
+        CausalLinearUpsampleConv1d,
+        DepthwiseSeparableCausalConv1d,
+    )):
         return module.forward_stream(x, state)
 
     if isinstance(module, Residual):
@@ -774,6 +868,8 @@ class SoundStream(Module):
         discr_multi_scales = (1, 0.5, 0.25),
         stft_normalized = False,
         enc_cycle_dilations = (1, 3, 9),
+        encoder_depthwise_separable_blocks = (),
+        encoder_depthwise_separable_revision = 2,
         dec_cycle_dilations = (1, 3, 9),
         decoder_upsample_mode = 'convtranspose',
         decoder_residual_scale = 1.,
@@ -843,6 +939,29 @@ class SoundStream(Module):
 
         self.single_channel = input_channels == 1
         self.strides = strides
+        encoder_depthwise_separable_blocks = tuple(
+            int(index) for index in encoder_depthwise_separable_blocks
+        )
+        invalid_depthwise_blocks = tuple(
+            index for index in encoder_depthwise_separable_blocks
+            if index < 0 or index >= len(strides)
+        )
+        if invalid_depthwise_blocks:
+            raise ValueError(
+                'encoder_depthwise_separable_blocks contains invalid zero-based '
+                f'indices {invalid_depthwise_blocks}; encoder has {len(strides)} blocks'
+            )
+        if len(set(encoder_depthwise_separable_blocks)) != len(
+            encoder_depthwise_separable_blocks
+        ):
+            raise ValueError('encoder_depthwise_separable_blocks cannot contain duplicates')
+        self.encoder_depthwise_separable_blocks = encoder_depthwise_separable_blocks
+        if int(encoder_depthwise_separable_revision) != 2:
+            raise ValueError(
+                'only Encoder DSCNN revision 2 '
+                '(Depthwise -> Pointwise with ReLU outside) is supported'
+            )
+        self.encoder_depthwise_separable_revision = 2
         if decoder_upsample_mode not in ('convtranspose', 'linear'):
             raise ValueError(f'unknown decoder upsample mode: {decoder_upsample_mode}')
         if decoder_residual_scale < 0:
@@ -889,8 +1008,20 @@ class SoundStream(Module):
 
         encoder_blocks = []
 
-        for ((chan_in, chan_out), layer_stride) in zip(chan_in_out_pairs, strides):
-            encoder_blocks.append(EncoderBlock(chan_in, chan_out, layer_stride, enc_cycle_dilations, squeeze_excite, pad_mode))
+        for block_index, ((chan_in, chan_out), layer_stride) in enumerate(
+            zip(chan_in_out_pairs, strides)
+        ):
+            encoder_blocks.append(EncoderBlock(
+                chan_in,
+                chan_out,
+                layer_stride,
+                enc_cycle_dilations,
+                squeeze_excite,
+                pad_mode,
+                depthwise_separable=(
+                    block_index in self.encoder_depthwise_separable_blocks
+                )
+            ))
 
             if use_gate_loop_layers:
                 encoder_blocks.append(Residual(ChannelTranspose(GateLoop(chan_out, use_heinsen = False))))

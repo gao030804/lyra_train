@@ -20,9 +20,20 @@ python -m py_compile \
   audiolm_pytorch/soundstream.py \
   audiolm_pytorch/trainer.py
 
+refuse_stale_fresh_run() {
+    local results="$1"
+    local resume="$2"
+
+    if [[ "$resume" == "--no-resume" ]] && compgen -G "$results/*.pt" >/dev/null; then
+        echo "ERROR: refusing a fresh run in $results because stale .pt files exist." >&2
+        echo "Move that result directory aside, or restore latest.pt and resume intentionally." >&2
+        return 1
+    fi
+}
+
 run_stage0() {
-    local results="results/overfit-64d-23q"
-    local log="logs/overfit-64d-23q.log"
+    local results="results/overfit-dscnn-relu-fp-64d-8q"
+    local log="logs/overfit-dscnn-relu-fp-64d-8q.log"
     local marker="$results/.stage_complete"
 
     if [[ -f "$marker" ]]; then
@@ -32,6 +43,7 @@ run_stage0() {
 
     local resume="--no-resume"
     [[ -f "$results/latest.pt" ]] && resume="--resume"
+    refuse_stale_fresh_run "$results" "$resume"
 
     echo "[stage0 overfit] starting with $resume"
 
@@ -65,6 +77,7 @@ run_6gpu_stage() {
 
     local resume="--no-resume"
     [[ -f "$results/latest.pt" ]] && resume="--resume"
+    refuse_stale_fresh_run "$results" "$resume"
 
     local test_args=(--test-eval-batches 0)
     if [[ "$run_final_test" == "yes" ]]; then
@@ -101,26 +114,32 @@ run_stage0
 
 run_6gpu_stage \
   recon_pretrain \
-  results/recon-pretrain-64d-23q \
-  logs/recon-pretrain-64d-23q.log \
-  60000 6 no
+  results/recon-pretrain-dscnn-relu-fp-64d-8q \
+  logs/recon-pretrain-dscnn-relu-fp-64d-8q.log \
+  150000 4 no
+
+run_6gpu_stage \
+  spectral_refine \
+  results/spectral-refine-dscnn-relu-fp-64d-8q \
+  logs/spectral-refine-dscnn-relu-fp-64d-8q.log \
+  20000 4 no
 
 run_6gpu_stage \
   gan_pretrain \
-  results/gan-pretrain-64d-23q \
-  logs/gan-pretrain-64d-23q.log \
-  30000 4 no
+  results/gan-pretrain-dscnn-relu-fp-64d-8q \
+  logs/gan-pretrain-dscnn-relu-fp-64d-8q.log \
+  50000 4 no
 
 run_6gpu_stage \
   stream_finetune \
-  results/stream-finetune-64d-23q \
-  logs/stream-finetune-64d-23q.log \
+  results/stream-finetune-dscnn-relu-fp-64d-8q \
+  logs/stream-finetune-dscnn-relu-fp-64d-8q.log \
   20000 4 no
 
 run_6gpu_stage \
   stream_finetune_long \
-  results/stream-finetune-long-64d-23q \
-  logs/stream-finetune-long-64d-23q.log \
-  5000 2 yes
+  results/stream-finetune-long-dscnn-relu-fp-64d-8q \
+  logs/stream-finetune-long-dscnn-relu-fp-64d-8q.log \
+  20000 2 yes
 
-echo "All stages 0-4 completed successfully."
+echo "All non-quantized stages completed successfully at 3.2 kbps."

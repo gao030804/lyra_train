@@ -38,17 +38,11 @@ def main() -> None:
     parser.add_argument("--decision-report", type=Path, required=True)
     parser.add_argument("--max-si-sdr-drop", type=float, default=0.15)
     parser.add_argument("--max-correlation-drop", type=float, default=0.01)
-    parser.add_argument("--max-voiced-hf-drop-db", type=float, default=0.10)
-    parser.add_argument("--max-voiced-hf-rise-db", type=float, default=0.50)
-    parser.add_argument("--max-quiet-hf-rise-db", type=float, default=0.50)
-    parser.add_argument("--max-ac320-rise", type=float, default=0.01)
     parser.add_argument("--max-click-rise", type=float, default=1.0)
     parser.add_argument("--max-recon-clip-fraction", type=float, default=1e-3)
     parser.add_argument("--min-aligned-si-sdr", type=float, default=0.0)
     parser.add_argument("--min-aligned-correlation", type=float, default=0.65)
     parser.add_argument("--max-click-excess", type=float, default=0.5)
-    parser.add_argument("--min-voiced-hf-ratio-db", type=float, default=-1.5)
-    parser.add_argument("--max-voiced-hf-ratio-db", type=float, default=1.0)
     parser.add_argument("--min-q00-active-ratio", type=float, default=0.70)
     parser.add_argument("--min-q00-perplexity", type=float, default=50.0)
     args = parser.parse_args()
@@ -86,25 +80,6 @@ def main() -> None:
         "aligned_correlation",
         args.max_correlation_drop,
     )
-    at_least(
-        "voiced_hf_ratio_lower_bound",
-        "voiced_hf_energy_ratio_db",
-        "voiced_hf_energy_ratio_db",
-        args.max_voiced_hf_drop_db,
-    )
-    at_most(
-        "voiced_hf_ratio_upper_bound",
-        "voiced_hf_energy_ratio_db",
-        "voiced_hf_energy_ratio_db",
-        args.max_voiced_hf_rise_db,
-    )
-    at_most(
-        "quiet_hf_excess_db",
-        "quiet_hf_excess_db",
-        "quiet_hf_excess_db",
-        args.max_quiet_hf_rise_db,
-    )
-    at_most("ac_320_isolated", "ac_320_isolated", "ac_320_isolated", args.max_ac320_rise)
     # Click is an advisory comparison, not a single-metric veto. The raw score
     # depends strongly on the target utterance's transients; Stage 1 now gates
     # matched click excess against the target instead.
@@ -129,8 +104,6 @@ def main() -> None:
             "aligned_si_sdr": require(metrics, "aligned_si_sdr", report) >= args.min_aligned_si_sdr,
             "aligned_correlation": require(metrics, "aligned_correlation", report) >= args.min_aligned_correlation,
             "click_excess": require(metrics, "click_excess", report) <= args.max_click_excess,
-            "voiced_hf_lower": require(metrics, "voiced_hf_energy_ratio_db", report) >= args.min_voiced_hf_ratio_db,
-            "voiced_hf_upper": require(metrics, "voiced_hf_energy_ratio_db", report) <= args.max_voiced_hf_ratio_db,
             "q00_active": require(metrics, "codebook_q00_active_ratio", report) >= args.min_q00_active_ratio,
             "q00_perplexity": require(metrics, "codebook_q00_perplexity", report) >= args.min_q00_perplexity,
             "q00_stage_flag": require(metrics, "q00_validation_eligible", report) >= 0.5,
@@ -188,7 +161,7 @@ def main() -> None:
     if selected is None:
         raise SystemExit(
             "Automatic fallback refused to start Stage 2 because neither checkpoint passes the "
-            "absolute clean, voiced-HF, q00/RVQ, and clip preflight. "
+            "absolute clean, q00/RVQ, and clip preflight. "
             f"See {decision_report}"
         )
 

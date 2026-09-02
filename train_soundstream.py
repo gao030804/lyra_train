@@ -34,12 +34,12 @@ DEFAULT_AUDIO_DIR = (
 )
 
 STAGE_RESULTS_DIRS = {
-    "overfit": PROJECT_DIR / "results" / "overfit-64d-23q",
-    "recon_pretrain": PROJECT_DIR / "results" / "recon-pretrain-64d-23q",
-    "spectral_refine": PROJECT_DIR / "results" / "stage1-spectral-refine-64d-23q",
-    "gan_pretrain": PROJECT_DIR / "results" / "gan-pretrain-64d-23q",
-    "stream_finetune": PROJECT_DIR / "results" / "stream-finetune-64d-23q",
-    "stream_finetune_long": PROJECT_DIR / "results" / "stream-finetune-long-64d-23q",
+    "overfit": PROJECT_DIR / "results" / "overfit-dscnn-relu-fp-64d-8q",
+    "recon_pretrain": PROJECT_DIR / "results" / "recon-pretrain-dscnn-relu-fp-64d-8q",
+    "spectral_refine": PROJECT_DIR / "results" / "spectral-refine-dscnn-relu-fp-64d-8q",
+    "gan_pretrain": PROJECT_DIR / "results" / "gan-pretrain-dscnn-relu-fp-64d-8q",
+    "stream_finetune": PROJECT_DIR / "results" / "stream-finetune-dscnn-relu-fp-64d-8q",
+    "stream_finetune_long": PROJECT_DIR / "results" / "stream-finetune-long-dscnn-relu-fp-64d-8q",
 }
 
 RECONSTRUCTION_STAGES = frozenset((
@@ -301,7 +301,7 @@ SUPPORTED_AUDIO_EXTENSIONS = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a staged 9.2 kbps streaming SoundStream speech codec."
+        description="Train a staged 3.2 kbps streaming SoundStream speech codec."
     )
 
     parser.add_argument(
@@ -1606,6 +1606,41 @@ def load_model_weights_only(
                 f"current_split_x8={model_split_first}. "
                 "The x8 versus x4+x2 decoder parameters are not shape-compatible."
             )
+        checkpoint_depthwise_blocks = tuple(checkpoint_config.get(
+            "encoder_depthwise_separable_blocks",
+            (),
+        ))
+        model_depthwise_blocks = tuple(getattr(
+            model,
+            "encoder_depthwise_separable_blocks",
+            (),
+        ))
+        if checkpoint_depthwise_blocks != model_depthwise_blocks:
+            raise ValueError(
+                "Checkpoint Encoder DSCNN topology mismatch: "
+                f"checkpoint_blocks={checkpoint_depthwise_blocks}, "
+                f"current_model_blocks={model_depthwise_blocks}. "
+                "Block3/4 DSCNN changes parameter names and shapes; start a "
+                "fresh run or use a checkpoint trained with the same topology."
+            )
+        if checkpoint_depthwise_blocks:
+            checkpoint_dscnn_revision = int(checkpoint_config.get(
+                "encoder_depthwise_separable_revision",
+                1,
+            ))
+            model_dscnn_revision = int(getattr(
+                model,
+                "encoder_depthwise_separable_revision",
+                2,
+            ))
+            if checkpoint_dscnn_revision != model_dscnn_revision:
+                raise ValueError(
+                    "Checkpoint Encoder DSCNN activation topology mismatch: "
+                    f"checkpoint_revision={checkpoint_dscnn_revision}, "
+                    f"current_revision={model_dscnn_revision}. Revision 2 "
+                    "removes the Depthwise/Pointwise intermediate ELU and "
+                    "uses ReLU; start a fresh run."
+                )
     state_dict = pkg["model"] if "model" in pkg else pkg
     if generator_only:
         if not hasattr(model, "load_generator_state_dict"):
@@ -1691,6 +1726,11 @@ def build_model(
         use_local_attn=False,
         target_sample_hz=sample_rate,
         strides=strides,
+        # Zero-based Encoder Block3/4.  The SoundStream constructor itself
+        # defaults to the legacy full-convolution topology so old checkpoint
+        # configs that predate this field still rebuild correctly.
+        encoder_depthwise_separable_blocks=(2, 3),
+        encoder_depthwise_separable_revision=2,
         recon_loss_weight=recon_loss_weight,
         multi_spectral_recon_loss_weight=multi_spectral_recon_loss_weight,
         stft_recon_loss_weight=stft_recon_loss_weight,
@@ -2438,9 +2478,9 @@ def main() -> None:
     stream_frame_size = math.prod(strides)
     stream_context_frames = args.stream_context_frames
     # Lyra V2-style maximum bitrate:
-    # 50 frames/s * 23 quantizers * 8 bits/index = 9.2 kbps.
+    # 50 frames/s * 8 quantizers * 8 bits/index = 3.2 kbps.
     codebook_size = 256
-    num_quantizers = 23
+    num_quantizers = 8
     if args.stage in RECONSTRUCTION_STAGES:
         si_sdr_loss_weight = (
             args.si_sdr_loss_weight
@@ -2617,6 +2657,11 @@ def main() -> None:
     print(f"Best eval every: {best_eval_every} steps")
     print(f"Maximum training steps: {num_train_steps}")
     print(f"Generator learning rate: {stage_defaults['lr']}")
+    print(
+        "Encoder DSCNN: zero-based blocks 2/3 (Block3/4), each temporal and "
+        "downsample convolution uses Depthwise -> Pointwise; all SoundStream "
+        "activation layers use ReLU."
+    )
     if stage25_decoder_only_refine:
         print(
             "Stage-2.5 optimizer groups: "
@@ -2866,9 +2911,9 @@ def main() -> None:
         f"click_excess<={args.clean_gate_max_click_excess} "
         f"(absolute click diagnostic threshold={args.clean_gate_max_click_score}), "
         f"jump<={args.clean_gate_max_jump_ratio}, "
-        f"p999_jump<={args.clean_gate_max_p999_jump_ratio}, "
-        f"stage1_voiced_hf_ratio_db=[{args.clean_gate_min_voiced_hf_ratio_db}, "
-        f"{args.clean_gate_max_voiced_hf_ratio_db}]"
+        f"p999_jump<={args.clean_gate_max_p999_jump_ratio}; "
+        "AC320, periodic/comb artifacts and high-frequency metrics are "
+        "diagnostic-only"
     )
     if args.stage == "gan_pretrain":
         print(
@@ -2876,24 +2921,11 @@ def main() -> None:
             f"enabled={args.stage2_quality_retention_gate}, "
             f"aligned_si_sdr_drop<={args.stage2_max_aligned_si_sdr_drop:.2f} dB, "
             f"aligned_corr_drop<={args.stage2_max_aligned_corr_drop:.3f}, "
-            f"quiet_hf_excess_rise<={args.stage2_max_quiet_hf_excess_db_rise:.2f} dB, "
-            f"voiced_hf_ratio_delta=[-{args.stage2_max_voiced_hf_ratio_db_drop:.2f}, "
-            f"+{args.stage2_max_voiced_hf_ratio_db_rise:.2f}] dB, "
-            f"voiced_hf_score_weight={args.stage2_voiced_hf_score_weight:g}, "
             "balanced_aligned_si_sdr_drop<="
             f"{args.stage2_balanced_max_aligned_si_sdr_drop:.2f} dB, "
-            "balanced_voiced_7k_7p8k_ratio_db=["
-            f"{args.stage2_min_voiced_7k_7p8k_ratio_db:+.2f},"
-            f"{args.stage2_max_voiced_7k_7p8k_ratio_db:+.2f}], "
-            "balanced_quiet_7k_7p8k_excess_rise<="
-            f"{args.stage2_max_quiet_7k_7p8k_excess_db_rise:.2f} dB, "
-            "upper_highband_score_weight="
-            f"{args.stage2_upper_highband_score_weight:g}, "
             "active_spectral_score_weight="
             f"{args.stage2_active_spectral_score_weight:g}, "
-            f"ac320_rise<={args.stage2_max_ac320_isolated_rise:.4f}, "
-            "comb_median_excess_rise<="
-            f"{args.stage2_max_comb_median_excess_db_rise:.2f} dB, "
+            "AC320/comb/high-frequency scores=diagnostic-only, "
             "q00=(active>=0.70, perplexity>=50), q01/RVQ healthy, "
             f"hard_stop=(quality={args.stage2_quality_retention_patience}, "
             f"rvq={args.stage2_rvq_retention_patience}) validation checks"
@@ -3667,7 +3699,7 @@ def main() -> None:
             )
         predecessor_stage = {
             "spectral_refine": "recon_pretrain",
-            "gan_pretrain": "recon_pretrain",
+            "gan_pretrain": "spectral_refine",
             "stream_finetune": "gan_pretrain",
             "stream_finetune_long": "stream_finetune",
         }.get(args.stage)

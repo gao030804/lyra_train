@@ -1,0 +1,269 @@
+import torch
+
+from audiolm_pytorch.hardware_quantization import (
+    HardwareReLU,
+    HardwareResidualAdd,
+    SymmetricActivationFakeQuant,
+    approximate_requant_multiplier,
+    round_half_away_from_zero,
+)
+from audiolm_pytorch.hardware_export import (
+    integer_conv1d_reference,
+    pack_conv1d_weights_4x8,
+)
+from audiolm_pytorch.soundstream import (
+    CausalConv1d,
+    SoundStream,
+    hardware_input_fake_quant,
+)
+
+
+def test_half_away_from_zero_matches_hardware_ties():
+    values = torch.tensor([-2.5, -1.5, -0.5, 0.5, 1.5, 2.5])
+    expected = torch.tensor([-3., -2., -1., 1., 2., 3.])
+    torch.testing.assert_close(round_half_away_from_zero(values), expected)
+
+
+def test_symmetric_activation_fake_quant_uses_signed_int8_and_ste():
+    fake_quant = SymmetricActivationFakeQuant(ema_decay=0.).train()
+    fake_quant.set_state(enabled=True, observer_enabled=True)
+    x = torch.tensor([-2., -0.25, 0.5, 1.], requires_grad=True)
+
+    output = fake_quant(x)
+    output.sum().backward()
+
+    torch.testing.assert_close(
+        fake_quant.scale,
+        torch.tensor(2. / 127.),
+    )
+    assert output.min() >= -2.
+    assert output.max() <= 2.
+    torch.testing.assert_close(x.grad, torch.ones_like(x))
+
+
+def test_activation_uses_full_rtl_negative_saturation_code():
+    fake_quant = SymmetricActivationFakeQuant().eval()
+    fake_quant.set_state(enabled=True, observer_enabled=False)
+    fake_quant.scale.fill_(1.)
+    output = fake_quant(torch.tensor([-200., -128., 127., 200.]))
+    torch.testing.assert_close(output, torch.tensor([-128., -128., 127., 127.]))
+
+
+def test_activation_scale_is_observer_owned_and_fixed_after_freeze():
+    fake_quant = SymmetricActivationFakeQuant(ema_decay=0.).train()
+    x = torch.tensor([-1.3, -0.2, 0.7, 1.1], requires_grad=True)
+
+    fake_quant.set_state(enabled=True, observer_enabled=True)
+    fake_quant(x).square().sum().backward()
+    assert fake_quant.scale.grad is None
+    calibrated_scale = fake_quant.scale.clone()
+
+    x.grad = None
+    fake_quant.set_state(enabled=True, observer_enabled=False)
+    fake_quant(x).square().sum().backward()
+    assert fake_quant.scale.grad is None
+    torch.testing.assert_close(fake_quant.scale, calibrated_scale)
+    assert "scale" not in dict(fake_quant.named_parameters())
+
+
+def test_requant_multiplier_uses_int32_multiplier_and_six_bit_shift():
+    ratio = torch.tensor([0.003, 0.25, 1.5], requires_grad=True)
+    effective, multiplier, shift = approximate_requant_multiplier(ratio)
+
+    assert torch.all(multiplier >= 1)
+    assert torch.all(multiplier <= (2 ** 31) - 1)
+    assert torch.all(shift >= 0)
+    assert torch.all(shift <= 63)
+    torch.testing.assert_close(effective, ratio, rtol=1e-6, atol=1e-9)
+    effective.sum().backward()
+    torch.testing.assert_close(ratio.grad, torch.ones_like(ratio))
+
+
+def test_hardware_relu_shares_one_scale_and_preserves_gradients():
+    relu = HardwareReLU(ema_decay=0.).train()
+    relu.set_hardware_qat_state(enabled=True, observer_enabled=True)
+    x = torch.tensor([-2., -0.5, 0., 1.], requires_grad=True)
+
+    output = relu(x)
+    output.sum().backward()
+
+    assert relu.fake_quant.scale.item() > 0.
+    torch.testing.assert_close(output[:3], torch.zeros(3))
+    assert output[3] > 0.
+    assert torch.isfinite(x.grad).all()
+
+
+def test_hardware_relu_does_not_double_update_shared_conv_observer():
+    producer = SymmetricActivationFakeQuant(ema_decay=0.).train()
+    producer.set_state(enabled=True, observer_enabled=True)
+    relu = HardwareReLU(ema_decay=0.).train()
+    relu.share_producer_fake_quant(producer)
+    producer.observe(torch.tensor([-2., 1.]))
+    observations = int(producer.num_observations.item())
+    relu(torch.tensor([-2., 1.]))
+    assert int(producer.num_observations.item()) == observations
+
+    consumer = CausalConv1d(1, 1, 1, pad_mode="constant")
+    consumer.configure_hardware_qat(ema_decay=0.)
+    consumer.share_hardware_input_fake_quant(producer)
+    consumer.set_hardware_qat_state(enabled=True, observer_enabled=True)
+    consumer(torch.tensor([[[-2., 1.]]]))
+    assert int(producer.num_observations.item()) == observations
+
+
+def test_residual_scale_is_applied_through_integer_requant():
+    residual = HardwareResidualAdd(ema_decay=0.).train()
+    residual.set_hardware_qat_state(enabled=True, observer_enabled=False)
+    residual.fake_quant.scale.fill_(1.)
+    identity = torch.tensor([[[10., -10.]]])
+    branch = torch.tensor([[[8., 8.]]])
+    output = residual(identity, branch, residual_scale=0.5)
+    torch.testing.assert_close(output, torch.tensor([[[14., -6.]]]))
+
+
+def test_hardware_relu_preserves_large_positive_branch_without_overflow():
+    relu = HardwareReLU().train()
+    relu.set_hardware_qat_state(enabled=True, observer_enabled=False)
+    with torch.no_grad():
+        relu.fake_quant.scale.fill_(1.)
+    x = torch.tensor([-2., 100.], requires_grad=True)
+
+    output = relu(x)
+    output.sum().backward()
+
+    assert torch.isfinite(output).all()
+    assert torch.isfinite(x.grad).all()
+    assert relu.fake_quant.scale.grad is None
+
+
+def test_hardware_encoder_factors_oversized_x8_layer_and_keeps_shape():
+    model = SoundStream(
+        channels=16,
+        channel_mults=(2, 4, 8, 16),
+        codebook_dim=64,
+        codebook_size=256,
+        rq_num_quantizers=8,
+        use_local_attn=False,
+        hardware_compatible_encoder=True,
+        hardware_encoder_qat=True,
+        hardware_qat_start_step=1,
+        hardware_qat_observer_freeze_step=3,
+        pad_mode="constant",
+    ).eval()
+
+    report = model.hardware_encoder_weight_report()
+    assert report
+    assert all(layer["fits_weight_bank"] for layer in report)
+    assert any(
+        layer["cin"] == 128
+        and layer["cout"] == 128
+        and layer["kernel"] == 8
+        and layer["stride"] == 4
+        for layer in report
+    )
+    assert any(
+        layer["cin"] == 128
+        and layer["cout"] == 256
+        and layer["kernel"] == 4
+        and layer["stride"] == 2
+        for layer in report
+    )
+
+    with torch.no_grad():
+        encoded = model.encoder(torch.randn(1, 1, 320))
+    assert encoded.shape == (1, 64, 1)
+
+    assert model.update_hardware_qat(0) == (False, False)
+    assert model.update_hardware_qat(1) == (True, True)
+    assert model.update_hardware_qat(3) == (True, False)
+    assert (
+        model.encoder[0].hardware_output_fake_quant is
+        hardware_input_fake_quant(model.encoder[1])
+    )
+
+
+def test_hardware_qat_disabled_stage_rebuild_starts_in_float_mode():
+    model = SoundStream(
+        channels=16,
+        channel_mults=(2, 4, 8, 16),
+        codebook_dim=64,
+        codebook_size=256,
+        rq_num_quantizers=8,
+        use_local_attn=False,
+        hardware_compatible_encoder=True,
+        hardware_encoder_qat=True,
+        hardware_qat_start_step=(2 ** 31) - 1,
+        hardware_qat_observer_freeze_step=(2 ** 31) - 1,
+        pad_mode="constant",
+    ).eval()
+
+    convs = [module for module in model.encoder.modules() if isinstance(module, CausalConv1d)]
+    assert convs
+    assert all(not module.hardware_input_fake_quant.enabled for module in convs)
+    assert all(not module.hardware_output_fake_quant.enabled for module in convs)
+
+    rebuilt = SoundStream(**model.configs).eval()
+    rebuilt.load_state_dict(model.state_dict(), strict=True)
+    encoder_input = torch.randn(1, 1, 320)
+    with torch.no_grad():
+        encoded = model.encoder(encoder_input)
+        rebuilt_encoded = rebuilt.encoder(encoder_input)
+    assert torch.count_nonzero(encoded).item() > 0
+    assert torch.isfinite(encoded).all()
+    torch.testing.assert_close(rebuilt_encoded, encoded)
+
+
+def test_hardware_qat_causal_conv_quantizes_bias_and_backpropagates():
+    layer = CausalConv1d(4, 8, 3, pad_mode="constant")
+    layer.configure_hardware_qat(ema_decay=0.)
+    layer.set_hardware_qat_state(enabled=True, observer_enabled=True)
+    x = torch.randn(2, 4, 16, requires_grad=True)
+
+    output = layer(x)
+    output.square().mean().backward()
+
+    assert output.shape == (2, 8, 16)
+    assert torch.isfinite(output).all()
+    assert torch.isfinite(x.grad).all()
+    assert torch.isfinite(layer.conv.weight.grad).all()
+    report = layer.hardware_quantization_diagnostics()
+    assert report["accumulator_values"] > 0
+    assert report["output_values"] > 0
+    assert 0. <= report["accumulator_overflow_rate"] <= 1.
+    assert 0. <= report["output_saturation_rate"] <= 1.
+    assert len(report["requant_multiplier"]) == 8
+    assert len(report["requant_shift"]) == 8
+
+
+def test_weight_packing_matches_rtl_4x8_byte_order():
+    qweight = torch.zeros(9, 2, 2, dtype=torch.int8)
+    qweight[0, 0, 0] = 11
+    qweight[7, 1, 0] = 22
+    qweight[8, 0, 1] = 33
+    packed = pack_conv1d_weights_4x8(qweight)
+    assert packed.shape == (2, 1, 4, 8)
+    assert packed[0, 0, 0, 0].item() == 11
+    assert packed[0, 0, 1, 7].item() == 22
+    assert packed[1, 0, 2, 0].item() == 33
+
+
+def test_integer_reference_keeps_bias_after_accumulation():
+    result = integer_conv1d_reference(
+        torch.tensor([[[2, 3]]], dtype=torch.int8),
+        torch.tensor([[[4]]], dtype=torch.int8),
+        torch.tensor([5], dtype=torch.int32),
+        torch.tensor([1], dtype=torch.int32),
+        torch.tensor([0], dtype=torch.uint8),
+    )
+    torch.testing.assert_close(
+        result["accumulator_int32"],
+        torch.tensor([[[8, 12]]], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        result["biased_int32"],
+        torch.tensor([[[13, 17]]], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        result["requant_int8"],
+        torch.tensor([[[13, 17]]], dtype=torch.int8),
+    )

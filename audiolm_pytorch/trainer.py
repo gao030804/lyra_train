@@ -40,16 +40,40 @@ from ema_pytorch import EMA
 from audiolm_pytorch.soundstream import SoundStream
 from audiolm_pytorch.encodec import EncodecWrapper
 
-from audiolm_pytorch.audiolm_pytorch import (
-    SemanticTransformer,
-    SemanticTransformerWrapper,
-    CoarseTransformer,
-    CoarseTransformerWrapper,
-    FineTransformer,
-    FineTransformerWrapper,
-    FairseqVQWav2Vec,
-    HubertWithKmeans
-)
+try:
+    from audiolm_pytorch.audiolm_pytorch import (
+        SemanticTransformer,
+        SemanticTransformerWrapper,
+        CoarseTransformer,
+        CoarseTransformerWrapper,
+        FineTransformer,
+        FineTransformerWrapper,
+        FairseqVQWav2Vec,
+        HubertWithKmeans,
+    )
+except ModuleNotFoundError as exc:
+    # SoundStream training does not use the AudioLM semantic-token stack.
+    # Keep fairseq optional so importing SoundStreamTrainer does not require it.
+    if exc.name != "fairseq":
+        raise
+
+    class _MissingFairseqComponent:
+        """Type-safe placeholder for AudioLM-only components."""
+
+        def __init__(self, *args, **kwargs):
+            raise ModuleNotFoundError(
+                "The AudioLM semantic-token trainers require the optional "
+                "'fairseq' dependency. SoundStreamTrainer does not require it."
+            )
+
+    SemanticTransformer = _MissingFairseqComponent
+    SemanticTransformerWrapper = _MissingFairseqComponent
+    CoarseTransformer = _MissingFairseqComponent
+    CoarseTransformerWrapper = _MissingFairseqComponent
+    FineTransformer = _MissingFairseqComponent
+    FineTransformerWrapper = _MissingFairseqComponent
+    FairseqVQWav2Vec = _MissingFairseqComponent
+    HubertWithKmeans = _MissingFairseqComponent
 
 from audiolm_pytorch.data import (
     SoundDataset,
@@ -2843,21 +2867,6 @@ class SoundStreamTrainer(nn.Module):
         if not self.clean_gate:
             return True
 
-        voiced_hf_ratio_db = metrics.get(
-            'voiced_hf_energy_ratio_db',
-            float('-inf')
-        )
-        voiced_hf_ok = (
-            (
-                not exists(self.clean_gate_min_voiced_hf_ratio_db) or
-                voiced_hf_ratio_db >= self.clean_gate_min_voiced_hf_ratio_db
-            ) and
-            (
-                not exists(self.clean_gate_max_voiced_hf_ratio_db) or
-                voiced_hf_ratio_db <= self.clean_gate_max_voiced_hf_ratio_db
-            )
-        )
-
         click_ok = (
             metrics.get('click_excess', float('inf')) <= self.clean_gate_max_click_excess
             if exists(self.clean_gate_max_click_excess)
@@ -2872,8 +2881,7 @@ class SoundStreamTrainer(nn.Module):
             metrics.get('recon_clip_fraction', float('inf')) <= self.clean_gate_max_recon_clip_fraction and
             click_ok and
             metrics.get('jump_ratio', float('inf')) <= self.clean_gate_max_jump_ratio and
-            metrics.get('p999_jump_ratio', float('inf')) <= self.clean_gate_max_p999_jump_ratio and
-            voiced_hf_ok
+            metrics.get('p999_jump_ratio', float('inf')) <= self.clean_gate_max_p999_jump_ratio
         )
 
     def clean_gate_failure_reasons(self, metrics):
@@ -2909,18 +2917,6 @@ class SoundStreamTrainer(nn.Module):
 
         if metrics.get('p999_jump_ratio', float('inf')) > self.clean_gate_max_p999_jump_ratio:
             reasons.append('p999_jump')
-
-        voiced_hf_ratio_db = metrics.get('voiced_hf_energy_ratio_db', float('-inf'))
-        if (
-            exists(self.clean_gate_min_voiced_hf_ratio_db) and
-            voiced_hf_ratio_db < self.clean_gate_min_voiced_hf_ratio_db
-        ):
-            reasons.append('voiced_hf_low')
-        if (
-            exists(self.clean_gate_max_voiced_hf_ratio_db) and
-            voiced_hf_ratio_db > self.clean_gate_max_voiced_hf_ratio_db
-        ):
-            reasons.append('voiced_hf_high')
 
         return reasons
 
@@ -2983,15 +2979,9 @@ class SoundStreamTrainer(nn.Module):
         )
 
     def quality_retention_voiced_hf_score_penalties(self, current_ratio):
-        bounds = self.quality_retention_voiced_hf_bounds()
-        if bounds is None or self.quality_retention_hf_score_weight <= 0.:
-            return 0., 0.
-
-        minimum_ratio, maximum_ratio = bounds
-        shortfall_db = max(0., minimum_ratio - current_ratio)
-        excess_db = max(0., current_ratio - maximum_ratio)
-        weight = self.quality_retention_hf_score_weight
-        return weight * shortfall_db ** 2, weight * excess_db ** 2
+        # High-frequency metrics remain diagnostics/loss targets, but no longer
+        # alter checkpoint ranking or quality-retention eligibility.
+        return 0., 0.
 
     def upper_hf_score_bounds(self):
         minimum = self.balanced_checkpoint_min_upper_hf_ratio_db
@@ -3001,14 +2991,7 @@ class SoundStreamTrainer(nn.Module):
         return minimum, maximum
 
     def quality_retention_upper_hf_score_penalties(self, current_ratio):
-        bounds = self.upper_hf_score_bounds()
-        if bounds is None or self.quality_retention_upper_hf_score_weight <= 0.:
-            return 0., 0.
-        minimum_ratio, maximum_ratio = bounds
-        shortfall_db = max(0., minimum_ratio - current_ratio)
-        excess_db = max(0., current_ratio - maximum_ratio)
-        weight = self.quality_retention_upper_hf_score_weight
-        return weight * shortfall_db ** 2, weight * excess_db ** 2
+        return 0., 0.
 
     def balanced_checkpoint_failure_reasons(self, metrics):
         """Stricter Stage-2 gate for a reconstruction/artifact compromise."""
@@ -3017,7 +3000,7 @@ class SoundStreamTrainer(nn.Module):
             return [*reasons, 'missing_baseline']
 
         baseline = self.quality_retention_baseline
-        required = ('aligned_si_sdr', 'ac_320_isolated', 'comb_median_excess_db')
+        required = ('aligned_si_sdr',)
         if any(key not in baseline for key in required):
             # Older trainer checkpoints did not store the frame-leakage
             # baseline. They remain resumable, but cannot claim a balanced best.
@@ -3029,40 +3012,6 @@ class SoundStreamTrainer(nn.Module):
             tolerance
         ):
             reasons.append('balanced_si_sdr')
-        if metrics.get('ac_320_isolated', float('inf')) > (
-            baseline['ac_320_isolated'] +
-            self.quality_retention_max_ac320_isolated_rise +
-            tolerance
-        ):
-            reasons.append('balanced_ac320')
-        if metrics.get('comb_median_excess_db', float('inf')) > (
-            baseline['comb_median_excess_db'] +
-            self.quality_retention_max_comb_median_excess_db_rise +
-            tolerance
-        ):
-            reasons.append('balanced_comb')
-        upper_bounds = self.upper_hf_score_bounds()
-        if upper_bounds is not None:
-            minimum_upper_ratio, maximum_upper_ratio = upper_bounds
-            upper_ratio = metrics.get(
-                'voiced_7k_7p8k_ratio_db',
-                float('-inf')
-            )
-            if upper_ratio < minimum_upper_ratio - tolerance:
-                reasons.append('balanced_upper_hf_low')
-            if upper_ratio > maximum_upper_ratio + tolerance:
-                reasons.append('balanced_upper_hf_high')
-            baseline_quiet_upper = baseline.get(
-                'quiet_7k_7p8k_excess_db'
-            )
-            if baseline_quiet_upper is None:
-                reasons.append('missing_upper_hf_baseline')
-            elif metrics.get('quiet_7k_7p8k_excess_db', float('inf')) > (
-                baseline_quiet_upper +
-                self.balanced_checkpoint_max_quiet_upper_hf_excess_db_rise +
-                tolerance
-            ):
-                reasons.append('balanced_quiet_upper_hf')
         return reasons
 
     def quality_retention_failure_reasons(self, metrics):
@@ -3084,41 +3033,12 @@ class SoundStreamTrainer(nn.Module):
             tolerance
         ):
             reasons.append('aligned_corr')
-        if metrics.get('quiet_hf_excess_db', float('inf')) > (
-            baseline['quiet_hf_excess_db'] +
-            self.quality_retention_max_quiet_hf_excess_db_rise +
-            tolerance
-        ):
-            reasons.append('quiet_hf')
-        minimum_hf_ratio, maximum_hf_ratio = (
-            self.quality_retention_voiced_hf_bounds()
-        )
-        if metrics.get('voiced_hf_energy_ratio_db', float('-inf')) < (
-            minimum_hf_ratio - tolerance
-        ):
-            reasons.append('voiced_hf_low')
-        if metrics.get('voiced_hf_energy_ratio_db', float('inf')) > (
-            maximum_hf_ratio + tolerance
-        ):
-            reasons.append('voiced_hf_high')
         if metrics.get('click_score', float('inf')) > (
             baseline.get('click_score', self.clean_gate_max_click_score) +
             self.quality_retention_max_click_score_rise +
             tolerance
         ):
             reasons.append('click')
-        if metrics.get('ac_320_isolated', float('inf')) > (
-            baseline['ac_320_isolated'] +
-            self.quality_retention_max_ac320_isolated_rise +
-            tolerance
-        ):
-            reasons.append('ac320')
-        if metrics.get('comb_median_excess_db', float('inf')) > (
-            baseline['comb_median_excess_db'] +
-            self.quality_retention_max_comb_median_excess_db_rise +
-            tolerance
-        ):
-            reasons.append('comb')
         if (
             metrics.get('codebook_q00_active_ratio', 0.) <
             self.quality_retention_q00_min_active_ratio or

@@ -65,9 +65,9 @@
 1. 三个残差单元，dilation依次为`1、3、9`；
 2. 每个残差单元使用：
    - `CausalConv1d(kernel=7, dilation=d)`
-   - ELU
+   - ReLU
    - `CausalConv1d(kernel=1)`
-   - ELU
+   - ReLU
 3. 最后使用`CausalConv1d(kernel=2×stride, stride=stride)`完成下采样和通道扩展。
 
 ### 3.2 DecoderBlock
@@ -306,11 +306,12 @@ rq.*._codebook.embed
 
 ```text
 results/
-├─ overfit-64d-23q/
-├─ recon-pretrain-64d-23q/
-├─ gan-pretrain-64d-23q/
-├─ stream-finetune-64d-23q/
-└─ stream-finetune-long-64d-23q/
+├─ overfit-dscnn-relu-fp-64d-8q/
+├─ recon-pretrain-dscnn-relu-fp-64d-8q/
+├─ spectral-refine-dscnn-relu-fp-64d-8q/
+├─ gan-pretrain-dscnn-relu-fp-64d-8q/
+├─ stream-finetune-dscnn-relu-fp-64d-8q/
+└─ stream-finetune-long-dscnn-relu-fp-64d-8q/
 ```
 
 部署或进入下一阶段默认使用：

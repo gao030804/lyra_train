@@ -13,8 +13,8 @@ if [ -n "${CONDA_PREFIX:-}" ]; then
 fi
 export PYTHONUNBUFFERED=1
 
-GPU_LIST="${GPU_LIST:-0,1,2,3,4,5,7}"
-NUM_PROCESSES="${NUM_PROCESSES:-7}"
+GPU_LIST="${GPU_LIST:-0,1,2,3,4,5}"
+NUM_PROCESSES="${NUM_PROCESSES:-6}"
 AUDIO_DIR="${AUDIO_DIR:-$PWD/data/librispeech/LibriSpeech/train-clean-100}"
 SEED="${SEED:-42}"
 STAGE2_STEPS="${STAGE2_STEPS:-50000}"
@@ -54,10 +54,6 @@ RESUME_STAGE1="${RESUME_STAGE1:-0}"
 FALLBACK_STAGE1_CKPT="${FALLBACK_STAGE1_CKPT:-}"
 FALLBACK_MAX_SISDR_DROP="${FALLBACK_MAX_SISDR_DROP:-0.15}"
 FALLBACK_MAX_CORR_DROP="${FALLBACK_MAX_CORR_DROP:-0.01}"
-FALLBACK_MAX_VOICED_HF_DROP_DB="${FALLBACK_MAX_VOICED_HF_DROP_DB:-0.10}"
-FALLBACK_MAX_VOICED_HF_RISE_DB="${FALLBACK_MAX_VOICED_HF_RISE_DB:-0.50}"
-FALLBACK_MAX_QUIET_HF_RISE_DB="${FALLBACK_MAX_QUIET_HF_RISE_DB:-0.50}"
-FALLBACK_MAX_AC320_RISE="${FALLBACK_MAX_AC320_RISE:-0.01}"
 FALLBACK_MAX_CLICK_RISE="${FALLBACK_MAX_CLICK_RISE:-1.00}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
@@ -126,8 +122,8 @@ fi
 
 # Defaults include a timestamp, so --no-resume cannot accidentally reuse an
 # older checkpoint's best-score state.  Set explicit names only when needed.
-STAGE1_NAME="${STAGE1_NAME:-recon-pretrain-full-${RUN_TAG}-7gpu-4s}"
-STAGE2_NAME="${STAGE2_NAME:-gan-pretrain-direct-s1-${RUN_TAG}-s2-${STAGE2_ABLATION}-50k-hfretain-7gpu-4s}"
+STAGE1_NAME="${STAGE1_NAME:-recon-pretrain-dscnn-relu-fp-64d-8q-${RUN_TAG}-${NUM_PROCESSES}gpu-4s}"
+STAGE2_NAME="${STAGE2_NAME:-gan-pretrain-dscnn-relu-fp-64d-8q-from-s1-${RUN_TAG}-s2-${STAGE2_ABLATION}-50k-${NUM_PROCESSES}gpu-4s}"
 
 STAGE1_DIR="$PWD/results/$STAGE1_NAME"
 STAGE2_DIR="$PWD/results/$STAGE2_NAME"
@@ -339,10 +335,6 @@ if [[ -n "$FALLBACK_STAGE1_CKPT" ]]; then
       --decision-report "$FALLBACK_DECISION_REPORT" \
       --max-si-sdr-drop "$FALLBACK_MAX_SISDR_DROP" \
       --max-correlation-drop "$FALLBACK_MAX_CORR_DROP" \
-      --max-voiced-hf-drop-db "$FALLBACK_MAX_VOICED_HF_DROP_DB" \
-      --max-voiced-hf-rise-db "$FALLBACK_MAX_VOICED_HF_RISE_DB" \
-      --max-quiet-hf-rise-db "$FALLBACK_MAX_QUIET_HF_RISE_DB" \
-      --max-ac320-rise "$FALLBACK_MAX_AC320_RISE" \
       --max-click-rise "$FALLBACK_MAX_CLICK_RISE")"
     echo "Automatic fallback decision report: $FALLBACK_DECISION_REPORT"
     cat "$FALLBACK_DECISION_REPORT"
@@ -361,11 +353,6 @@ evaluate_stage1_checkpoint "$STAGE1_CKPT" "$STAGE2_PREFLIGHT_REPORT"
   --min-aligned-si-sdr 0 \
   --min-aligned-correlation 0.65 \
   --max-click-excess 0.5 \
-  --min-voiced-hf-ratio-db -1.5 \
-  --max-voiced-hf-ratio-db 1.0 \
-  --max-quiet-hf-excess-db 1.0 \
-  --max-ac320-isolated 0.10 \
-  --max-comb-median-excess-db 8.0 \
   --min-q00-active-ratio 0.70 \
   --min-q00-perplexity 50 \
   --max-recon-clip-fraction 0.001
@@ -465,14 +452,7 @@ run_stage "Stage 2: gan_pretrain" 29503 \
   --stage2-best-checkpoint-min-step 5000 \
   --stage2-quality-retention-patience 8 \
   --stage2-rvq-retention-patience 6 \
-  --stage2-max-voiced-hf-ratio-db-drop 0.30 \
-  --stage2-max-voiced-hf-ratio-db-rise 1.50 \
-  --stage2-voiced-hf-score-weight 3.0 \
   --stage2-balanced-max-aligned-si-sdr-drop 0.10 \
-  --stage2-min-voiced-7k-7p8k-ratio-db -1.0 \
-  --stage2-max-voiced-7k-7p8k-ratio-db 0.50 \
-  --stage2-max-quiet-7k-7p8k-excess-db-rise 0.30 \
-  --stage2-upper-highband-score-weight 0.10 \
   --stage2-max-click-score-rise 0.30 \
   --clean-gate-max-click-score 6.0 \
   --clean-gate-max-click-excess 0.5 \

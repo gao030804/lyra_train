@@ -31,12 +31,13 @@ from audiolm_pytorch import FrameStreamingSoundStream, SoundStream
 
 
 DEFAULT_RESULTS_DIRS = (
-    PROJECT_DIR / "results" / "stream-finetune-long-64d-23q",
-    PROJECT_DIR / "results" / "stream-finetune-64d-23q",
-    PROJECT_DIR / "results" / "gan-pretrain-64d-23q",
+    PROJECT_DIR / "results" / "stream-finetune-long-dscnn-relu-fp-64d-8q",
+    PROJECT_DIR / "results" / "stream-finetune-dscnn-relu-fp-64d-8q",
+    PROJECT_DIR / "results" / "gan-pretrain-dscnn-relu-fp-64d-8q",
+    PROJECT_DIR / "results" / "spectral-refine-dscnn-relu-fp-64d-8q",
+    PROJECT_DIR / "results" / "recon-pretrain-dscnn-relu-fp-64d-8q",
+    PROJECT_DIR / "results" / "overfit-dscnn-relu-fp-64d-8q",
     PROJECT_DIR / "results" / "recon-pretrain-saturday-baseline-6gpu",
-    PROJECT_DIR / "results" / "recon-pretrain-64d-23q",
-    PROJECT_DIR / "results" / "overfit-64d-23q",
     PROJECT_DIR / "results" / "soundstream-3k2-finetune",
     PROJECT_DIR / "results" / "soundstream-3k2-pretrain",
     PROJECT_DIR / "results" / "soundstream-librispeech",
