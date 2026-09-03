@@ -324,6 +324,12 @@ class SoundStreamTrainer(nn.Module):
         generator_hold_steps: int = 0,
         generator_hold_lr: float | None = None,
         generator_freeze_steps: int = 0,
+        stage2_phase2_start_step: int | None = None,
+        stage2_phase3_start_step: int | None = None,
+        stage2_phase2_generator_lr: float | None = None,
+        stage2_phase3_generator_lr: float | None = None,
+        stage2_phase3_gan_adversarial_max: float | None = None,
+        stage2_phase3_gan_feature_max: float | None = None,
         discriminator_hold_steps: int = 0,
         discriminator_hold_lr: float | None = None,
         discriminator_start_step: int | None = None,
@@ -385,6 +391,7 @@ class SoundStreamTrainer(nn.Module):
         clean_gate_min_voiced_hf_ratio_db: float | None = None,
         clean_gate_max_voiced_hf_ratio_db: float | None = None,
         quality_retention_gate: bool = False,
+        quality_retention_hard_stop: bool = True,
         quality_retention_max_aligned_si_sdr_drop: float = 0.30,
         quality_retention_max_aligned_corr_drop: float = 0.02,
         quality_retention_max_quiet_hf_excess_db_rise: float = 0.50,
@@ -643,6 +650,7 @@ class SoundStreamTrainer(nn.Module):
         assert quality_retention_hf_score_weight >= 0.
         assert stage1_rvq_retention_patience > 0
         self.quality_retention_gate = quality_retention_gate
+        self.quality_retention_hard_stop = quality_retention_hard_stop
         self.quality_retention_max_aligned_si_sdr_drop = quality_retention_max_aligned_si_sdr_drop
         self.quality_retention_max_aligned_corr_drop = quality_retention_max_aligned_corr_drop
         self.quality_retention_max_quiet_hf_excess_db_rise = quality_retention_max_quiet_hf_excess_db_rise
@@ -712,6 +720,14 @@ class SoundStreamTrainer(nn.Module):
             "encoder_excluded_from_generator_optimizer": (
                 exclude_encoder_from_generator_optimizer
             ),
+            "stage2_phase2_start_step": stage2_phase2_start_step,
+            "stage2_phase3_start_step": stage2_phase3_start_step,
+            "stage2_phase2_generator_lr": stage2_phase2_generator_lr,
+            "stage2_phase3_generator_lr": stage2_phase3_generator_lr,
+            "stage2_phase3_gan_adversarial_max": (
+                stage2_phase3_gan_adversarial_max
+            ),
+            "stage2_phase3_gan_feature_max": stage2_phase3_gan_feature_max,
             "first_decoder_block_excluded_from_generator_optimizer": (
                 exclude_first_decoder_block_from_generator_optimizer
             ),
@@ -886,6 +902,24 @@ class SoundStreamTrainer(nn.Module):
         self.generator_hold_steps = generator_hold_steps
         self.generator_hold_lr = generator_hold_lr
         self.generator_freeze_steps = generator_freeze_steps
+        if exists(stage2_phase2_start_step):
+            assert stage2_phase2_start_step >= 0
+            assert exists(stage2_phase3_start_step)
+            assert stage2_phase3_start_step > stage2_phase2_start_step
+            assert exists(stage2_phase2_generator_lr)
+            assert exists(stage2_phase3_generator_lr)
+            assert stage2_phase2_generator_lr > 0.
+            assert stage2_phase3_generator_lr > 0.
+        if exists(stage2_phase3_gan_adversarial_max):
+            assert stage2_phase3_gan_adversarial_max >= 0.
+        if exists(stage2_phase3_gan_feature_max):
+            assert stage2_phase3_gan_feature_max >= 0.
+        self.stage2_phase2_start_step = stage2_phase2_start_step
+        self.stage2_phase3_start_step = stage2_phase3_start_step
+        self.stage2_phase2_generator_lr = stage2_phase2_generator_lr
+        self.stage2_phase3_generator_lr = stage2_phase3_generator_lr
+        self.stage2_phase3_gan_adversarial_max = stage2_phase3_gan_adversarial_max
+        self.stage2_phase3_gan_feature_max = stage2_phase3_gan_feature_max
         assert discriminator_hold_steps >= 0
         if exists(discriminator_hold_lr):
             assert discriminator_hold_lr > 0.
@@ -1233,6 +1267,7 @@ class SoundStreamTrainer(nn.Module):
         self.best_balanced_score = float('inf')
         self.best_gan_balanced_score = float('inf')
         self.best_full_gan_balanced_score = float('inf')
+        self.best_full_gan_formant_balanced_score = float('inf')
         assert not exists(early_stopping_patience) or early_stopping_patience > 0
         assert early_stopping_min_delta >= 0.
         assert early_stopping_min_steps >= 0
@@ -1386,6 +1421,9 @@ class SoundStreamTrainer(nn.Module):
             best_balanced_score = self.best_balanced_score,
             best_gan_balanced_score = self.best_gan_balanced_score,
             best_full_gan_balanced_score = self.best_full_gan_balanced_score,
+            best_full_gan_formant_balanced_score = (
+                self.best_full_gan_formant_balanced_score
+            ),
             early_stopping_bad_evals = self.early_stopping_bad_evals,
             early_stopping_triggered = self.early_stopping_triggered,
             quality_retention_baseline = self.quality_retention_baseline,
@@ -1564,6 +1602,15 @@ class SoundStreamTrainer(nn.Module):
             self.best_full_gan_balanced_score = min(
                 self.best_full_gan_balanced_score,
                 best_full_gan_balanced_score,
+            )
+
+        best_full_gan_formant_balanced_score = self.saved_model_only_score(
+            self.results_folder / 'best_full_gan_formant_balanced.pt'
+        )
+        if exists(best_full_gan_formant_balanced_score):
+            self.best_full_gan_formant_balanced_score = min(
+                self.best_full_gan_formant_balanced_score,
+                best_full_gan_formant_balanced_score,
             )
 
     def codebook_metrics(self, model, indices):
@@ -3074,6 +3121,42 @@ class SoundStreamTrainer(nn.Module):
             reasons.append('balanced_si_sdr')
         return reasons
 
+    def full_gan_formant_balance_score(self, metrics):
+        """Soft Stage-2 ranking that retains, but does not gate, formants."""
+        if not self.has_quality_retention_baseline:
+            return float('inf')
+
+        baseline = self.quality_retention_baseline
+        relative_deltas = []
+        for name in (
+            'spectral_envelope_fine',
+            'spectral_envelope_coarse',
+            'formant_f1_mae_hz',
+            'formant_f2_mae_hz',
+            'formant_f3_mae_hz',
+        ):
+            initial = baseline.get(name)
+            current = metrics.get(name)
+            if (
+                not exists(initial) or
+                not exists(current) or
+                not isfinite(initial) or
+                not isfinite(current)
+            ):
+                continue
+            scale = max(abs(initial), 1e-6)
+            relative_deltas.append(
+                min(max((current - initial) / scale, -2.), 2.)
+            )
+
+        if not relative_deltas:
+            return float('inf')
+
+        # This is deliberately a separate diagnostic ranker. It cannot reject
+        # a checkpoint or alter the production reconstruction/GAN score.
+        formant_penalty = 0.05 * sum(relative_deltas) / len(relative_deltas)
+        return metrics.get('score', float('inf')) + formant_penalty
+
     def quality_retention_failure_reasons(self, metrics):
         if not self.quality_retention_gate or not self.has_quality_retention_baseline:
             return []
@@ -3607,6 +3690,10 @@ class SoundStreamTrainer(nn.Module):
             'best_full_gan_balanced_score',
             float('inf')
         )
+        self.best_full_gan_formant_balanced_score = pkg.get(
+            'best_full_gan_formant_balanced_score',
+            float('inf')
+        )
         saved_early_stopping_metric = pkg.get('early_stopping_metric', 'score')
         if saved_early_stopping_metric == self.early_stopping_metric:
             self.early_stopping_best_score = pkg.get(
@@ -3728,8 +3815,23 @@ class SoundStreamTrainer(nn.Module):
                 )
             )
 
-        model.adversarial_loss_weight = self.gan_adversarial_max * progress
-        model.feature_loss_weight = self.gan_feature_max * progress
+        adversarial_max = self.gan_adversarial_max
+        feature_max = self.gan_feature_max
+        if (
+            exists(self.stage2_phase3_start_step) and
+            steps >= self.stage2_phase3_start_step
+        ):
+            adversarial_max = default(
+                self.stage2_phase3_gan_adversarial_max,
+                adversarial_max,
+            )
+            feature_max = default(
+                self.stage2_phase3_gan_feature_max,
+                feature_max,
+            )
+
+        model.adversarial_loss_weight = adversarial_max * progress
+        model.feature_loss_weight = feature_max * progress
         return progress
 
     def update_si_sdr_loss_weight(self, steps):
@@ -4024,6 +4126,32 @@ class SoundStreamTrainer(nn.Module):
                 group['lr'] = base_lr
             self.optim.sync_warmup_lrs_from_optimizer()
             return self.generator_hold_base_lrs[0]
+
+        phase_lr = None
+        if (
+            exists(self.stage2_phase3_start_step) and
+            steps >= self.stage2_phase3_start_step
+        ):
+            phase_lr = self.stage2_phase3_generator_lr
+        elif (
+            exists(self.stage2_phase2_start_step) and
+            steps >= self.stage2_phase2_start_step
+        ):
+            phase_lr = self.stage2_phase2_generator_lr
+
+        if exists(phase_lr):
+            reference_lr = max(self.generator_hold_base_lrs[0], 1e-20)
+            target_lrs = [
+                phase_lr * (base_lr / reference_lr)
+                for base_lr in self.generator_hold_base_lrs
+            ]
+            for group, target_lr in zip(
+                self.optim.optimizer.param_groups,
+                target_lrs,
+            ):
+                group['lr'] = target_lr
+            self.optim.sync_warmup_lrs_from_optimizer()
+            return target_lrs[0]
 
         return current_lr
 
@@ -4875,6 +5003,14 @@ class SoundStreamTrainer(nn.Module):
             f"lr_d_wave_next={waveform_discriminator_lr:.3e}"
         )
 
+        if exists(self.stage2_phase2_start_step):
+            stage2_phase = (
+                3 if steps >= self.stage2_phase3_start_step
+                else 2 if steps >= self.stage2_phase2_start_step
+                else 1
+            )
+            losses_str += f" | stage2_phase={stage2_phase}"
+
         if 'g_gan_to_reconstruction_grad_ratio' in logs:
             losses_str += (
                 f" | g_recon_grad={logs['g_reconstruction_grad_norm']:.6f}"
@@ -5236,6 +5372,28 @@ class SoundStreamTrainer(nn.Module):
                 full_gan_balanced_selected_model = None
                 full_gan_balanced_selected_metrics = None
 
+            if full_gan_balanced_candidates:
+                (
+                    full_gan_formant_selected_name,
+                    full_gan_formant_selected_model,
+                    full_gan_formant_selected_metrics,
+                ) = min(
+                    full_gan_balanced_candidates,
+                    key = lambda candidate: self.full_gan_formant_balance_score(
+                        candidate[2]
+                    ),
+                )
+                full_gan_formant_selected_score = (
+                    self.full_gan_formant_balance_score(
+                        full_gan_formant_selected_metrics
+                    )
+                )
+            else:
+                full_gan_formant_selected_name = 'none'
+                full_gan_formant_selected_model = None
+                full_gan_formant_selected_metrics = None
+                full_gan_formant_selected_score = float('inf')
+
             self.sync_best_scores_from_disk()
 
             # Keep an online diagnostic best independently of the perceptual
@@ -5456,6 +5614,14 @@ class SoundStreamTrainer(nn.Module):
                     f"aligned_si_sdr={online_score['aligned_si_sdr'] - baseline['aligned_si_sdr']:+.3f} dB, "
                     f"ac320_iso={online_score.get('ac_320_isolated', 0.) - baseline['ac_320_isolated']:+.4f}, "
                     f"comb_median={online_score.get('comb_median_excess_db', 0.) - baseline['comb_median_excess_db']:+.2f} dB, "
+                    f"env_fine={online_score.get('spectral_envelope_fine', 0.) - baseline.get('spectral_envelope_fine', 0.):+.4f}, "
+                    f"env_coarse={online_score.get('spectral_envelope_coarse', 0.) - baseline.get('spectral_envelope_coarse', 0.):+.4f}, "
+                    f"f1_mae={online_score.get('formant_f1_mae_hz', 0.) - baseline.get('formant_f1_mae_hz', 0.):+.1f} Hz, "
+                    f"f2_mae={online_score.get('formant_f2_mae_hz', 0.) - baseline.get('formant_f2_mae_hz', 0.):+.1f} Hz, "
+                    f"f3_mae={online_score.get('formant_f3_mae_hz', 0.) - baseline.get('formant_f3_mae_hz', 0.):+.1f} Hz, "
+                    f"stft512={online_score.get('stft_scale_512', 0.) - baseline.get('stft_scale_512', 0.):+.4f}, "
+                    f"stft1024={online_score.get('stft_scale_1024', 0.) - baseline.get('stft_scale_1024', 0.):+.4f}, "
+                    f"stft2048={online_score.get('stft_scale_2048', 0.) - baseline.get('stft_scale_2048', 0.):+.4f}, "
                     "q00_active="
                     f"{online_score.get('codebook_q00_active_ratio', 0.) - baseline.get('codebook_q00_active_ratio', 0.):+.3f}, "
                     "q00_perplexity="
@@ -5550,8 +5716,11 @@ class SoundStreamTrainer(nn.Module):
                         self.plateau_lr_reduction_count > 0
                     )
                     if (
-                        rvq_patience_exhausted or
-                        (quality_patience_exhausted and quality_hard_stop_ready)
+                        self.quality_retention_hard_stop and
+                        (
+                            rvq_patience_exhausted or
+                            (quality_patience_exhausted and quality_hard_stop_ready)
+                        )
                     ):
                         self.early_stopping_triggered = True
                         self.save(str(self.results_folder / 'latest.pt'))
@@ -5561,10 +5730,16 @@ class SoundStreamTrainer(nn.Module):
                             "Any previously saved gated best checkpoint remains valid; "
                             "baseline_init.pt remains the initialization reference."
                         )
-                    elif quality_patience_exhausted:
+                    elif quality_patience_exhausted and self.quality_retention_hard_stop:
                         self.print(
                             f"{steps}: quality hard stop deferred until "
                             "ReduceLROnPlateau has reduced the generator LR at least once."
+                        )
+                    elif quality_patience_exhausted:
+                        self.print(
+                            f"{steps}: quality retention remains diagnostic-only; "
+                            "failed candidates are rejected, but the configured "
+                            "150k schedule continues."
                         )
             elif self.quality_retention_gate and self.is_main:
                 self.print(
@@ -5662,6 +5837,11 @@ class SoundStreamTrainer(nn.Module):
             full_gan_balanced_improved = (
                 exists(full_gan_balanced_selected_model) and
                 full_gan_balanced_selected_metrics['score'] < self.best_full_gan_balanced_score
+            )
+            full_gan_formant_balanced_improved = (
+                exists(full_gan_formant_selected_model) and
+                full_gan_formant_selected_score <
+                self.best_full_gan_formant_balanced_score
             )
 
             if raw_online_improved:
@@ -5762,6 +5942,25 @@ class SoundStreamTrainer(nn.Module):
                     f"{steps}: saving best_full_gan_balanced.pt "
                     f"({full_gan_balanced_selected_name}, score="
                     f"{self.best_full_gan_balanced_score:.6f}, gan_ramp={gan_progress:.3f})"
+                )
+
+            if full_gan_formant_balanced_improved:
+                self.best_full_gan_formant_balanced_score = (
+                    full_gan_formant_selected_score
+                )
+                self.save_model_only(
+                    self.results_folder / 'best_full_gan_formant_balanced.pt',
+                    full_gan_formant_selected_model,
+                    score = self.best_full_gan_formant_balanced_score,
+                    step = steps,
+                    weight_source = full_gan_formant_selected_name,
+                )
+                self.save(str(self.results_folder / 'latest.pt'))
+                self.print(
+                    f"{steps}: saving best_full_gan_formant_balanced.pt "
+                    f"({full_gan_formant_selected_name}, score="
+                    f"{self.best_full_gan_formant_balanced_score:.6f}, "
+                    f"gan_ramp={gan_progress:.3f}; diagnostic soft formant rank)"
                 )
 
             if frame_leakage_improved:

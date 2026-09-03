@@ -17,7 +17,7 @@ GPU_LIST="${GPU_LIST:-0,1,2,3,4,5}"
 NUM_PROCESSES="${NUM_PROCESSES:-6}"
 AUDIO_DIR="${AUDIO_DIR:-$PWD/data/librispeech/LibriSpeech/train-clean-100}"
 SEED="${SEED:-42}"
-STAGE2_STEPS="${STAGE2_STEPS:-50000}"
+STAGE2_STEPS="${STAGE2_STEPS:-150000}"
 # Controlled Stage-2 GAN ablations. Keep the production baseline unchanged
 # unless one explicit single-variable experiment is selected:
 #   baseline: unchanged G LR=5e-7 and adversarial max=2e-4
@@ -58,22 +58,6 @@ FALLBACK_MAX_CLICK_RISE="${FALLBACK_MAX_CLICK_RISE:-1.00}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
 
-# Short diagnostics intentionally finish before the formal 60k/90k schedule
-# floors. Clamp those floors to the requested run length so the same launcher
-# works for both a 30k diagnostic and a 200k formal run.
-if (( STAGE2_STEPS < 20000 )); then
-  DEFAULT_STAGE2_EARLY_STOP_MIN_STEPS="$STAGE2_STEPS"
-else
-  DEFAULT_STAGE2_EARLY_STOP_MIN_STEPS=20000
-fi
-if (( STAGE2_STEPS < 10000 )); then
-  DEFAULT_STAGE2_PLATEAU_START_STEPS="$STAGE2_STEPS"
-else
-  DEFAULT_STAGE2_PLATEAU_START_STEPS=10000
-fi
-STAGE2_EARLY_STOP_MIN_STEPS="${STAGE2_EARLY_STOP_MIN_STEPS:-$DEFAULT_STAGE2_EARLY_STOP_MIN_STEPS}"
-STAGE2_PLATEAU_START_STEPS="${STAGE2_PLATEAU_START_STEPS:-$DEFAULT_STAGE2_PLATEAU_START_STEPS}"
-
 if [[ "$SKIP_STAGE1" != "0" && "$SKIP_STAGE1" != "1" ]]; then
     echo "ERROR: SKIP_STAGE1 must be 0 or 1." >&2
     exit 2
@@ -105,15 +89,6 @@ if [[ "$SKIP_STAGE1" == "1" && "$RESUME_STAGE1" == "1" ]]; then
   exit 2
 fi
 
-if (( STAGE2_EARLY_STOP_MIN_STEPS < 0 || STAGE2_EARLY_STOP_MIN_STEPS > STAGE2_STEPS )); then
-  echo "ERROR: STAGE2_EARLY_STOP_MIN_STEPS must be in [0, STAGE2_STEPS]." >&2
-  exit 2
-fi
-if (( STAGE2_PLATEAU_START_STEPS < 0 || STAGE2_PLATEAU_START_STEPS > STAGE2_STEPS )); then
-  echo "ERROR: STAGE2_PLATEAU_START_STEPS must be in [0, STAGE2_STEPS]." >&2
-  exit 2
-fi
-
 IFS=',' read -r -a GPU_IDS <<< "$GPU_LIST"
 if (( ${#GPU_IDS[@]} != NUM_PROCESSES )); then
   echo "ERROR: GPU_LIST has ${#GPU_IDS[@]} devices but NUM_PROCESSES=$NUM_PROCESSES." >&2
@@ -123,7 +98,7 @@ fi
 # Defaults include a timestamp, so --no-resume cannot accidentally reuse an
 # older checkpoint's best-score state.  Set explicit names only when needed.
 STAGE1_NAME="${STAGE1_NAME:-recon-pretrain-dscnn-relu-fp-64d-8q-${RUN_TAG}-${NUM_PROCESSES}gpu-4s}"
-STAGE2_NAME="${STAGE2_NAME:-gan-pretrain-dscnn-relu-fp-64d-8q-from-s1-${RUN_TAG}-s2-${STAGE2_ABLATION}-50k-${NUM_PROCESSES}gpu-4s}"
+STAGE2_NAME="${STAGE2_NAME:-gan-pretrain-dscnn-relu-fp-64d-8q-from-s1-${RUN_TAG}-s2-${STAGE2_ABLATION}-${STAGE2_STEPS}steps-${NUM_PROCESSES}gpu-4s}"
 
 STAGE1_DIR="$PWD/results/$STAGE1_NAME"
 STAGE2_DIR="$PWD/results/$STAGE2_NAME"
@@ -383,8 +358,6 @@ echo "STAGE2_ABLATION=$STAGE2_ABLATION"
 echo "STAGE2_GENERATOR_LR=$STAGE2_GENERATOR_LR"
 echo "STAGE2_GAN_ADVERSARIAL_MAX=$STAGE2_GAN_ADVERSARIAL_MAX"
 echo "STAGE2_GAN_FEATURE_MAX=$STAGE2_GAN_FEATURE_MAX"
-echo "STAGE2_EARLY_STOP_MIN_STEPS=$STAGE2_EARLY_STOP_MIN_STEPS"
-echo "STAGE2_PLATEAU_START_STEPS=$STAGE2_PLATEAU_START_STEPS"
 run_stage "Stage 2: gan_pretrain" 29503 \
   --stage gan_pretrain \
   --audio-dir "$AUDIO_DIR" \
@@ -405,8 +378,7 @@ run_stage "Stage 2: gan_pretrain" 29503 \
   --seed "$SEED" \
   --save-model-every 5000 \
   --best-eval-every 500 \
-  --early-stopping-min-steps "$STAGE2_EARLY_STOP_MIN_STEPS" \
-  --early-stopping-patience 12 \
+  --early-stopping-min-steps "$STAGE2_STEPS" \
   --si-sdr-loss-weight 0.05 \
   --si-sdr-loss-start-steps 0 \
   --si-sdr-loss-warmup-steps 0 \
@@ -415,19 +387,19 @@ run_stage "Stage 2: gan_pretrain" 29503 \
   --formant-peak-loss-start-steps 0 \
   --formant-peak-loss-warmup-steps 5000 \
   --loss-grad-diagnostics-every 1000 \
-  --voiced-highband-loss-weight 0.06 \
+  --voiced-highband-loss-weight 0.02 \
   --voiced-highband-energy-deficit-weight 0.40 \
   --voiced-highband-energy-margin-db 0.05 \
-  --voiced-hf-retention-loss-weight 0.02 \
+  --voiced-hf-retention-loss-weight 0.01 \
   --voiced-hf-retention-margin-db 0.50 \
   --voiced-highband-loss-start-steps 0 \
   --voiced-highband-loss-warmup-steps 0 \
-  --upper-highband-loss-weight 0.0025 \
+  --upper-highband-loss-weight 0.001 \
   --upper-highband-energy-deficit-weight 0.20 \
   --upper-highband-energy-margin-db 0.50 \
   --upper-highband-loss-start-steps 1000 \
   --upper-highband-loss-warmup-steps 5000 \
-  --active-spectral-detail-loss-weight 0.02 \
+  --active-spectral-detail-loss-weight 0.01 \
   --active-spectral-detail-loss-start-steps 2000 \
   --active-spectral-detail-loss-warmup-steps 8000 \
   --stage2-active-spectral-score-weight 0.05 \
@@ -435,34 +407,35 @@ run_stage "Stage 2: gan_pretrain" 29503 \
   --click-loss-weight 0 \
   --jump-loss-weight 0 \
   --preemph-loss-weight 0 \
-  --stage2-plateau-lr \
-  --stage2-plateau-start-steps "$STAGE2_PLATEAU_START_STEPS" \
-  --stage2-plateau-factor 0.5 \
-  --stage2-plateau-patience 8 \
-  --stage2-plateau-threshold 0.01 \
-  --stage2-plateau-cooldown 2 \
-  --stage2-plateau-min-lr 2e-7 \
-  --stage2-plateau-discr-min-lr 1e-7 \
-  --stage2-plateau-stft-discr-min-lr 1e-7 \
+  --stft-recon-loss-weight 0.02 \
+  --stft-recon-loss-start-steps 2000 \
+  --stft-recon-loss-warmup-steps 8000 \
   --waveform-discr-lrs 5e-7 5e-7 2.5e-7 \
   --stft-discr-lr 2.5e-7 \
-  --waveform-discr-update-every 2 4 4 \
+  --waveform-discr-update-every 2 2 2 \
   --waveform-discr-loss-weights 1.0 0.25 0.25 \
   --stft-discr-update-every 4 \
   --stft-discr-loss-weight 0.5 \
   --gan-grad-diagnostics-every 500 \
   --discr-max-grad-norm 1.0 \
-  --stage2-generator-freeze-steps 1000 \
+  --stage2-generator-freeze-steps 2000 \
   --stage2-discriminator-start-steps 0 \
   --stage2-unfreeze-encoder-rvq-step -1 \
   --stage2-generator-hold-steps 5000 \
   --stage2-generator-hold-lr 1e-7 \
+  --stage2-phase2-start-step 50000 \
+  --stage2-phase3-start-step 100000 \
+  --stage2-phase2-generator-lr 2e-7 \
+  --stage2-phase3-generator-lr 1e-7 \
+  --stage2-phase3-gan-adversarial-max 1e-4 \
+  --stage2-phase3-gan-feature-max 1.0 \
   --stage2-discriminator-hold-steps 0 \
   --stage2-discriminator-hold-lr 5e-6 \
   --stage2-quality-gate-start-steps 20000 \
   --stage2-best-checkpoint-min-step 5000 \
   --stage2-quality-retention-patience 8 \
   --stage2-rvq-retention-patience 6 \
+  --no-stage2-quality-hard-stop \
   --stage2-balanced-max-aligned-si-sdr-drop 0.10 \
   --stage2-max-click-score-rise 0.30 \
   --clean-gate-max-click-score 6.0 \
