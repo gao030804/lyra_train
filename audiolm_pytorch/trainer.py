@@ -408,9 +408,9 @@ class SoundStreamTrainer(nn.Module):
         quality_retention_upper_hf_score_weight: float = 0.,
         quality_retention_active_spectral_score_weight: float = 0.,
         quality_retention_q00_min_active_ratio: float = 0.70,
-        quality_retention_q00_min_perplexity: float = 50.,
+        quality_retention_q00_min_perplexity: float = 8.,
         quality_retention_q00_warn_active_ratio: float = 0.80,
-        quality_retention_q00_warn_perplexity: float = 70.,
+        quality_retention_q00_warn_perplexity: float = 10.,
         quality_retention_max_q00_active_ratio_drop: float | None = None,
         quality_retention_max_q00_perplexity_fraction_drop: float | None = None,
         quality_retention_patience: int = 3,
@@ -426,6 +426,7 @@ class SoundStreamTrainer(nn.Module):
         gan_ramp_steps: int = 0,
         gan_adversarial_max: float = 0.1,
         gan_feature_max: float = 10.,
+        rvq_calibration_only: bool = False,
         freeze_codebook_after_step: int | None = None,
         freeze_codebook_before_step: int | None = None,
         freeze_codebook_during_training: bool = False,
@@ -1300,6 +1301,7 @@ class SoundStreamTrainer(nn.Module):
         self.gan_ramp_steps = gan_ramp_steps
         self.gan_adversarial_max = gan_adversarial_max
         self.gan_feature_max = gan_feature_max
+        self.rvq_calibration_only = bool(rvq_calibration_only)
         assert not exists(freeze_codebook_after_step) or freeze_codebook_after_step >= 0
         assert not exists(freeze_codebook_before_step) or freeze_codebook_before_step >= 0
         assert not exists(freeze_encoder_before_step) or freeze_encoder_before_step >= 0
@@ -1679,7 +1681,8 @@ class SoundStreamTrainer(nn.Module):
             active_ratio_value = float(active_ratio.detach().cpu())
             perplexity_value = float(perplexity.detach().cpu())
             collapsed_quantizers += int(
-                active_ratio_value < 0.10 or perplexity_value < 16.
+                active_ratio_value < 0.10 or
+                perplexity_value < max(2., 0.25 * codebook_size)
             )
             prefix = f'codebook_q{quantizer_index:02d}'
             metrics[f'{prefix}_active_codes'] = active_codes
@@ -1704,6 +1707,7 @@ class SoundStreamTrainer(nn.Module):
             )
 
         metrics.update(
+            codebook_size=(counts.shape[-1] if counts.ndim == 2 else 0),
             active_code_ratio = float(
                 torch.stack(active_ratios).mean().detach().cpu()
                 if active_ratios
@@ -1775,9 +1779,12 @@ class SoundStreamTrainer(nn.Module):
         collapsed = [
             index
             for (
-                index, _, active_ratio, perplexity, _, *_
+                index, active_codes, active_ratio, perplexity, _, dead_codes, *_
             ) in quantizer_metrics
-            if active_ratio < 0.10 or perplexity < 16.
+            if (
+                active_ratio < 0.10 or
+                perplexity < max(2., 0.25 * (active_codes + dead_codes))
+            )
         ]
         details = " ".join(
             (
@@ -3182,13 +3189,15 @@ class SoundStreamTrainer(nn.Module):
             tolerance
         ):
             reasons.append('click')
-        if (
-            metrics.get('codebook_q00_active_ratio', 0.) <
-            self.quality_retention_q00_min_active_ratio or
-            metrics.get('codebook_q00_perplexity', 0.) <
-            self.quality_retention_q00_min_perplexity
-        ):
-            reasons.append('q00')
+        bypass_rvq = metrics.get('bypass_rvq', 0.) >= 0.5
+        if not bypass_rvq:
+            if (
+                metrics.get('codebook_q00_active_ratio', 0.) <
+                self.quality_retention_q00_min_active_ratio or
+                metrics.get('codebook_q00_perplexity', 0.) <
+                self.quality_retention_q00_min_perplexity
+            ):
+                reasons.append('q00')
         baseline_q00_active = baseline.get('codebook_q00_active_ratio')
         if (
             exists(self.quality_retention_max_q00_active_ratio_drop) and
@@ -3216,7 +3225,7 @@ class SoundStreamTrainer(nn.Module):
             )
         ):
             reasons.append('q00_perplexity_drop')
-        if metrics.get('q01_validation_eligible', 0.) < 0.5:
+        if not bypass_rvq and metrics.get('q01_validation_eligible', 0.) < 0.5:
             reasons.append('q01')
         return reasons
 
@@ -3337,6 +3346,8 @@ class SoundStreamTrainer(nn.Module):
             averaged_metrics['aligned_correlation'] >= 0.5 and
             averaged_metrics['aligned_si_sdr'] >= -5.
         )
+        codebook_size = max(1., averaged_metrics.get('codebook_size', 1.))
+        reconstruction_min_perplexity = 0.50 * codebook_size
         q00_eligible = (
             averaged_metrics.get('codebook_q00_active_ratio', 0.) >= (
                 self.quality_retention_q00_min_active_ratio
@@ -3344,7 +3355,8 @@ class SoundStreamTrainer(nn.Module):
             ) and
             averaged_metrics.get('codebook_q00_perplexity', 0.) >= (
                 self.quality_retention_q00_min_perplexity
-                if self.best_checkpoint_metric == 'gan_pretrain' else 16.
+                if self.best_checkpoint_metric == 'gan_pretrain'
+                else reconstruction_min_perplexity
             )
         )
         averaged_metrics['q00_retention_warning'] = float(
@@ -3357,13 +3369,26 @@ class SoundStreamTrainer(nn.Module):
         )
         q01_eligible = (
             averaged_metrics.get('codebook_q01_active_ratio', 0.) >= 0.30 and
-            averaged_metrics.get('codebook_q01_perplexity', 0.) >= 16.
+            averaged_metrics.get('codebook_q01_perplexity', 0.) >= (
+                reconstruction_min_perplexity
+            )
         )
         rvq_eligible = (
             averaged_metrics.get('active_code_ratio', 0.) >= 0.25 and
-            averaged_metrics.get('codebook_perplexity', 0.) >= 20. and
+            averaged_metrics.get('codebook_perplexity', 0.) >= (
+                reconstruction_min_perplexity
+            ) and
             averaged_metrics.get('codebook_collapsed_quantizers', 0) <= 2
         )
+        bypass_rvq = bool(getattr(model, 'bypass_rvq', False))
+        if bypass_rvq:
+            # No RVQ tokens exist by design.  Reconstruction/cleanliness gates
+            # remain active, but codebook-health gates are not applicable.
+            q00_eligible = True
+            q01_eligible = True
+            rvq_eligible = True
+            averaged_metrics['q00_retention_warning'] = 0.
+        averaged_metrics['bypass_rvq'] = float(bypass_rvq)
         averaged_metrics['q00_validation_eligible'] = float(q00_eligible)
         averaged_metrics['q01_validation_eligible'] = float(q01_eligible)
         averaged_metrics['rvq_validation_eligible'] = float(rvq_eligible)
@@ -3399,7 +3424,9 @@ class SoundStreamTrainer(nn.Module):
             eligible = (
                 eligible and
                 averaged_metrics['active_code_ratio'] >= 0.15 and
-                averaged_metrics['codebook_perplexity'] >= 24. and
+                averaged_metrics['codebook_perplexity'] >= (
+                    reconstruction_min_perplexity
+                ) and
                 clean_eligible
             )
         averaged_metrics['validation_eligible'] = float(eligible)
@@ -4593,7 +4620,94 @@ class SoundStreamTrainer(nn.Module):
         )
         return sqrt(max(squared_norm, 0.))
 
+    @torch.no_grad()
+    def rvq_calibration_step(self):
+        """Update only RVQ EMA/dead-code buffers from frozen Encoder latents.
+
+        No decoder forward, backward pass, optimizer step, scheduler step or EMA
+        model update is performed.  `model.train()` is required because the
+        vector-quantize package updates its codebooks only in training mode.
+        """
+        if getattr(self.unwrapped_soundstream, 'bypass_rvq', False):
+            raise RuntimeError(
+                'RVQ calibration requires bypass_rvq=False; disable '
+                '--bypass-rvq-during-training for this phase.'
+            )
+
+        steps = int(self.steps.item())
+        self.soundstream.train()
+        counts = None
+        valid_tokens = 0
+
+        for _ in range(self.grad_accum_every):
+            wave, = next(self.dl_iter)
+            wave = wave.to(self.device)
+            with self.accelerator.autocast():
+                _, indices, _ = self.soundstream(
+                    wave,
+                    return_encoded = True,
+                    freeze_codebook = False,
+                )
+
+            flat_indices = indices.reshape(-1, indices.shape[-1]).long()
+            batch_counts = torch.stack([
+                torch.bincount(
+                    flat_indices[:, quantizer][flat_indices[:, quantizer] >= 0],
+                    minlength = self.unwrapped_soundstream.codebook_size,
+                )
+                for quantizer in range(flat_indices.shape[-1])
+            ])
+            counts = batch_counts if counts is None else counts + batch_counts
+            valid_tokens += int((flat_indices >= 0).sum().item())
+
+        counts = self.accelerator.reduce(counts, reduction = 'sum')
+        valid_tensor = torch.tensor(valid_tokens, device=self.device)
+        valid_tokens = int(
+            self.accelerator.reduce(valid_tensor, reduction='sum').item()
+        )
+        probabilities = counts.float() / counts.sum(dim=-1, keepdim=True).clamp_min(1.)
+        perplexities = torch.exp(
+            -(probabilities * probabilities.clamp_min(1e-12).log()).sum(dim=-1)
+        )
+        active_ratios = (counts > 0).float().mean(dim=-1)
+        logs = {
+            'rvq_calibration_tokens': valid_tokens,
+            'rvq_calibration_active_ratio_mean': float(active_ratios.mean().cpu()),
+            'rvq_calibration_perplexity_mean': float(perplexities.mean().cpu()),
+        }
+
+        if self.is_main and (
+            (
+                self.log_losses_every > 0 and
+                not (steps % self.log_losses_every)
+            ) or
+            steps == (self.num_train_steps - 1)
+        ):
+            self.print(
+                f'{steps}: rvq_calibration_only=1 | encoder_frozen=1 | '
+                f'decoder_frozen=1 | tokens={valid_tokens} | '
+                f'active={logs["rvq_calibration_active_ratio_mean"]:.6f} | '
+                f'perplexity={logs["rvq_calibration_perplexity_mean"]:.4f}'
+            )
+
+        self.accelerator.wait_for_everyone()
+        should_save = (
+            not (steps % self.save_model_every) or
+            steps == (self.num_train_steps - 1)
+        )
+        if self.is_main and should_save:
+            self.save(str(self.results_folder / f'soundstream.{steps}.pt'))
+            self.save(str(self.results_folder / 'latest.pt'))
+            self.print(f'{steps}: saving calibrated RVQ to {self.results_folder}')
+
+        self.accelerator.wait_for_everyone()
+        self.steps.add_(1)
+        return logs
+
     def train_step(self):
+        if self.rvq_calibration_only:
+            return self.rvq_calibration_step()
+
         device = self.device
 
         steps = int(self.steps.item())

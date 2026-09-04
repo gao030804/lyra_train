@@ -43,10 +43,10 @@ case "$STAGE2_ABLATION" in
     ;;
 esac
 STAGE2_GAN_FEATURE_MAX=1.5
-# Decoder experiment controls:
-#   production baseline: DECODER_INTERPOLATION_MODE=linear, DECODER_SPLIT_FIRST_UPSAMPLE=0
-#   split ablation:      DECODER_INTERPOLATION_MODE=linear, DECODER_SPLIT_FIRST_UPSAMPLE=1
-#   cubic ablation:      DECODER_INTERPOLATION_MODE=cubic,  DECODER_SPLIT_FIRST_UPSAMPLE=0
+# Production Decoder uses learned ConvTranspose1d, so no explicit latent-frame
+# interpolation smoothing is applied.  Linear/cubic interpolation remains an
+# opt-in compatibility/ablation path.
+DECODER_UPSAMPLE_MODE="${DECODER_UPSAMPLE_MODE:-convtranspose}"
 DECODER_INTERPOLATION_MODE="${DECODER_INTERPOLATION_MODE:-linear}"
 DECODER_SPLIT_FIRST_UPSAMPLE="${DECODER_SPLIT_FIRST_UPSAMPLE:-0}"
 SKIP_STAGE1="${SKIP_STAGE1:-0}"
@@ -65,6 +65,16 @@ fi
 
 if [[ "$DECODER_INTERPOLATION_MODE" != "linear" && "$DECODER_INTERPOLATION_MODE" != "cubic" ]]; then
   echo "ERROR: DECODER_INTERPOLATION_MODE must be linear or cubic." >&2
+  exit 2
+fi
+
+if [[ "$DECODER_UPSAMPLE_MODE" != "convtranspose" && "$DECODER_UPSAMPLE_MODE" != "linear" ]]; then
+  echo "ERROR: DECODER_UPSAMPLE_MODE must be convtranspose or linear." >&2
+  exit 2
+fi
+
+if [[ "$DECODER_UPSAMPLE_MODE" == "convtranspose" && "$DECODER_SPLIT_FIRST_UPSAMPLE" == "1" ]]; then
+  echo "ERROR: split-first upsampling requires DECODER_UPSAMPLE_MODE=linear." >&2
   exit 2
 fi
 
@@ -97,8 +107,8 @@ fi
 
 # Defaults include a timestamp, so --no-resume cannot accidentally reuse an
 # older checkpoint's best-score state.  Set explicit names only when needed.
-STAGE1_NAME="${STAGE1_NAME:-recon-pretrain-dscnn-relu-fp-64d-8q-${RUN_TAG}-${NUM_PROCESSES}gpu-4s}"
-STAGE2_NAME="${STAGE2_NAME:-gan-pretrain-dscnn-relu-fp-64d-8q-from-s1-${RUN_TAG}-s2-${STAGE2_ABLATION}-${STAGE2_STEPS}steps-${NUM_PROCESSES}gpu-4s}"
+STAGE1_NAME="${STAGE1_NAME:-recon-pretrain-lowrank-dscnn-b234-relu-convtranspose-fp-64d-16q16-${RUN_TAG}-${NUM_PROCESSES}gpu-4s}"
+STAGE2_NAME="${STAGE2_NAME:-gan-pretrain-lowrank-dscnn-b234-relu-convtranspose-fp-64d-16q16-from-s1-${RUN_TAG}-s2-${STAGE2_ABLATION}-${STAGE2_STEPS}steps-${NUM_PROCESSES}gpu-4s}"
 
 STAGE1_DIR="$PWD/results/$STAGE1_NAME"
 STAGE2_DIR="$PWD/results/$STAGE2_NAME"
@@ -232,7 +242,7 @@ else
 fi
 echo "STAGE1_DIR=$STAGE1_DIR"
 echo "STAGE1_LOG=$STAGE1_LOG"
-echo "Stage 1 decoder architecture: interpolation=$DECODER_INTERPOLATION_MODE, split_first_x8=$DECODER_SPLIT_FIRST_UPSAMPLE"
+echo "Stage 1 decoder architecture: mode=$DECODER_UPSAMPLE_MODE, interpolation=$DECODER_INTERPOLATION_MODE, split_first_x8=$DECODER_SPLIT_FIRST_UPSAMPLE"
 run_and_log "$STAGE1_LOG" "$RESUME_STAGE1" run_stage "Stage 1: recon_pretrain" 29501 \
   --stage recon_pretrain \
   --audio-dir "$AUDIO_DIR" \
@@ -243,6 +253,7 @@ run_and_log "$STAGE1_LOG" "$RESUME_STAGE1" run_stage "Stage 1: recon_pretrain" 2
   --segment-seconds 4.0 \
   --dl-num-workers 6 \
   --seed "$SEED" \
+  --decoder-upsample-mode "$DECODER_UPSAMPLE_MODE" \
   --decoder-interpolation-mode "$DECODER_INTERPOLATION_MODE" \
   "$DECODER_SPLIT_FLAG" \
   --decoder-residual-scale-start 0.2 \
@@ -336,7 +347,7 @@ evaluate_stage1_checkpoint "$STAGE1_CKPT" "$STAGE2_PREFLIGHT_REPORT"
   --min-aligned-correlation 0.65 \
   --max-click-excess 0.5 \
   --min-q00-active-ratio 0.70 \
-  --min-q00-perplexity 50 \
+  --min-q00-perplexity 8 \
   --max-recon-clip-fraction 0.001
 
 declare -a STAGE2_DECODER_ARGS

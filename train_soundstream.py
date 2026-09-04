@@ -34,12 +34,12 @@ DEFAULT_AUDIO_DIR = (
 )
 
 STAGE_RESULTS_DIRS = {
-    "overfit": PROJECT_DIR / "results" / "overfit-dscnn-relu-fp-64d-8q",
-    "recon_pretrain": PROJECT_DIR / "results" / "recon-pretrain-dscnn-relu-fp-64d-8q",
-    "spectral_refine": PROJECT_DIR / "results" / "spectral-refine-dscnn-relu-fp-64d-8q",
-    "gan_pretrain": PROJECT_DIR / "results" / "gan-pretrain-dscnn-relu-fp-64d-8q",
-    "stream_finetune": PROJECT_DIR / "results" / "stream-finetune-dscnn-relu-fp-64d-8q",
-    "stream_finetune_long": PROJECT_DIR / "results" / "stream-finetune-long-dscnn-relu-fp-64d-8q",
+    "overfit": PROJECT_DIR / "results" / "overfit-lowrank-dscnn-fp-64d-16q16",
+    "recon_pretrain": PROJECT_DIR / "results" / "recon-pretrain-lowrank-dscnn-fp-64d-16q16",
+    "spectral_refine": PROJECT_DIR / "results" / "spectral-refine-lowrank-dscnn-fp-64d-16q16",
+    "gan_pretrain": PROJECT_DIR / "results" / "gan-pretrain-lowrank-dscnn-fp-64d-16q16",
+    "stream_finetune": PROJECT_DIR / "results" / "stream-finetune-lowrank-dscnn-fp-64d-16q16",
+    "stream_finetune_long": PROJECT_DIR / "results" / "stream-finetune-long-lowrank-dscnn-fp-64d-16q16",
 }
 
 RECONSTRUCTION_STAGES = frozenset((
@@ -501,6 +501,24 @@ def parse_args() -> argparse.Namespace:
         help=(
             "After its start step, linearly ramp the voiced spectral-envelope "
             "loss to its maximum weight; defaults depend on --stage."
+        ),
+    )
+    parser.add_argument(
+        "--bypass-rvq-during-training",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Bypass RVQ in every generator path (training, validation and GAN) "
+            "while preserving the same Encoder/Decoder checkpoint topology."
+        ),
+    )
+    parser.add_argument(
+        "--rvq-calibration-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Run Encoder -> RVQ only under no_grad so EMA codebooks are "
+            "calibrated while Encoder and Decoder weights remain unchanged."
         ),
     )
     parser.add_argument(
@@ -1225,10 +1243,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--decoder-upsample-mode",
         choices=("convtranspose", "linear"),
-        default="linear",
+        default="convtranspose",
         help=(
-            "Decoder upsampling block. 'linear' uses causal linear upsample + "
-            "CausalConv1d and is stored in the checkpoint config."
+            "Decoder upsampling block. The production default is learned "
+            "causal ConvTranspose1d, avoiding explicit interpolation smoothing. "
+            "'linear' remains available for old checkpoints and ablations."
         ),
     )
     parser.add_argument(
@@ -1634,6 +1653,30 @@ def load_model_weights_only(
     checkpoint_config = {}
     if "config" in pkg:
         checkpoint_config = pickle.loads(pkg["config"])
+        rvq_fields = (
+            ("rq_num_quantizers", "num_quantizers"),
+            ("codebook_size", "codebook_size"),
+            ("codebook_dim", "codebook_dim"),
+        )
+        rvq_mismatches = []
+        for config_name, model_name in rvq_fields:
+            checkpoint_value = checkpoint_config.get(config_name)
+            model_value = getattr(model, model_name, None)
+            if (
+                checkpoint_value is not None and
+                model_value is not None and
+                int(checkpoint_value) != int(model_value)
+            ):
+                rvq_mismatches.append(
+                    f"{config_name}: checkpoint={checkpoint_value}, "
+                    f"current_model={model_value}"
+                )
+        if rvq_mismatches:
+            raise ValueError(
+                "Checkpoint RVQ topology mismatch: "
+                + "; ".join(rvq_mismatches)
+                + ". Start a fresh run or use a matching checkpoint."
+            )
         checkpoint_upsample = checkpoint_config.get(
             "decoder_upsample_mode",
             "convtranspose",
@@ -1720,7 +1763,7 @@ def load_model_weights_only(
                 "Checkpoint Encoder DSCNN topology mismatch: "
                 f"checkpoint_blocks={checkpoint_depthwise_blocks}, "
                 f"current_model_blocks={model_depthwise_blocks}. "
-                "Block3/4 DSCNN changes parameter names and shapes; start a "
+                "Encoder DSCNN block selection changes parameter names and shapes; start a "
                 "fresh run or use a checkpoint trained with the same topology."
             )
         if checkpoint_depthwise_blocks:
@@ -1738,8 +1781,27 @@ def load_model_weights_only(
                     "Checkpoint Encoder DSCNN activation topology mismatch: "
                     f"checkpoint_revision={checkpoint_dscnn_revision}, "
                     f"current_revision={model_dscnn_revision}. Revision 2 "
-                    "removes the Depthwise/Pointwise intermediate ELU and "
-                    "uses ReLU; start a fresh run."
+                    "uses full-rank Pointwise layers, while revision 3 uses "
+                    "low-rank Pointwise factorization; start a fresh run."
+                )
+            checkpoint_low_rank_ranks = tuple(
+                tuple(int(rank) for rank in ranks)
+                for ranks in checkpoint_config.get(
+                    "encoder_low_rank_pointwise_ranks",
+                    (),
+                )
+            )
+            model_low_rank_ranks = tuple(getattr(
+                model,
+                "encoder_low_rank_pointwise_ranks",
+                (),
+            ))
+            if checkpoint_low_rank_ranks != model_low_rank_ranks:
+                raise ValueError(
+                    "Checkpoint Encoder low-rank Pointwise topology mismatch: "
+                    f"checkpoint_ranks={checkpoint_low_rank_ranks}, "
+                    f"current_model_ranks={model_low_rank_ranks}. Start a "
+                    "fresh run or use a checkpoint with matching ranks."
                 )
     state_dict = pkg["model"] if "model" in pkg else pkg
     if generator_only:
@@ -1802,6 +1864,7 @@ def build_model(
     decoder_split_first_upsample: bool,
     commitment_loss_weight: float | None = None,
     sync_codebook: bool | None = None,
+    bypass_rvq: bool = False,
 ) -> SoundStream:
     if sync_codebook is None:
         sync_codebook = int(os.environ.get("WORLD_SIZE", "1")) > 1
@@ -1827,11 +1890,14 @@ def build_model(
         use_local_attn=False,
         target_sample_hz=sample_rate,
         strides=strides,
-        # Zero-based Encoder Block3/4.  The SoundStream constructor itself
+        # Zero-based Encoder Block2/3/4.  The SoundStream constructor itself
         # defaults to the legacy full-convolution topology so old checkpoint
         # configs that predate this field still rebuild correctly.
-        encoder_depthwise_separable_blocks=(2, 3),
-        encoder_depthwise_separable_revision=2,
+        encoder_depthwise_separable_blocks=(1, 2, 3),
+        encoder_depthwise_separable_revision=3,
+        # One (residual PW rank, downsample PW rank) pair per zero-based block.
+        # Block1 remains dense; Block2/3/4 use hardware-aligned low-rank PW.
+        encoder_low_rank_pointwise_ranks=((0, 0), (8, 16), (16, 32), (32, 64)),
         recon_loss_weight=recon_loss_weight,
         multi_spectral_recon_loss_weight=multi_spectral_recon_loss_weight,
         stft_recon_loss_weight=stft_recon_loss_weight,
@@ -1872,6 +1938,7 @@ def build_model(
         rq_quantize_dropout=False,
         rq_threshold_ema_dead_code=2,
         rq_kwargs=dict(sync_codebook=sync_codebook),
+        bypass_rvq=bypass_rvq,
         attn_window_size=64,
         attn_dim_head=32,
         attn_heads=4,
@@ -2109,6 +2176,21 @@ def main() -> None:
         if args.generator_lr <= 0:
             raise ValueError("--generator-lr must be positive.")
         stage_defaults["lr"] = args.generator_lr
+    if args.rvq_calibration_only:
+        if args.bypass_rvq_during_training:
+            raise ValueError(
+                "--rvq-calibration-only cannot be combined with "
+                "--bypass-rvq-during-training"
+            )
+        if args.stage != "recon_pretrain":
+            raise ValueError(
+                "--rvq-calibration-only requires --stage recon_pretrain"
+            )
+        if args.init_checkpoint is None:
+            raise ValueError(
+                "--rvq-calibration-only requires --init-checkpoint from the "
+                "completed bypass phase"
+            )
     if args.gan_adversarial_max is not None:
         if args.gan_adversarial_max < 0:
             raise ValueError("--gan-adversarial-max cannot be negative.")
@@ -2614,10 +2696,11 @@ def main() -> None:
     strides = (2, 4, 5, 8)
     stream_frame_size = math.prod(strides)
     stream_context_frames = args.stream_context_frames
-    # Lyra V2-style maximum bitrate:
-    # 50 frames/s * 8 quantizers * 8 bits/index = 3.2 kbps.
-    codebook_size = 256
-    num_quantizers = 8
+    # 50 frames/s * 16 quantizers * 4 bits/index = 3.2 kbps.
+    # Each 64-D deployment codeword is INT8, so the complete RVQ table is
+    # 16 * 16 * 64 = 16 KiB (indices must be packed two per byte).
+    codebook_size = 16
+    num_quantizers = 16
     if args.stage in RECONSTRUCTION_STAGES:
         si_sdr_loss_weight = (
             args.si_sdr_loss_weight
@@ -2815,9 +2898,9 @@ def main() -> None:
     print(f"Maximum training steps: {num_train_steps}")
     print(f"Generator learning rate: {stage_defaults['lr']}")
     print(
-        "Encoder DSCNN: zero-based blocks 2/3 (Block3/4), each temporal and "
-        "downsample convolution uses Depthwise -> Pointwise; all SoundStream "
-        "activation layers use ReLU."
+        "Encoder DSCNN low-rank revision 3: Block2/3/4 use Depthwise followed "
+        "by rank-factorized Pointwise convolutions; residual ranks=8/16/32, "
+        "downsample ranks=16/32/64; existing ReLU positions are unchanged."
     )
     if stage25_decoder_only_refine:
         print(
@@ -3105,7 +3188,7 @@ def main() -> None:
             "active_spectral_score_weight="
             f"{args.stage2_active_spectral_score_weight:g}, "
             "AC320/comb/high-frequency scores=diagnostic-only, "
-            "q00=(active>=0.70, perplexity>=50), q01/RVQ healthy, "
+            "q00=(active>=0.70, perplexity>=8/16), q01/RVQ healthy, "
             f"hard_stop=(quality={args.stage2_quality_retention_patience}, "
             f"rvq={args.stage2_rvq_retention_patience}) validation checks"
         )
@@ -3292,10 +3375,9 @@ def main() -> None:
             f"{args.test_context_ms:.1f} ms previous context discarded from output"
         )
 
-    # Lyra V2-style scalable bitrate configuration:
+    # Fixed 3.2 kbps hardware profile:
     # 16000 / 320 = 50 frames/s
-    # log2(256) = 8 bits/token
-    # 8 / 15 / 23 quantizers = 3.2 / 6.0 / 9.2 kbps
+    # log2(16) = 4 bits/token; 16 quantizers = 3.2 kbps
     soundstream = build_model(
         args.stage,
         sample_rate=sample_rate,
@@ -3361,6 +3443,7 @@ def main() -> None:
             else 0.1
         ),
         sync_codebook=(world_size > 1),
+        bypass_rvq=args.bypass_rvq_during_training,
     )
 
     warmup_steps = (
@@ -3388,6 +3471,7 @@ def main() -> None:
         dataset_max_files=(args.overfit_files if args.stage == "overfit" else None),
         dataset_fixed_crop=(args.stage == "overfit"),
         num_train_steps=num_train_steps,
+        rvq_calibration_only=args.rvq_calibration_only,
         lr=stage_defaults["lr"],
         encoder_lr=stage_defaults.get("encoder_lr"),
         # EMA codebook updates do not require optimizer parameters. Keep RVQ

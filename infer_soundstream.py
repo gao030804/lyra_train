@@ -31,6 +31,12 @@ from audiolm_pytorch import FrameStreamingSoundStream, SoundStream
 
 
 DEFAULT_RESULTS_DIRS = (
+    PROJECT_DIR / "results" / "stream-finetune-long-lowrank-dscnn-fp-64d-16q16",
+    PROJECT_DIR / "results" / "stream-finetune-lowrank-dscnn-fp-64d-16q16",
+    PROJECT_DIR / "results" / "gan-pretrain-lowrank-dscnn-fp-64d-16q16",
+    PROJECT_DIR / "results" / "spectral-refine-lowrank-dscnn-fp-64d-16q16",
+    PROJECT_DIR / "results" / "recon-pretrain-lowrank-dscnn-fp-64d-16q16",
+    PROJECT_DIR / "results" / "overfit-lowrank-dscnn-fp-64d-16q16",
     PROJECT_DIR / "results" / "stream-finetune-long-dscnn-relu-fp-64d-8q",
     PROJECT_DIR / "results" / "stream-finetune-dscnn-relu-fp-64d-8q",
     PROJECT_DIR / "results" / "gan-pretrain-dscnn-relu-fp-64d-8q",
@@ -43,13 +49,6 @@ DEFAULT_RESULTS_DIRS = (
     PROJECT_DIR / "results" / "soundstream-librispeech",
     PROJECT_DIR / "results" / "soundstream-3k2",
 )
-
-BITRATE_TO_QUANTIZERS = {
-    3200: 8,
-    6000: 15,
-    9200: 23,
-}
-
 
 def checkpoint_step(path: Path) -> int:
     match = re.fullmatch(r"soundstream\.(\d+)\.pt", path.name)
@@ -139,9 +138,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--bitrate",
         type=int,
-        choices=tuple(BITRATE_TO_QUANTIZERS),
         default=None,
-        help="Codec payload bitrate. Defaults to all RVQ quantizers in the checkpoint.",
+        help=(
+            "Codec payload bitrate in bit/s. The required RVQ count is derived "
+            "from the checkpoint frame rate and codebook size; defaults to all "
+            "RVQ quantizers."
+        ),
     )
     parser.add_argument(
         "--block-seconds",
@@ -394,16 +396,24 @@ def main() -> None:
     model = model.to(args.device)
     model.eval()
 
-    num_quantizers = (
-        BITRATE_TO_QUANTIZERS[args.bitrate]
-        if args.bitrate is not None
-        else model.num_quantizers
-    )
-    if args.bitrate is not None and model.codebook_size != 256:
-        raise ValueError(
-            f"Lyra-style bitrate selection requires codebook_size=256, "
-            f"but the checkpoint uses {model.codebook_size}."
-        )
+    if args.bitrate is None:
+        num_quantizers = model.num_quantizers
+    else:
+        bits_per_index = math.log2(model.codebook_size)
+        frame_rate = model.target_sample_hz / model.seq_len_multiple_of
+        quantizers_exact = args.bitrate / (frame_rate * bits_per_index)
+        num_quantizers = round(quantizers_exact)
+        if num_quantizers <= 0 or not math.isclose(
+            quantizers_exact,
+            num_quantizers,
+            rel_tol=0.,
+            abs_tol=1e-9,
+        ):
+            raise ValueError(
+                f"{args.bitrate} bps is not representable by an integer number "
+                f"of RVQ stages for frame_rate={frame_rate:g} and "
+                f"codebook_size={model.codebook_size}."
+            )
     if num_quantizers > model.num_quantizers:
         raise ValueError(
             f"{args.bitrate} bps requires {num_quantizers} RVQ quantizers, "

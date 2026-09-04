@@ -44,7 +44,7 @@ def main() -> None:
     parser.add_argument("--min-aligned-correlation", type=float, default=0.65)
     parser.add_argument("--max-click-excess", type=float, default=0.5)
     parser.add_argument("--min-q00-active-ratio", type=float, default=0.70)
-    parser.add_argument("--min-q00-perplexity", type=float, default=50.0)
+    parser.add_argument("--min-q00-perplexity", type=float, default=8.0)
     args = parser.parse_args()
 
     new_checkpoint = args.new_checkpoint.expanduser().resolve()

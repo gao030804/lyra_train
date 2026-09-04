@@ -14,6 +14,32 @@ from train_soundstream import (
 from audiolm_pytorch.trainer import SoundStreamTrainer
 
 
+def test_bypass_rvq_is_saved_runtime_mode_and_emits_sentinel_indices():
+    from audiolm_pytorch.soundstream import SoundStream
+
+    model = SoundStream(
+        channels=4,
+        channel_mults=(2, 2),
+        strides=(2, 2),
+        codebook_dim=8,
+        codebook_size=16,
+        rq_num_quantizers=2,
+        discr_multi_scales=(1,),
+        pad_mode="constant",
+        bypass_rvq=True,
+    )
+    latent, indices, commitment = model(
+        torch.randn(1, 256),
+        return_encoded=True,
+    )
+
+    assert latent.shape == (1, 64, 8)
+    assert indices.shape == (1, 64, 2)
+    assert torch.all(indices == -1)
+    assert commitment.item() == 0
+    assert model.config["bypass_rvq"] is True
+
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -58,6 +84,7 @@ def test_loss_gradient_diagnostic_default(monkeypatch):
     args = train_soundstream.parse_args()
 
     assert args.loss_grad_diagnostics_every == 1_000
+    assert args.decoder_upsample_mode == "convtranspose"
 
 
 def test_stage2_uses_decoder_only_150k_schedule():
@@ -142,26 +169,44 @@ def test_distributed_test_report_keeps_formant_and_stft_metrics():
 
 
 class GeneratorOnlyModel:
-    decoder_upsample_mode = "linear"
+    decoder_upsample_mode = "convtranspose"
     decoder_linear_upsample_kernel_min = 4
     decoder_interpolation_mode = "linear"
     decoder_split_first_upsample = False
-    encoder_depthwise_separable_blocks = (2, 3)
-    encoder_depthwise_separable_revision = 2
+    encoder_depthwise_separable_blocks = (1, 2, 3)
+    encoder_depthwise_separable_revision = 3
+    encoder_low_rank_pointwise_ranks = (
+        (0, 0), (8, 16), (16, 32), (32, 64)
+    )
+    num_quantizers = 16
+    codebook_size = 16
+    codebook_dim = 64
 
     def load_generator_state_dict(self, state_dict):
         assert state_dict == {}
         return []
 
 
+class LinearGeneratorOnlyModel(GeneratorOnlyModel):
+    """Compatibility fixture for checkpoints using interpolated upsampling."""
+
+    decoder_upsample_mode = "linear"
+
+
 def matching_config(**overrides):
     config = {
-        "decoder_upsample_mode": "linear",
+        "decoder_upsample_mode": "convtranspose",
         "decoder_linear_upsample_kernel_min": 4,
         "decoder_interpolation_mode": "linear",
         "decoder_split_first_upsample": False,
-        "encoder_depthwise_separable_blocks": (2, 3),
-        "encoder_depthwise_separable_revision": 2,
+        "encoder_depthwise_separable_blocks": (1, 2, 3),
+        "encoder_depthwise_separable_revision": 3,
+        "encoder_low_rank_pointwise_ranks": (
+            (0, 0), (8, 16), (16, 32), (32, 64)
+        ),
+        "rq_num_quantizers": 16,
+        "codebook_size": 16,
+        "codebook_dim": 64,
     }
     config.update(overrides)
     return config
@@ -179,7 +224,7 @@ def test_generator_checkpoint_accepts_matching_current_topology(tmp_path):
         GeneratorOnlyModel(), checkpoint, generator_only=True
     )
 
-    assert config["encoder_depthwise_separable_revision"] == 2
+    assert config["encoder_depthwise_separable_revision"] == 3
 
 
 def test_generator_checkpoint_rejects_old_dscnn_activation_revision(tmp_path):
@@ -195,14 +240,43 @@ def test_generator_checkpoint_rejects_old_dscnn_activation_revision(tmp_path):
         )
 
 
+def test_generator_checkpoint_rejects_old_rvq_shape(tmp_path):
+    checkpoint = tmp_path / "rvq-8x256.pt"
+    save_generator_checkpoint(
+        checkpoint,
+        matching_config(rq_num_quantizers=8, codebook_size=256),
+    )
+
+    with pytest.raises(ValueError, match="RVQ topology mismatch"):
+        load_model_weights_only(
+            GeneratorOnlyModel(), checkpoint, generator_only=True
+        )
+
+
+def test_generator_checkpoint_rejects_missing_block2_dscnn(tmp_path):
+    checkpoint = tmp_path / "blocks-3-4-only.pt"
+    save_generator_checkpoint(
+        checkpoint,
+        matching_config(encoder_depthwise_separable_blocks=(2, 3)),
+    )
+
+    with pytest.raises(ValueError, match="DSCNN topology mismatch"):
+        load_model_weights_only(
+            GeneratorOnlyModel(), checkpoint, generator_only=True
+        )
+
+
 def test_generator_checkpoint_rejects_decoder_interpolation_mismatch(tmp_path):
     checkpoint = tmp_path / "cubic.pt"
     save_generator_checkpoint(
         checkpoint,
-        matching_config(decoder_interpolation_mode="cubic"),
+        matching_config(
+            decoder_upsample_mode="linear",
+            decoder_interpolation_mode="cubic",
+        ),
     )
 
     with pytest.raises(ValueError, match="decoder interpolation mismatch"):
         load_model_weights_only(
-            GeneratorOnlyModel(), checkpoint, generator_only=True
+            LinearGeneratorOnlyModel(), checkpoint, generator_only=True
         )

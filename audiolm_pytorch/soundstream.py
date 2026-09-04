@@ -581,9 +581,20 @@ class DepthwiseSeparableCausalConv1d(Module):
         *,
         stride = 1,
         dilation = 1,
-        pad_mode = 'reflect'
+        pad_mode = 'reflect',
+        pointwise_rank = None
     ):
         super().__init__()
+        pointwise = (
+            LowRankPointwiseCausalConv1d(
+                chan_in,
+                chan_out,
+                pointwise_rank,
+                pad_mode = pad_mode
+            )
+            if exists(pointwise_rank)
+            else CausalConv1d(chan_in, chan_out, 1, pad_mode = pad_mode)
+        )
         self.net = nn.Sequential(
             CausalConv1d(
                 chan_in,
@@ -594,7 +605,27 @@ class DepthwiseSeparableCausalConv1d(Module):
                 groups = chan_in,
                 pad_mode = pad_mode
             ),
-            CausalConv1d(chan_in, chan_out, 1, pad_mode = pad_mode)
+            pointwise
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+    def forward_stream(self, x, state = None):
+        return stream_module(self.net, x, state)
+
+class LowRankPointwiseCausalConv1d(Module):
+    """Factor a pointwise matrix as Cin -> rank -> Cout without activation."""
+
+    def __init__(self, chan_in, chan_out, rank, *, pad_mode = 'reflect'):
+        super().__init__()
+        rank = int(rank)
+        if rank <= 0:
+            raise ValueError(f'pointwise rank must be positive, got {rank}')
+        self.rank = rank
+        self.net = nn.Sequential(
+            CausalConv1d(chan_in, rank, 1, pad_mode = pad_mode),
+            CausalConv1d(rank, chan_out, 1, pad_mode = pad_mode)
         )
 
     def forward(self, x):
@@ -611,7 +642,8 @@ def ResidualUnit(
     squeeze_excite = False,
     pad_mode = 'reflect',
     residual_scale = 1.,
-    depthwise_separable = False
+    depthwise_separable = False,
+    pointwise_rank = None
 ):
     temporal_conv = (
         DepthwiseSeparableCausalConv1d(
@@ -619,7 +651,8 @@ def ResidualUnit(
             chan_out,
             kernel_size,
             dilation = dilation,
-            pad_mode = pad_mode
+            pad_mode = pad_mode,
+            pointwise_rank = pointwise_rank
         )
         if depthwise_separable
         else CausalConv1d(
@@ -630,10 +663,20 @@ def ResidualUnit(
             pad_mode = pad_mode
         )
     )
+    output_pointwise = (
+        LowRankPointwiseCausalConv1d(
+            chan_out,
+            chan_out,
+            pointwise_rank,
+            pad_mode = pad_mode
+        )
+        if exists(pointwise_rank)
+        else CausalConv1d(chan_out, chan_out, 1, pad_mode = pad_mode)
+    )
     return Residual(Sequential(
         temporal_conv,
         nn.ReLU(),
-        CausalConv1d(chan_out, chan_out, 1, pad_mode = pad_mode),
+        output_pointwise,
         nn.ReLU(),
         SqueezeExcite(chan_out) if squeeze_excite else None
     ), scale = residual_scale)
@@ -645,14 +688,17 @@ def EncoderBlock(
     cycle_dilations = (1, 3, 9),
     squeeze_excite = False,
     pad_mode = 'reflect',
-    depthwise_separable = False
+    depthwise_separable = False,
+    residual_pointwise_rank = None,
+    downsample_pointwise_rank = None
 ):
     it = cycle(cycle_dilations)
     residual_unit = partial(
         ResidualUnit,
         squeeze_excite = squeeze_excite,
         pad_mode = pad_mode,
-        depthwise_separable = depthwise_separable
+        depthwise_separable = depthwise_separable,
+        pointwise_rank = residual_pointwise_rank
     )
     downsample = (
         DepthwiseSeparableCausalConv1d(
@@ -660,7 +706,8 @@ def EncoderBlock(
             chan_out,
             2 * stride,
             stride = stride,
-            pad_mode = pad_mode
+            pad_mode = pad_mode,
+            pointwise_rank = downsample_pointwise_rank
         )
         if depthwise_separable
         else CausalConv1d(
@@ -862,6 +909,7 @@ class SoundStream(Module):
         rq_rotation_trick = True,
         rq_threshold_ema_dead_code = 2,
         rq_kwargs: dict = {},
+        bypass_rvq = False,
         use_lookup_free_quantizer = False,              # proposed in https://arxiv.org/abs/2310.05737, adapted for residual quantization
         use_finite_scalar_quantizer = False,            # proposed in https://arxiv.org/abs/2309.15505, adapted for residual quantization
         input_channels = 1,
@@ -870,6 +918,7 @@ class SoundStream(Module):
         enc_cycle_dilations = (1, 3, 9),
         encoder_depthwise_separable_blocks = (),
         encoder_depthwise_separable_revision = 2,
+        encoder_low_rank_pointwise_ranks = (),
         dec_cycle_dilations = (1, 3, 9),
         decoder_upsample_mode = 'convtranspose',
         decoder_residual_scale = 1.,
@@ -957,12 +1006,47 @@ class SoundStream(Module):
         ):
             raise ValueError('encoder_depthwise_separable_blocks cannot contain duplicates')
         self.encoder_depthwise_separable_blocks = encoder_depthwise_separable_blocks
-        if int(encoder_depthwise_separable_revision) != 2:
+        encoder_depthwise_separable_revision = int(
+            encoder_depthwise_separable_revision
+        )
+        if encoder_depthwise_separable_revision not in (2, 3):
             raise ValueError(
-                'only Encoder DSCNN revision 2 '
-                '(Depthwise -> Pointwise with ReLU outside) is supported'
+                'only Encoder DSCNN revisions 2 and 3 are supported'
             )
-        self.encoder_depthwise_separable_revision = 2
+        low_rank_ranks = tuple(
+            tuple(int(rank) for rank in ranks)
+            for ranks in encoder_low_rank_pointwise_ranks
+        )
+        if low_rank_ranks and len(low_rank_ranks) != len(strides):
+            raise ValueError(
+                'encoder_low_rank_pointwise_ranks must contain one '
+                f'(residual_rank, downsample_rank) pair per Encoder block; '
+                f'expected {len(strides)}, got {len(low_rank_ranks)}'
+            )
+        if any(len(ranks) != 2 for ranks in low_rank_ranks):
+            raise ValueError(
+                'each encoder_low_rank_pointwise_ranks entry must contain '
+                '(residual_rank, downsample_rank)'
+            )
+        if encoder_depthwise_separable_revision == 3:
+            if not low_rank_ranks:
+                raise ValueError(
+                    'Encoder DSCNN revision 3 requires low-rank pointwise ranks'
+                )
+            for block_index in encoder_depthwise_separable_blocks:
+                if min(low_rank_ranks[block_index]) <= 0:
+                    raise ValueError(
+                        'every revision-3 DSCNN block requires positive '
+                        'residual and downsample pointwise ranks'
+                    )
+        elif low_rank_ranks and any(any(ranks) for ranks in low_rank_ranks):
+            raise ValueError(
+                'low-rank pointwise ranks require Encoder DSCNN revision 3'
+            )
+        self.encoder_depthwise_separable_revision = (
+            encoder_depthwise_separable_revision
+        )
+        self.encoder_low_rank_pointwise_ranks = low_rank_ranks
         if decoder_upsample_mode not in ('convtranspose', 'linear'):
             raise ValueError(f'unknown decoder upsample mode: {decoder_upsample_mode}')
         if decoder_residual_scale < 0:
@@ -1012,6 +1096,15 @@ class SoundStream(Module):
         for block_index, ((chan_in, chan_out), layer_stride) in enumerate(
             zip(chan_in_out_pairs, strides)
         ):
+            residual_rank = None
+            downsample_rank = None
+            if (
+                block_index in self.encoder_depthwise_separable_blocks and
+                self.encoder_depthwise_separable_revision == 3
+            ):
+                residual_rank, downsample_rank = (
+                    self.encoder_low_rank_pointwise_ranks[block_index]
+                )
             encoder_blocks.append(EncoderBlock(
                 chan_in,
                 chan_out,
@@ -1021,7 +1114,9 @@ class SoundStream(Module):
                 pad_mode,
                 depthwise_separable=(
                     block_index in self.encoder_depthwise_separable_blocks
-                )
+                ),
+                residual_pointwise_rank=residual_rank,
+                downsample_pointwise_rank=downsample_rank
             ))
 
             if use_gate_loop_layers:
@@ -1054,6 +1149,10 @@ class SoundStream(Module):
         self.codebook_dim = codebook_dim
 
         self.rq_groups = rq_groups
+        # Training-time codec mode.  This is intentionally part of the saved
+        # model config (rather than a diagnostic-only forward) so reconstruction,
+        # validation and GAN paths all see exactly the same latent signal.
+        self.bypass_rvq = bool(bypass_rvq)
 
         assert not (use_lookup_free_quantizer and use_finite_scalar_quantizer)
 
@@ -3019,7 +3118,15 @@ class SoundStream(Module):
             denoise_input = torch.tensor([is_denoising, not is_denoising], dtype = x.dtype, device = self.device) # [1, 0] for denoise, [0, 1] for not denoising
             x = self.encoder_film(x, denoise_input)
 
-        if not self.use_finite_scalar_quantizer:
+        if self.bypass_rvq:
+            indices = torch.full(
+                (self.rq_groups, x.shape[0], x.shape[1], self.num_quantizers),
+                -1,
+                dtype = torch.long,
+                device = x.device,
+            )
+            commit_loss = self.zero
+        elif not self.use_finite_scalar_quantizer:
             rq_kwargs = (
                 dict(freeze_codebook = freeze_codebook)
                 if not self.use_lookup_free_quantizer
@@ -3032,7 +3139,7 @@ class SoundStream(Module):
             x, indices = self.rq(x)
             commit_loss = self.zero
 
-        if exists(num_quantizers):
+        if exists(num_quantizers) and not self.bypass_rvq:
             assert 0 < num_quantizers <= self.num_quantizers
             indices = indices[..., :num_quantizers]
             x = self.rq.get_output_from_indices(indices)
@@ -3480,7 +3587,15 @@ class FrameStreamingSoundStream(SoundStream):
             is_denoising = is_denoising
         )
 
-        if not self.use_finite_scalar_quantizer:
+        if self.bypass_rvq:
+            indices = torch.full(
+                (self.rq_groups, x.shape[0], x.shape[1], self.num_quantizers),
+                -1,
+                dtype = torch.long,
+                device = x.device,
+            )
+            commit_loss = self.zero
+        elif not self.use_finite_scalar_quantizer:
             rq_kwargs = (
                 dict(freeze_codebook = freeze_codebook)
                 if not self.use_lookup_free_quantizer
@@ -3491,7 +3606,7 @@ class FrameStreamingSoundStream(SoundStream):
             x, indices = self.rq(x)
             commit_loss = self.zero
 
-        if exists(num_quantizers):
+        if exists(num_quantizers) and not self.bypass_rvq:
             assert 0 < num_quantizers <= self.num_quantizers
             indices = indices[..., :num_quantizers]
             x = self.rq.get_output_from_indices(indices)
@@ -3586,7 +3701,21 @@ class FrameStreamingSoundStream(SoundStream):
             latent_frames.append(frame_latent)
 
         all_latents = torch.cat(latent_frames, dim = 1)
-        if not self.use_finite_scalar_quantizer:
+        if self.bypass_rvq:
+            all_quantized = all_latents
+            all_indices = torch.full(
+                (
+                    self.rq_groups,
+                    all_latents.shape[0],
+                    all_latents.shape[1],
+                    self.num_quantizers,
+                ),
+                -1,
+                dtype = torch.long,
+                device = all_latents.device,
+            )
+            all_commit_loss = self.zero
+        elif not self.use_finite_scalar_quantizer:
             rq_kwargs = (
                 dict(freeze_codebook = freeze_codebook)
                 if not self.use_lookup_free_quantizer
@@ -3601,7 +3730,7 @@ class FrameStreamingSoundStream(SoundStream):
             all_quantized, all_indices = self.rq(all_latents)
             all_commit_loss = self.zero
 
-        if exists(num_quantizers):
+        if exists(num_quantizers) and not self.bypass_rvq:
             assert 0 < num_quantizers <= self.num_quantizers
             all_indices = all_indices[..., :num_quantizers]
             all_quantized = self.rq.get_output_from_indices(all_indices)

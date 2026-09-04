@@ -24,7 +24,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("report", type=Path)
     parser.add_argument("--min-q00-active-ratio", type=float, default=0.70)
-    parser.add_argument("--min-q00-perplexity", type=float, default=50.0)
+    parser.add_argument("--min-q00-perplexity", type=float, default=8.0)
     parser.add_argument("--max-recon-clip-fraction", type=float, default=1e-3)
     parser.add_argument("--min-aligned-si-sdr", type=float, default=0.0)
     parser.add_argument("--min-aligned-correlation", type=float, default=0.65)
