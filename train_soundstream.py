@@ -1885,6 +1885,10 @@ def build_model(
         codebook_size=codebook_size,
         rq_num_quantizers=num_quantizers,
         rq_groups=1,
+        # Use the classic straight-through estimator for Encoder gradients.
+        # vector-quantize-pytorch falls back to standard STE when the mutually
+        # exclusive rotation trick is disabled.
+        rq_rotation_trick=False,
         use_lookup_free_quantizer=False,
         use_finite_scalar_quantizer=False,
         use_local_attn=False,
@@ -2901,6 +2905,10 @@ def main() -> None:
         "Encoder DSCNN low-rank revision 3: Block2/3/4 use Depthwise followed "
         "by rank-factorized Pointwise convolutions; residual ranks=8/16/32, "
         "downsample ranks=16/32/64; existing ReLU positions are unchanged."
+    )
+    print(
+        "RVQ gradient estimator: standard STE "
+        "(rotation_trick=False; codebook remains EMA-updated)"
     )
     if stage25_decoder_only_refine:
         print(

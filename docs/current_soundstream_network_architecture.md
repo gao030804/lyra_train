@@ -188,7 +188,7 @@ r(q+1) = rq - qq
 
 最近邻 `argmin` 不可导。当前实现采用：
 
-- Rotation Trick：联合训练时把量化输出梯度近似传回 Encoder；
+- 标准 STE：联合训练时令量化层对 Encoder 的近似导数为恒等映射；
 - Commitment loss：约束 Encoder latent 靠近选中的码字；
 - EMA（decay=0.99）：更新码本聚类中心；
 - K-means 初始化；

@@ -27,6 +27,7 @@ def test_bypass_rvq_is_saved_runtime_mode_and_emits_sentinel_indices():
         discr_multi_scales=(1,),
         pad_mode="constant",
         bypass_rvq=True,
+        rq_rotation_trick=False,
     )
     latent, indices, commitment = model(
         torch.randn(1, 256),
@@ -37,7 +38,13 @@ def test_bypass_rvq_is_saved_runtime_mode_and_emits_sentinel_indices():
     assert indices.shape == (1, 64, 2)
     assert torch.all(indices == -1)
     assert commitment.item() == 0
-    assert model.config["bypass_rvq"] is True
+    assert model.configs["bypass_rvq"] is True
+    assert model.configs["rq_rotation_trick"] is False
+    assert all(
+        not layer.rotation_trick
+        for rvq in model.rq.rvqs
+        for layer in rvq.layers
+    )
 
 
 ROOT = Path(__file__).resolve().parents[1]

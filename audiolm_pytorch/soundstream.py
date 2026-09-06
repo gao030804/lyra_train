@@ -906,7 +906,7 @@ class SoundStream(Module):
         rq_quantize_dropout = True,
         rq_groups = 1,
         rq_stochastic_sample_codes = False,
-        rq_rotation_trick = True,
+        rq_rotation_trick = False,
         rq_threshold_ema_dead_code = 2,
         rq_kwargs: dict = {},
         bypass_rvq = False,

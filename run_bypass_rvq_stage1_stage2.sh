@@ -24,6 +24,8 @@ BYPASS_STAGE2_STEPS="${BYPASS_STAGE2_STEPS:-150000}"
 RVQ_CALIBRATION_STEPS="${RVQ_CALIBRATION_STEPS:-5000}"
 RVQ_STAGE2_STEPS="${RVQ_STAGE2_STEPS:-150000}"
 RESUME_BYPASS_STAGE1="${RESUME_BYPASS_STAGE1:-0}"
+START_PHASE="${START_PHASE:-bypass_stage1}"
+BYPASS_STAGE2_CKPT="${BYPASS_STAGE2_CKPT:-}"
 
 BASE="lowrank-dscnn-b234-relu-convtranspose-fp-64d-16q16-${RUN_TAG}"
 BYPASS_S1_DIR="$PWD/results/bypass-recon-$BASE"
@@ -31,12 +33,28 @@ BYPASS_S2_DIR="$PWD/results/bypass-gan-$BASE"
 RVQ_S1_DIR="$PWD/results/rvq-calibration-$BASE"
 RVQ_S2_DIR="$PWD/results/rvq-gan-$BASE"
 
+if [[ "$START_PHASE" != "bypass_stage1" && "$START_PHASE" != "rvq_stage1" ]]; then
+  echo "ERROR: START_PHASE must be bypass_stage1 or rvq_stage1." >&2
+  exit 2
+fi
+
 if [[ "$RESUME_BYPASS_STAGE1" != "0" && "$RESUME_BYPASS_STAGE1" != "1" ]]; then
   echo "ERROR: RESUME_BYPASS_STAGE1 must be 0 or 1." >&2
   exit 2
 fi
 
-if [[ "$RESUME_BYPASS_STAGE1" == "1" ]]; then
+if [[ "$START_PHASE" == "rvq_stage1" ]]; then
+  if [[ "$RESUME_BYPASS_STAGE1" != "0" ]]; then
+    echo "ERROR: RESUME_BYPASS_STAGE1 is not valid with START_PHASE=rvq_stage1." >&2
+    exit 2
+  fi
+  if [[ -z "$BYPASS_STAGE2_CKPT" || ! -f "$BYPASS_STAGE2_CKPT" ]]; then
+    echo "ERROR: START_PHASE=rvq_stage1 requires an existing BYPASS_STAGE2_CKPT." >&2
+    echo "received: ${BYPASS_STAGE2_CKPT:-<empty>}" >&2
+    exit 2
+  fi
+  BYPASS_S2_CKPT="$BYPASS_STAGE2_CKPT"
+elif [[ "$RESUME_BYPASS_STAGE1" == "1" ]]; then
   if [[ ! -f "$BYPASS_S1_DIR/latest.pt" ]]; then
     echo "ERROR: resume requires $BYPASS_S1_DIR/latest.pt" >&2
     exit 2
@@ -52,7 +70,11 @@ else
   fi
 fi
 
-for dir in "$BYPASS_S2_DIR" "$RVQ_S1_DIR" "$RVQ_S2_DIR"; do
+CHECK_DIRS=("$RVQ_S1_DIR" "$RVQ_S2_DIR")
+if [[ "$START_PHASE" == "bypass_stage1" ]]; then
+  CHECK_DIRS=("$BYPASS_S2_DIR" "${CHECK_DIRS[@]}")
+fi
+for dir in "${CHECK_DIRS[@]}"; do
   if [ -e "$dir" ]; then
     echo "ERROR: results directory already exists: $dir" >&2
     echo "Use a new RUN_TAG. Existing training results are never overwritten." >&2
@@ -125,31 +147,36 @@ GAN_LOSSES=(
   --no-stage2-quality-hard-stop --gan-grad-diagnostics-every 500 --loss-grad-diagnostics-every 1000
 )
 
-# A1: RVQ is absent from both the forward signal and checkpoint selection gate.
-run_stage "A1 bypass-RVQ reconstruction" 29511 "$PWD/logs/bypass-recon-$BASE.log" "$A1_APPEND_LOG" \
-  --stage recon_pretrain --results-dir "$BYPASS_S1_DIR" \
-  --num-train-steps "$BYPASS_STAGE1_STEPS" --bypass-rvq-during-training \
-  --decoder-residual-scale-start 0.2 --decoder-residual-scale-end 1.0 \
-  --decoder-residual-scale-warmup-start-steps 0 --decoder-residual-scale-warmup-end-steps 15000 \
-  "${RECON_LOSSES[@]}" "${COMMON[@]}" "$A1_RESUME_FLAG"
-BYPASS_S1_CKPT="$(pick_best "$BYPASS_S1_DIR")"
-echo "A1 checkpoint=$BYPASS_S1_CKPT"
+if [[ "$START_PHASE" == "bypass_stage1" ]]; then
+  # A1: RVQ is absent from both the forward signal and checkpoint selection gate.
+  run_stage "A1 bypass-RVQ reconstruction" 29511 "$PWD/logs/bypass-recon-$BASE.log" "$A1_APPEND_LOG" \
+    --stage recon_pretrain --results-dir "$BYPASS_S1_DIR" \
+    --num-train-steps "$BYPASS_STAGE1_STEPS" --bypass-rvq-during-training \
+    --decoder-residual-scale-start 0.2 --decoder-residual-scale-end 1.0 \
+    --decoder-residual-scale-warmup-start-steps 0 --decoder-residual-scale-warmup-end-steps 15000 \
+    "${RECON_LOSSES[@]}" "${COMMON[@]}" "$A1_RESUME_FLAG"
+  BYPASS_S1_CKPT="$(pick_best "$BYPASS_S1_DIR")"
+  echo "A1 checkpoint=$BYPASS_S1_CKPT"
 
-# A2: standard Stage-2 policy keeps the bypass Encoder fixed while Decoder and
-# discriminators refine the continuous latent path with GAN losses.
-run_stage "A2 bypass-RVQ GAN" 29512 "$PWD/logs/bypass-gan-$BASE.log" 0 \
-  --stage gan_pretrain --results-dir "$BYPASS_S2_DIR" \
-  --init-checkpoint "$BYPASS_S1_CKPT" --num-train-steps "$BYPASS_STAGE2_STEPS" \
-  --bypass-rvq-during-training "${GAN_LOSSES[@]}" "${COMMON[@]}" --no-resume
-BYPASS_S2_CKPT="$(pick_best "$BYPASS_S2_DIR")"
-echo "A2 checkpoint=$BYPASS_S2_CKPT"
+  # A2: standard Stage-2 policy keeps the bypass Encoder fixed while Decoder and
+  # discriminators refine the continuous latent path with GAN losses.
+  run_stage "A2 bypass-RVQ GAN" 29512 "$PWD/logs/bypass-gan-$BASE.log" 0 \
+    --stage gan_pretrain --results-dir "$BYPASS_S2_DIR" \
+    --init-checkpoint "$BYPASS_S1_CKPT" --num-train-steps "$BYPASS_STAGE2_STEPS" \
+    --bypass-rvq-during-training "${GAN_LOSSES[@]}" "${COMMON[@]}" --no-resume
+  BYPASS_S2_CKPT="$(pick_best "$BYPASS_S2_DIR")"
+  echo "A2 checkpoint=$BYPASS_S2_CKPT"
+else
+  echo "Skipping bypass stages; starting RVQ Stage-1 from $BYPASS_S2_CKPT"
+fi
 
 # B1: no Decoder call and no optimizer/backward step.  Only RVQ EMA and
 # dead-code replacement state changes; Encoder/Decoder tensors remain bitwise fixed.
 run_stage "B1 RVQ calibration with codec frozen" 29513 "$PWD/logs/rvq-calibration-$BASE.log" 0 \
   --stage recon_pretrain --results-dir "$RVQ_S1_DIR" \
   --init-checkpoint "$BYPASS_S2_CKPT" --num-train-steps "$RVQ_CALIBRATION_STEPS" \
-  --rvq-calibration-only --no-bypass-rvq-during-training "${COMMON[@]}" --no-resume
+  --rvq-calibration-only --early-stopping-min-steps 0 \
+  --no-bypass-rvq-during-training "${COMMON[@]}" --no-resume
 RVQ_S1_CKPT="$RVQ_S1_DIR/latest.pt"
 test -f "$RVQ_S1_CKPT" || { echo "ERROR: missing $RVQ_S1_CKPT" >&2; exit 2; }
 echo "B1 checkpoint=$RVQ_S1_CKPT"
