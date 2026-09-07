@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Four-phase training:
+# Five-phase training:
 #   A1 Encoder -> Decoder reconstruction (RVQ bypassed)
+#   A1.5 low-LR Encoder/Decoder formant refinement (RVQ bypassed)
 #   A2 Encoder -> Decoder GAN refinement (RVQ bypassed)
 #   B1 Encoder -> RVQ EMA calibration (Encoder/Decoder weights frozen)
 #   B2 Encoder -> frozen RVQ -> Decoder GAN adaptation (Encoder/RVQ frozen)
@@ -20,21 +21,31 @@ AUDIO_DIR="${AUDIO_DIR:-$PWD/data/librispeech/LibriSpeech/train-clean-100}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
 SEED="${SEED:-42}"
 BYPASS_STAGE1_STEPS="${BYPASS_STAGE1_STEPS:-150000}"
+BYPASS_FORMANT_REFINE_STEPS="${BYPASS_FORMANT_REFINE_STEPS:-20000}"
 BYPASS_STAGE2_STEPS="${BYPASS_STAGE2_STEPS:-150000}"
 RVQ_CALIBRATION_STEPS="${RVQ_CALIBRATION_STEPS:-5000}"
 RVQ_STAGE2_STEPS="${RVQ_STAGE2_STEPS:-150000}"
 RESUME_BYPASS_STAGE1="${RESUME_BYPASS_STAGE1:-0}"
 START_PHASE="${START_PHASE:-bypass_stage1}"
+STOP_AFTER_PHASE="${STOP_AFTER_PHASE:-}"
 BYPASS_STAGE2_CKPT="${BYPASS_STAGE2_CKPT:-}"
 
 BASE="lowrank-dscnn-b234-relu-convtranspose-fp-64d-16q16-${RUN_TAG}"
 BYPASS_S1_DIR="$PWD/results/bypass-recon-$BASE"
+BYPASS_FORMANT_DIR="$PWD/results/bypass-formant-refine-$BASE"
 BYPASS_S2_DIR="$PWD/results/bypass-gan-$BASE"
 RVQ_S1_DIR="$PWD/results/rvq-calibration-$BASE"
 RVQ_S2_DIR="$PWD/results/rvq-gan-$BASE"
 
 if [[ "$START_PHASE" != "bypass_stage1" && "$START_PHASE" != "rvq_stage1" ]]; then
   echo "ERROR: START_PHASE must be bypass_stage1 or rvq_stage1." >&2
+  exit 2
+fi
+
+if [[ -n "$STOP_AFTER_PHASE" && \
+      "$STOP_AFTER_PHASE" != "bypass_stage1" && \
+      "$STOP_AFTER_PHASE" != "bypass_formant_refine" ]]; then
+  echo "ERROR: STOP_AFTER_PHASE must be empty, bypass_stage1, or bypass_formant_refine." >&2
   exit 2
 fi
 
@@ -72,7 +83,7 @@ fi
 
 CHECK_DIRS=("$RVQ_S1_DIR" "$RVQ_S2_DIR")
 if [[ "$START_PHASE" == "bypass_stage1" ]]; then
-  CHECK_DIRS=("$BYPASS_S2_DIR" "${CHECK_DIRS[@]}")
+  CHECK_DIRS=("$BYPASS_FORMANT_DIR" "$BYPASS_S2_DIR" "${CHECK_DIRS[@]}")
 fi
 for dir in "${CHECK_DIRS[@]}"; do
   if [ -e "$dir" ]; then
@@ -103,6 +114,7 @@ run_stage() {
 pick_best() {
   local dir="$1" candidate
   for candidate in \
+    best_by_formant.pt \
     best_full_gan_formant_balanced.pt \
     best_full_gan_balanced.pt \
     best_gan_balanced.pt \
@@ -157,12 +169,38 @@ if [[ "$START_PHASE" == "bypass_stage1" ]]; then
     "${RECON_LOSSES[@]}" "${COMMON[@]}" "$A1_RESUME_FLAG"
   BYPASS_S1_CKPT="$(pick_best "$BYPASS_S1_DIR")"
   echo "A1 checkpoint=$BYPASS_S1_CKPT"
+  if [[ "$STOP_AFTER_PHASE" == "bypass_stage1" ]]; then
+    echo "Stopping after A1 as requested."
+    exit 0
+  fi
+
+  # A1.5: keep RVQ bypassed, update Decoder at 1e-5 and Encoder at 2e-6,
+  # and select a formant-preserving reconstruction before adversarial training.
+  run_stage "A1.5 bypass-RVQ formant refinement" 29515 \
+    "$PWD/logs/bypass-formant-refine-$BASE.log" 0 \
+    --stage spectral_refine --results-dir "$BYPASS_FORMANT_DIR" \
+    --init-checkpoint "$BYPASS_S1_CKPT" \
+    --num-train-steps "$BYPASS_FORMANT_REFINE_STEPS" \
+    --bypass-rvq-during-training "${COMMON[@]}" --no-resume
+  if [[ -f "$BYPASS_FORMANT_DIR/best_by_formant.pt" ]]; then
+    BYPASS_FORMANT_CKPT="$BYPASS_FORMANT_DIR/best_by_formant.pt"
+  elif [[ -f "$BYPASS_FORMANT_DIR/baseline_init.pt" ]]; then
+    BYPASS_FORMANT_CKPT="$BYPASS_FORMANT_DIR/baseline_init.pt"
+  else
+    echo "ERROR: A1.5 produced neither an improved formant checkpoint nor its baseline." >&2
+    exit 1
+  fi
+  echo "A1.5 checkpoint=$BYPASS_FORMANT_CKPT"
+  if [[ "$STOP_AFTER_PHASE" == "bypass_formant_refine" ]]; then
+    echo "Stopping after A1.5 as requested."
+    exit 0
+  fi
 
   # A2: standard Stage-2 policy keeps the bypass Encoder fixed while Decoder and
   # discriminators refine the continuous latent path with GAN losses.
   run_stage "A2 bypass-RVQ GAN" 29512 "$PWD/logs/bypass-gan-$BASE.log" 0 \
     --stage gan_pretrain --results-dir "$BYPASS_S2_DIR" \
-    --init-checkpoint "$BYPASS_S1_CKPT" --num-train-steps "$BYPASS_STAGE2_STEPS" \
+    --init-checkpoint "$BYPASS_FORMANT_CKPT" --num-train-steps "$BYPASS_STAGE2_STEPS" \
     --bypass-rvq-during-training "${GAN_LOSSES[@]}" "${COMMON[@]}" --no-resume
   BYPASS_S2_CKPT="$(pick_best "$BYPASS_S2_DIR")"
   echo "A2 checkpoint=$BYPASS_S2_CKPT"
@@ -188,8 +226,9 @@ run_stage "B2 RVQ GAN decoder adaptation" 29514 "$PWD/logs/rvq-gan-$BASE.log" 0 
   --init-checkpoint "$RVQ_S1_CKPT" --num-train-steps "$RVQ_STAGE2_STEPS" \
   --no-bypass-rvq-during-training "${GAN_LOSSES[@]}" "${COMMON[@]}" --no-resume
 
-echo "===== four-phase training complete ====="
+echo "===== five-phase training complete ====="
 echo "bypass Stage-1: $BYPASS_S1_DIR"
+echo "bypass formant refine: $BYPASS_FORMANT_DIR"
 echo "bypass Stage-2: $BYPASS_S2_DIR"
 echo "RVQ calibration: $RVQ_S1_DIR"
 echo "RVQ Stage-2: $RVQ_S2_DIR"

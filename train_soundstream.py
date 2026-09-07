@@ -53,6 +53,7 @@ RECONSTRUCTION_STAGES = frozenset((
 # streaming-GAN pass after stateful/offline consistency has been established.
 GAN_STAGES = frozenset(("gan_pretrain", "stream_finetune_long"))
 QUALITY_RETENTION_STAGES = frozenset((
+    "spectral_refine",
     "gan_pretrain",
     "stream_finetune",
     "stream_finetune_long",
@@ -122,21 +123,26 @@ STAGE_DEFAULTS = {
         gan_start=0, gan_ramp=0,
         gan_adversarial_max=0., gan_feature_max=0.,
     ),
-    # Stage 1.5 starts from the validation-selected stage-1 codec. It keeps
-    # RVQ trainable and only adds a small spectral refinement objective.
+    # Stage 1.5 is the formant-refinement pass.  In bypass-RVQ runs it keeps
+    # the continuous latent path, updates Decoder conservatively, and gives
+    # Encoder a smaller LR so F2/F3 information can still enter the latent.
     "spectral_refine": dict(
         steps=20_000, batch_size=4, segment_seconds=4.,
         save_every=1_000, eval_every=250, min_steps=5_000, patience=30,
-        lr=2e-5, discr_lr=None, ema_beta=0.999,
+        lr=1e-5, encoder_lr=2e-6, discr_lr=None, ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
-        use_ema=True,
+        use_ema=False,
         click_loss_weight=0., jump_loss_weight=0.,
         preemph_loss_weight=0., noise_floor_loss_weight=0.03,
         transient_loss_warmup_steps=0,
-        spectral_envelope_loss_weight=0.05,
+        # The previous 0.12 envelope objective barely moved validation
+        # formants while competing with waveform quality.  Keep it as a
+        # structural anchor and let the independently scheduled F2/F3 peak
+        # terms do the targeted refinement.
+        spectral_envelope_loss_weight=0.10,
         spectral_envelope_loss_start_steps=0,
         spectral_envelope_loss_warmup_steps=0,
-        formant_peak_loss_weight=0.02,
+        formant_peak_loss_weight=0.05,
         formant_peak_loss_start_steps=0,
         formant_peak_loss_warmup_steps=5_000,
         voiced_highband_loss_weight=0.02,
@@ -147,15 +153,15 @@ STAGE_DEFAULTS = {
         upper_highband_energy_margin_db=0.50,
         upper_highband_loss_start_steps=0,
         upper_highband_loss_warmup_steps=5_000,
-        stft_recon_loss_weight=0.10,
+        stft_recon_loss_weight=0.05,
         stft_recon_loss_start_steps=0,
         stft_recon_loss_warmup_steps=5_000,
-        frame_phase_loss_weight=0.005,
+        frame_phase_loss_weight=0.,
         frame_phase_loss_start_steps=0,
         frame_phase_loss_warmup_steps=5_000,
-        decoder_x8_residual_scale_target=0.85,
+        decoder_x8_residual_scale_target=1.0,
         decoder_x8_residual_scale_ramp_steps=3_000,
-        si_sdr_loss_weight=0.03,
+        si_sdr_loss_weight=0.05,
         si_sdr_loss_start_steps=0,
         si_sdr_loss_warmup_steps=0,
         gan_start=0, gan_ramp=0,
@@ -321,6 +327,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train a staged 3.2 kbps streaming SoundStream speech codec."
     )
+    parser.add_argument('--preceding-context-seconds', type=float, default=0.,
+                        help='Real contiguous prefix excluded from waveform losses; use 0.4 for context-aware crops.')
+    parser.add_argument('--stream-tbptt-frames', type=int, default=20,
+                        help='Detach streaming activation caches every N frames; 0 retains the full graph.')
 
     parser.add_argument(
         "--audio-dir",
@@ -3470,12 +3480,19 @@ def main() -> None:
         scheduler = LambdaLR
         scheduler_kwargs = dict(lr_lambda=stage1_lr_lambda)
 
+    if args.stream_tbptt_frames < 0:
+        raise ValueError('--stream-tbptt-frames must be non-negative')
+    if args.preceding_context_seconds and not args.bypass_rvq_during_training:
+        raise ValueError('Context training currently requires --bypass-rvq-during-training; RVQ burn-in updates are not yet isolated.')
+    soundstream.stream_tbptt_frames = args.stream_tbptt_frames
+    print(f'Preceding real context: {args.preceding_context_seconds}s; target: {segment_seconds}s; TBPTT: {args.stream_tbptt_frames} frames')
     trainer = SoundStreamTrainer(
         soundstream,
         folder=str(audio_dir),
         batch_size=batch_size,
         grad_accum_every=args.grad_accum_every,
         data_max_length_seconds=segment_seconds,
+        preceding_context_seconds=args.preceding_context_seconds,
         dataset_max_files=(args.overfit_files if args.stage == "overfit" else None),
         dataset_fixed_crop=(args.stage == "overfit"),
         num_train_steps=num_train_steps,
@@ -3486,6 +3503,7 @@ def main() -> None:
         # parameters out of Adam even in the midband mode; freeze_codebook=False
         # below is what enables EMA/dead-code state updates.
         exclude_rq_from_generator_optimizer=(
+            args.bypass_rvq_during_training or
             args.stage2_targeted_refine or
             (
                 args.stage == "gan_pretrain" and
@@ -3803,14 +3821,22 @@ def main() -> None:
             args.stage2_quality_retention_gate
         ),
         quality_retention_hard_stop=(
-            args.stage2_quality_hard_stop
-            if args.stage == "gan_pretrain"
-            else True
+            False
+            if args.stage == "spectral_refine"
+            else (
+                args.stage2_quality_hard_stop
+                if args.stage == "gan_pretrain"
+                else True
+            )
         ),
         quality_retention_max_aligned_si_sdr_drop=(
-            0.20
-            if args.stage in ("stream_finetune", "stream_finetune_long")
-            else args.stage2_max_aligned_si_sdr_drop
+            0.10
+            if args.stage == "spectral_refine"
+            else (
+                0.20
+                if args.stage in ("stream_finetune", "stream_finetune_long")
+                else args.stage2_max_aligned_si_sdr_drop
+            )
         ),
         quality_retention_max_aligned_corr_drop=(
             0.01
@@ -4186,6 +4212,9 @@ def main() -> None:
             "formant_f1_mae_hz",
             "formant_f2_mae_hz",
             "formant_f3_mae_hz",
+            "formant_f1_valid_fraction",
+            "formant_f2_valid_fraction",
+            "formant_f3_valid_fraction",
             "stft_scale_512",
             "stft_scale_1024",
             "stft_scale_2048",
@@ -4239,6 +4268,10 @@ def main() -> None:
             trainer.best_balanced_score = min(
                 trainer.best_balanced_score,
                 baseline_metrics["score"],
+            )
+            trainer.best_formant_score = min(
+                trainer.best_formant_score,
+                trainer.formant_refinement_score(baseline_metrics),
             )
             if stage25_rvq_midband_refine:
                 trainer.best_midband_score = min(
@@ -4360,6 +4393,8 @@ def main() -> None:
     best_gan_balanced = results_dir / "best_gan_balanced.pt"
     best_balanced = results_dir / "best_balanced.pt"
     best_by_midband = results_dir / "best_by_midband.pt"
+    best_by_formant = results_dir / "best_by_formant.pt"
+    baseline_init = results_dir / "baseline_init.pt"
     best_by_aligned_si_sdr = results_dir / "best_by_aligned_si_sdr.pt"
     best_selected = results_dir / "best_selected.pt"
     best_by_clarity = results_dir / "best_by_clarity.pt"
@@ -4406,6 +4441,17 @@ def main() -> None:
             )
             if checkpoint.exists()
         ), best_raw_online)
+    elif args.stage == "spectral_refine":
+        # A trained refinement is eligible only if its normalized formant
+        # score beats the initialization while the retention gate passes.
+        # Otherwise report/test the original A1 initialization explicitly.
+        best_checkpoint = next((
+            checkpoint for checkpoint in (
+                best_by_formant,
+                baseline_init,
+            )
+            if checkpoint.exists()
+        ), None)
     elif args.stage in ("stream_finetune", "stream_finetune_long"):
         # Streaming adaptation is ranked by the gated reconstruction +
         # boundary + offline/stateful consistency score.

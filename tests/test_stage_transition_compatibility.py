@@ -71,18 +71,20 @@ def test_stage1_formant_training_schedule():
     assert stage1["upper_highband_loss_weight"] == pytest.approx(0.0025)
 
 
-def test_spectral_refine_matches_current_optional_profile():
+def test_spectral_refine_matches_formant_refinement_profile():
     refine = STAGE_DEFAULTS["spectral_refine"]
 
     assert "spectral_refine" in QUALITY_RETENTION_STAGES
-    assert refine["lr"] == pytest.approx(2e-5)
+    assert refine["lr"] == pytest.approx(1e-5)
+    assert refine["encoder_lr"] == pytest.approx(2e-6)
+    assert refine["use_ema"] is False
     assert refine["patience"] == 30
-    assert refine["spectral_envelope_loss_weight"] == pytest.approx(0.05)
-    assert refine["formant_peak_loss_weight"] == pytest.approx(0.02)
+    assert refine["spectral_envelope_loss_weight"] == pytest.approx(0.10)
+    assert refine["formant_peak_loss_weight"] == pytest.approx(0.05)
     assert refine["formant_peak_loss_warmup_steps"] == 5_000
-    assert refine["stft_recon_loss_weight"] == pytest.approx(0.10)
-    assert refine["frame_phase_loss_weight"] == pytest.approx(0.005)
-    assert refine["decoder_x8_residual_scale_target"] == pytest.approx(0.85)
+    assert refine["stft_recon_loss_weight"] == pytest.approx(0.05)
+    assert refine["frame_phase_loss_weight"] == pytest.approx(0.)
+    assert refine["decoder_x8_residual_scale_target"] == pytest.approx(1.0)
     assert refine["decoder_x8_residual_scale_ramp_steps"] == 3_000
 
 

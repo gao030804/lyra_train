@@ -281,6 +281,7 @@ class SoundStreamTrainer(nn.Module):
         batch_size: int,
         data_max_length: int = None,
         data_max_length_seconds: int | float = None,
+        preceding_context_seconds: float = 0.,
         dataset_max_files: int | None = None,
         dataset_fixed_crop: bool = False,
         dataset_min_rms_db: float | None = None,
@@ -1024,6 +1025,15 @@ class SoundStreamTrainer(nn.Module):
             else:
                 assert exists(data_max_length)
 
+            if preceding_context_seconds < 0:
+                raise ValueError('preceding_context_seconds must be non-negative')
+            context_samples = round(preceding_context_seconds * soundstream.target_sample_hz)
+            if context_samples % soundstream.seq_len_multiple_of:
+                raise ValueError('preceding context must align to the codec stride')
+            soundstream.training_context_samples = context_samples
+            # Sample a contiguous real prefix plus target. Short utterances
+            # are padded only on the right by SoundDataset, never on the left.
+            data_max_length += context_samples
             hyperparameters['data_max_length'] = data_max_length
 
             dataset = SoundDataset(
@@ -1263,6 +1273,7 @@ class SoundStreamTrainer(nn.Module):
         self.best_raw_online_aligned_si_sdr = float('-inf')
         self.best_raw_online_clarity_score = float('-inf')
         self.best_clean_online_clarity_score = float('-inf')
+        self.best_formant_score = float('inf')
         self.best_frame_leakage_score = float('inf')
         self.best_midband_score = float('inf')
         self.best_balanced_score = float('inf')
@@ -1418,6 +1429,7 @@ class SoundStreamTrainer(nn.Module):
             best_raw_online_aligned_si_sdr = self.best_raw_online_aligned_si_sdr,
             best_raw_online_clarity_score = self.best_raw_online_clarity_score,
             best_clean_online_clarity_score = self.best_clean_online_clarity_score,
+            best_formant_score = self.best_formant_score,
             best_frame_leakage_score = self.best_frame_leakage_score,
             best_midband_score = self.best_midband_score,
             best_balanced_score = self.best_balanced_score,
@@ -1559,6 +1571,15 @@ class SoundStreamTrainer(nn.Module):
             self.best_clean_online_clarity_score = max(
                 self.best_clean_online_clarity_score,
                 best_clean_online_clarity_score,
+            )
+
+        best_formant_score = self.saved_model_only_score(
+            self.results_folder / 'best_by_formant.pt'
+        )
+        if exists(best_formant_score):
+            self.best_formant_score = min(
+                self.best_formant_score,
+                best_formant_score,
             )
 
         best_frame_leakage_score = self.saved_model_only_score(
@@ -3071,6 +3092,14 @@ class SoundStreamTrainer(nn.Module):
             'quiet_7k_7p8k_excess_db',
             'codebook_q00_active_ratio',
             'codebook_q00_perplexity',
+            'spectral_envelope_fine',
+            'spectral_envelope_coarse',
+            'formant_f1_mae_hz',
+            'formant_f2_mae_hz',
+            'formant_f3_mae_hz',
+            'formant_f1_valid_fraction',
+            'formant_f2_valid_fraction',
+            'formant_f3_valid_fraction',
         ):
             if key in metrics:
                 self.quality_retention_baseline[key] = float(metrics[key])
@@ -3164,6 +3193,32 @@ class SoundStreamTrainer(nn.Module):
         formant_penalty = 0.05 * sum(relative_deltas) / len(relative_deltas)
         return metrics.get('score', float('inf')) + formant_penalty
 
+    def formant_refinement_score(self, metrics):
+        """Return a scale-free A1.5 score relative to its A1 baseline."""
+        if not self.has_quality_retention_baseline:
+            return float('inf')
+
+        baseline = self.quality_retention_baseline
+        weighted_metrics = (
+            ('spectral_envelope_fine', 0.25),
+            ('spectral_envelope_coarse', 0.15),
+            ('formant_f1_mae_hz', 0.10),
+            ('formant_f2_mae_hz', 0.25),
+            ('formant_f3_mae_hz', 0.25),
+        )
+        score = 0.
+        for name, weight in weighted_metrics:
+            initial = baseline.get(name)
+            current = metrics.get(name)
+            if (
+                not exists(initial) or not exists(current) or
+                not isfinite(initial) or not isfinite(current) or
+                initial <= 0.
+            ):
+                return float('inf')
+            score += weight * current / initial
+        return score
+
     def quality_retention_failure_reasons(self, metrics):
         if not self.quality_retention_gate or not self.has_quality_retention_baseline:
             return []
@@ -3183,6 +3238,15 @@ class SoundStreamTrainer(nn.Module):
             tolerance
         ):
             reasons.append('aligned_corr')
+        for formant_name in ('f2', 'f3'):
+            key = f'formant_{formant_name}_valid_fraction'
+            initial_valid = baseline.get(key)
+            current_valid = metrics.get(key)
+            if (
+                exists(initial_valid) and exists(current_valid) and
+                current_valid < initial_valid - 0.02 - tolerance
+            ):
+                reasons.append(f'{formant_name}_valid')
         if metrics.get('click_score', float('inf')) > (
             baseline.get('click_score', self.clean_gate_max_click_score) +
             self.quality_retention_max_click_score_rise +
@@ -3709,6 +3773,7 @@ class SoundStreamTrainer(nn.Module):
             'best_clean_online_clarity_score',
             float('-inf')
         )
+        self.best_formant_score = pkg.get('best_formant_score', float('inf'))
         self.best_frame_leakage_score = pkg.get('best_frame_leakage_score', float('inf'))
         self.best_midband_score = pkg.get('best_midband_score', float('inf'))
         self.best_balanced_score = pkg.get('best_balanced_score', float('inf'))
@@ -3920,6 +3985,15 @@ class SoundStreamTrainer(nn.Module):
             self.formant_peak_loss_max_weight,
         )
         model.formant_peak_loss_weight = weight
+        if self.best_checkpoint_metric == 'spectral_refine':
+            # F1 is already accurate.  Emphasize F2 immediately, then admit
+            # F3 only after 3k steps so the upper formant objective cannot
+            # create a narrow metallic peak at the start of refinement.
+            f2_progress = min(max(steps / 3000., 0.), 1.)
+            f3_progress = min(max((steps - 3000) / 5000., 0.), 1.)
+            model.formant_peak_f1_weight = 0.50
+            model.formant_peak_f2_weight = 1.30 + 0.20 * f2_progress
+            model.formant_peak_f3_weight = 1.10 * f3_progress
         return progress
 
     def update_voiced_highband_loss_weight(self, steps):
@@ -4886,6 +4960,14 @@ class SoundStreamTrainer(nn.Module):
                         ),
                         'si_sdr': si_sdr_loss * runtime_model.si_sdr_loss_weight,
                     }
+                    for formant_name in ('f1', 'f2', 'f3'):
+                        component = formant_diagnostics.get(
+                            f'{formant_name}_weighted_loss'
+                        )
+                        if isinstance(component, torch.Tensor):
+                            weighted_objectives[f'formant_{formant_name}'] = (
+                                component * runtime_model.formant_peak_loss_weight
+                            )
                     for objective_name, objective in weighted_objectives.items():
                         logs[f'grad_{objective_name}'] = self.objective_grad_norm(
                             objective, decoder_parameters
@@ -5034,7 +5116,10 @@ class SoundStreamTrainer(nn.Module):
             f"(w={model.spectral_envelope_loss_weight:.4g},ramp={spectral_envelope_loss_progress:.4f}) | "
             f"formant_peak={logs['formant_peak_loss']:.6f}"
             f"(w={getattr(model, 'formant_peak_loss_weight', 0.):.4g},"
-            f"ramp={formant_peak_loss_progress:.4f}) | "
+            f"ramp={formant_peak_loss_progress:.4f},"
+            f"bands={getattr(model, 'formant_peak_f1_weight', 0.):.2f}/"
+            f"{getattr(model, 'formant_peak_f2_weight', 0.):.2f}/"
+            f"{getattr(model, 'formant_peak_f3_weight', 0.):.2f}) | "
             f"voiced_highband={logs['voiced_highband_loss']:.6f}"
             f"(w={model.voiced_highband_loss_weight:.4g},ramp={voiced_highband_loss_progress:.4f}) | "
             f"upper_7k_7p8k={logs['upper_highband_loss']:.6f}"
@@ -5143,6 +5228,9 @@ class SoundStreamTrainer(nn.Module):
                 f"stft={logs.get('grad_stft', 0.):.5f},"
                 f"env={logs.get('grad_formant_env', 0.):.5f},"
                 f"peak={logs.get('grad_formant_peak', 0.):.5f},"
+                f"f1={logs.get('grad_formant_f1', 0.):.5f},"
+                f"f2={logs.get('grad_formant_f2', 0.):.5f},"
+                f"f3={logs.get('grad_formant_f3', 0.):.5f},"
                 f"hf={logs.get('grad_voiced_highband', 0.):.5f},"
                 f"sisdr={logs.get('grad_si_sdr', 0.):.5f},"
                 f"formant_ratio={(logs.get('grad_formant_env', 0.) + logs.get('grad_formant_peak', 0.)) / total_grad:.4f}]"
@@ -5556,6 +5644,15 @@ class SoundStreamTrainer(nn.Module):
                 not quality_reasons['online'] and
                 isfinite(clarity_score) and
                 clarity_score > self.best_clean_online_clarity_score
+            )
+            formant_score = self.formant_refinement_score(online_score)
+            formant_improved = (
+                self.best_checkpoint_metric in ('recon_pretrain', 'spectral_refine') and
+                steps >= self.best_checkpoint_min_step and
+                online_score.get('validation_eligible', 0.) >= 0.5 and
+                not quality_reasons['online'] and
+                isfinite(formant_score) and
+                formant_score < self.best_formant_score
             )
 
             online_clean_fail = (
@@ -6009,6 +6106,26 @@ class SoundStreamTrainer(nn.Module):
                     f"voiced_hf_ratio_db={clarity_hf_ratio_db:+.2f}, "
                     f"click_excess={online_score.get('click_excess', float('inf')):+.4f}; "
                     "clean gate, q00, and RVQ passed)"
+                )
+
+            if formant_improved:
+                self.best_formant_score = formant_score
+                self.save_model_only(
+                    self.results_folder / 'best_by_formant.pt',
+                    online_model,
+                    score = self.best_formant_score,
+                    step = steps,
+                    weight_source = 'online_clean_gated_formant',
+                )
+                self.save(str(self.results_folder / 'latest.pt'))
+                self.print(
+                    f"{steps}: saving best_by_formant.pt "
+                    f"(score={self.best_formant_score:.6f}, "
+                    f"env={online_score.get('spectral_envelope_fine', 0.):.4f}/"
+                    f"{online_score.get('spectral_envelope_coarse', 0.):.4f}, "
+                    f"f1/f2/f3={online_score.get('formant_f1_mae_hz', 0.):.1f}/"
+                    f"{online_score.get('formant_f2_mae_hz', 0.):.1f}/"
+                    f"{online_score.get('formant_f3_mae_hz', 0.):.1f} Hz)"
                 )
 
             if balanced_improved:

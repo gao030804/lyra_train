@@ -5,6 +5,20 @@ import math
 from pathlib import Path
 from functools import partial, wraps
 from itertools import cycle, zip_longest
+from contextlib import nullcontext
+
+
+def detach_stream_state(state):
+    """Cut history gradients while preserving every cached activation."""
+    if torch.is_tensor(state):
+        return state.detach()
+    if isinstance(state, dict):
+        return {key: detach_stream_state(value) for key, value in state.items()}
+    if isinstance(state, tuple):
+        return tuple(detach_stream_state(value) for value in state)
+    if isinstance(state, list):
+        return [detach_stream_state(value) for value in state]
+    return state
 
 import torch
 from torch import nn, einsum
@@ -1296,6 +1310,12 @@ class SoundStream(Module):
         self.spectral_envelope_f0_min_hz = 70.
         self.spectral_envelope_f0_max_hz = 400.
         self.formant_peak_softmax_temperature = 8.
+        # These are runtime-scheduled by the trainer during spectral_refine.
+        # Keeping them on the model makes the exact F1/F2/F3 mixture visible
+        # in logs and prevents one opaque scalar from hiding a weak F3 path.
+        self.formant_peak_f1_weight = 0.50
+        self.formant_peak_f2_weight = 1.50
+        self.formant_peak_f3_weight = 0.50
         # Optimize the band that carries speech presence and consonant detail
         # more strongly than the upper "air" band.  A flat 3-7 kHz objective
         # left the k4-online checkpoint measurably dull, while uniformly
@@ -1924,6 +1944,7 @@ class SoundStream(Module):
         recon_fine = recon_fine[..., :num_frames]
         target_coarse = target_coarse[..., :num_frames]
         recon_coarse = recon_coarse[..., :num_frames]
+        target_voice_log_mag = target_log_mag[:, voice_band, :num_frames].detach()
         relative_floor = (
             frame_rms.amax(dim = -1, keepdim = True) *
             (10. ** (self.spectral_envelope_relative_rms_db / 20.))
@@ -1936,14 +1957,21 @@ class SoundStream(Module):
         voiced_weight = voiced_mask.unsqueeze(1).to(target_fine.dtype)
 
         voice_frequencies = frequencies[voice_band]
-        region_weights = torch.ones_like(voice_frequencies)
+        # F1 is already reconstructed reliably in the current 16 kHz model.
+        # Shift envelope capacity toward F2/F3 without over-emphasizing the
+        # weak and noisy upper edge of the spectrum.
+        region_weights = torch.full_like(voice_frequencies, 0.8)
         region_weights = torch.where(
             (voice_frequencies >= 1000.) & (voice_frequencies < 2500.),
             region_weights.new_tensor(1.30), region_weights
         )
         region_weights = torch.where(
             voice_frequencies >= 2500.,
-            region_weights.new_tensor(1.15), region_weights
+            region_weights.new_tensor(1.40), region_weights
+        )
+        region_weights = torch.where(
+            voice_frequencies >= 4000.,
+            region_weights.new_tensor(0.70), region_weights
         )
 
         def masked_band_mean(error, band_mask, use_region_weights = False):
@@ -2024,14 +2052,19 @@ class SoundStream(Module):
         # Stage 2 is activated only when formant_peak_loss_weight is ramped by
         # the trainer.  Target peaks and confidence masks are detached.
         formant_bands = (
-            ('f1', 200., 1000., 1.0),
-            ('f2', 1000., 2500., 1.3),
-            ('f3', 2500., 4500., 0.8),
+            # name, minimum Hz, maximum Hz, runtime weight, prominence floor,
+            # minimum target-band energy relative to the full voice band.
+            ('f1', 200., 1000., self.formant_peak_f1_weight, 0.12, -2.5),
+            ('f2', 1000., 2500., self.formant_peak_f2_weight, 0.16, -6.0),
+            ('f3', 2500., 4500., self.formant_peak_f3_weight, 0.22, -12.0),
         )
         peak_loss_terms = []
         peak_weights = []
         peak_diagnostics = {}
-        for name, minimum_hz, maximum_hz, formant_weight in formant_bands:
+        for (
+            name, minimum_hz, maximum_hz, formant_weight,
+            prominence_floor, relative_energy_floor_db
+        ) in formant_bands:
             band_mask = (
                 (voice_frequencies >= minimum_hz) &
                 (voice_frequencies < maximum_hz)
@@ -2053,7 +2086,21 @@ class SoundStream(Module):
                 target_band.detach().amax(dim = 1) -
                 target_band.detach().mean(dim = 1)
             )
-            confidence = (prominence >= 0.10) & voiced_mask
+            target_band_log_mag = target_voice_log_mag[:, band_mask]
+            band_energy = target_band_log_mag.mul(2.).logsumexp(dim = 1)
+            voice_energy = target_voice_log_mag.mul(2.).logsumexp(dim = 1)
+            relative_band_energy_db = (
+                (band_energy - voice_energy) * (10. / math.log(10.))
+            )
+            # A separate confidence mask per peak avoids treating F3 as valid
+            # merely because the frame is voiced and F1 is prominent.  Both
+            # tests are target-only, so the reconstruction cannot evade loss
+            # by suppressing its own peak or band energy.
+            confidence = (
+                (prominence >= prominence_floor) &
+                (relative_band_energy_db >= relative_energy_floor_db) &
+                voiced_mask
+            )
             confidence_weight = confidence.to(target_band.dtype)
             denominator = confidence_weight.sum().clamp_min(1.)
             position_error_hz = (recon_position - target_position).abs()
@@ -2072,12 +2119,19 @@ class SoundStream(Module):
             one_peak_loss = position_loss + 0.30 * amplitude_loss + 0.30 * shape_loss
             peak_loss_terms.append(formant_weight * one_peak_loss)
             peak_weights.append(formant_weight)
+            peak_diagnostics[f'{name}_loss'] = one_peak_loss
             peak_diagnostics[f'{name}_mae_hz'] = (
                 position_error_hz * confidence_weight
             ).sum() / denominator
             peak_diagnostics[f'{name}_valid_fraction'] = confidence.float().mean()
 
-        formant_peak_loss = sum(peak_loss_terms) / max(sum(peak_weights), 1e-8)
+        peak_weight_sum = max(sum(peak_weights), 1e-8)
+        formant_peak_loss = sum(peak_loss_terms) / peak_weight_sum
+        for name, _, _, formant_weight, _, _ in formant_bands:
+            peak_diagnostics[f'{name}_weighted_loss'] = (
+                peak_diagnostics[f'{name}_loss'] *
+                (formant_weight / peak_weight_sum)
+            )
         self._last_formant_metrics = {
             'fine_loss': fine_loss,
             'coarse_loss': coarse_loss,
@@ -3167,6 +3221,15 @@ class SoundStream(Module):
 
         # multi-scale discriminator loss
 
+        context_samples = getattr(self, 'training_context_samples', 0) if self.training else 0
+        if context_samples:
+            if recon_x.shape[-1] <= context_samples:
+                raise ValueError('training target is empty after preceding context')
+            orig_x = orig_x[..., context_samples:]
+            recon_x = recon_x[..., context_samples:]
+            if exists(target):
+                target = target[..., context_samples:]
+
         if return_discr_loss:
             real, fake = orig_x.detach(), recon_x.detach()
 
@@ -3507,6 +3570,9 @@ class FrameStreamingSoundStream(SoundStream):
                 else self.offline_reconstruction(x)
             )
 
+        context_samples = getattr(self, 'training_context_samples', 0) if self.training else 0
+        if context_samples and exists(quantized):
+            offline_recon = offline_recon[..., context_samples:]
         offline_recon = offline_recon[..., :stream_recon.shape[-1]]
         stream_recon = stream_recon[..., :offline_recon.shape[-1]]
         # This objective measures implementation consistency, not perceptual
@@ -3692,12 +3758,17 @@ class FrameStreamingSoundStream(SoundStream):
         encoder_state = None
 
         for start in range(0, x.shape[-1], frame_size):
+            interval = getattr(self, 'stream_tbptt_frames', 20)
+            if self.training and interval > 0 and start % (frame_size * interval) == 0:
+                encoder_state = detach_stream_state(encoder_state)
             frame = x[..., start:(start + frame_size)]
-            frame_latent, encoder_state = self.encode_frame_latent(
-                frame,
-                state = encoder_state,
-                is_denoising = is_denoising
-            )
+            burn_in = self.training and start < getattr(self, 'training_context_samples', 0)
+            with torch.no_grad() if burn_in else nullcontext():
+                frame_latent, encoder_state = self.encode_frame_latent(
+                    frame,
+                    state = encoder_state,
+                    is_denoising = is_denoising
+                )
             latent_frames.append(frame_latent)
 
         all_latents = torch.cat(latent_frames, dim = 1)
@@ -3737,12 +3808,17 @@ class FrameStreamingSoundStream(SoundStream):
 
         recons = []
         decoder_state = None
-        for frame_quantized in all_quantized.split(1, dim = 1):
-            recon, decoder_state = self.decode_frame(
-                frame_quantized,
-                state = decoder_state,
-                is_denoising = is_denoising
-            )
+        for frame_index, frame_quantized in enumerate(all_quantized.split(1, dim = 1)):
+            interval = getattr(self, 'stream_tbptt_frames', 20)
+            if self.training and interval > 0 and frame_index % interval == 0:
+                decoder_state = detach_stream_state(decoder_state)
+            burn_in = self.training and frame_index * frame_size < getattr(self, 'training_context_samples', 0)
+            with torch.no_grad() if burn_in else nullcontext():
+                recon, decoder_state = self.decode_frame(
+                    frame_quantized,
+                    state = decoder_state,
+                    is_denoising = is_denoising
+                )
             recons.append(recon)
 
         recon_x = torch.cat(recons, dim = -1)
@@ -3786,6 +3862,15 @@ class FrameStreamingSoundStream(SoundStream):
             num_quantizers = num_quantizers,
             freeze_codebook = freeze_codebook
         )
+
+        context_samples = getattr(self, 'training_context_samples', 0) if self.training else 0
+        if context_samples and not (return_recons_only or return_encoded or return_codes_only):
+            if recon_x.shape[-1] <= context_samples:
+                raise ValueError('training target is empty after preceding context')
+            orig_x = orig_x[..., context_samples:]
+            recon_x = recon_x[..., context_samples:]
+            if exists(target):
+                target = target[..., context_samples:]
 
         if return_codes_only:
             return indices
