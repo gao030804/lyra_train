@@ -21,6 +21,7 @@ AUDIO_DIR="${AUDIO_DIR:-$PWD/data/librispeech/LibriSpeech/train-clean-100}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
 SEED="${SEED:-42}"
 BYPASS_STAGE1_STEPS="${BYPASS_STAGE1_STEPS:-150000}"
+BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS="${BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS:-60000}"
 BYPASS_FORMANT_REFINE_STEPS="${BYPASS_FORMANT_REFINE_STEPS:-20000}"
 BYPASS_STAGE2_STEPS="${BYPASS_STAGE2_STEPS:-150000}"
 RVQ_CALIBRATION_STEPS="${RVQ_CALIBRATION_STEPS:-5000}"
@@ -29,6 +30,11 @@ RESUME_BYPASS_STAGE1="${RESUME_BYPASS_STAGE1:-0}"
 START_PHASE="${START_PHASE:-bypass_stage1}"
 STOP_AFTER_PHASE="${STOP_AFTER_PHASE:-}"
 BYPASS_STAGE2_CKPT="${BYPASS_STAGE2_CKPT:-}"
+PRECEDING_CONTEXT_SECONDS="${PRECEDING_CONTEXT_SECONDS:-0.5}"
+
+if (( BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS > BYPASS_STAGE1_STEPS )); then
+  BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS="$BYPASS_STAGE1_STEPS"
+fi
 
 BASE="lowrank-dscnn-b234-relu-convtranspose-fp-64d-16q16-${RUN_TAG}"
 BYPASS_S1_DIR="$PWD/results/bypass-recon-$BASE"
@@ -70,10 +76,10 @@ elif [[ "$RESUME_BYPASS_STAGE1" == "1" ]]; then
     echo "ERROR: resume requires $BYPASS_S1_DIR/latest.pt" >&2
     exit 2
   fi
-  A1_RESUME_FLAG="--resume"
+  A1_RESUME_FLAGS=(--resume --reset-early-stopping-on-resume)
   A1_APPEND_LOG=1
 else
-  A1_RESUME_FLAG="--no-resume"
+  A1_RESUME_FLAGS=(--no-resume)
   A1_APPEND_LOG=0
   if [[ -e "$BYPASS_S1_DIR" ]]; then
     echo "ERROR: results directory already exists: $BYPASS_S1_DIR" >&2
@@ -138,7 +144,7 @@ COMMON=(
 )
 
 RECON_LOSSES=(
-  --si-sdr-loss-weight 0.07 --si-sdr-loss-start-steps 5000 --si-sdr-loss-warmup-steps 15000
+  --si-sdr-loss-weight 0.07 --si-sdr-loss-start-steps 15000 --si-sdr-loss-warmup-steps 15000
   --spectral-envelope-loss-weight 0.08 --spectral-envelope-loss-start-steps 5000 --spectral-envelope-loss-warmup-steps 15000
   --formant-peak-loss-weight 0.02 --formant-peak-loss-start-steps 15000 --formant-peak-loss-warmup-steps 20000
   --stft-recon-loss-weight 0.05 --stft-recon-loss-start-steps 5000 --stft-recon-loss-warmup-steps 15000
@@ -164,9 +170,11 @@ if [[ "$START_PHASE" == "bypass_stage1" ]]; then
   run_stage "A1 bypass-RVQ reconstruction" 29511 "$PWD/logs/bypass-recon-$BASE.log" "$A1_APPEND_LOG" \
     --stage recon_pretrain --results-dir "$BYPASS_S1_DIR" \
     --num-train-steps "$BYPASS_STAGE1_STEPS" --bypass-rvq-during-training \
+    --early-stopping-min-steps "$BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS" \
+    --preceding-context-seconds "$PRECEDING_CONTEXT_SECONDS" \
     --decoder-residual-scale-start 0.2 --decoder-residual-scale-end 1.0 \
     --decoder-residual-scale-warmup-start-steps 0 --decoder-residual-scale-warmup-end-steps 15000 \
-    "${RECON_LOSSES[@]}" "${COMMON[@]}" "$A1_RESUME_FLAG"
+    "${RECON_LOSSES[@]}" "${COMMON[@]}" "${A1_RESUME_FLAGS[@]}"
   BYPASS_S1_CKPT="$(pick_best "$BYPASS_S1_DIR")"
   echo "A1 checkpoint=$BYPASS_S1_CKPT"
   if [[ "$STOP_AFTER_PHASE" == "bypass_stage1" ]]; then
@@ -181,7 +189,9 @@ if [[ "$START_PHASE" == "bypass_stage1" ]]; then
     --stage spectral_refine --results-dir "$BYPASS_FORMANT_DIR" \
     --init-checkpoint "$BYPASS_S1_CKPT" \
     --num-train-steps "$BYPASS_FORMANT_REFINE_STEPS" \
-    --bypass-rvq-during-training "${COMMON[@]}" --no-resume
+    --bypass-rvq-during-training \
+    --preceding-context-seconds "$PRECEDING_CONTEXT_SECONDS" \
+    "${COMMON[@]}" --no-resume
   if [[ -f "$BYPASS_FORMANT_DIR/best_by_formant.pt" ]]; then
     BYPASS_FORMANT_CKPT="$BYPASS_FORMANT_DIR/best_by_formant.pt"
   elif [[ -f "$BYPASS_FORMANT_DIR/baseline_init.pt" ]]; then
@@ -201,7 +211,9 @@ if [[ "$START_PHASE" == "bypass_stage1" ]]; then
   run_stage "A2 bypass-RVQ GAN" 29512 "$PWD/logs/bypass-gan-$BASE.log" 0 \
     --stage gan_pretrain --results-dir "$BYPASS_S2_DIR" \
     --init-checkpoint "$BYPASS_FORMANT_CKPT" --num-train-steps "$BYPASS_STAGE2_STEPS" \
-    --bypass-rvq-during-training "${GAN_LOSSES[@]}" "${COMMON[@]}" --no-resume
+    --bypass-rvq-during-training \
+    --preceding-context-seconds "$PRECEDING_CONTEXT_SECONDS" \
+    "${GAN_LOSSES[@]}" "${COMMON[@]}" --no-resume
   BYPASS_S2_CKPT="$(pick_best "$BYPASS_S2_DIR")"
   echo "A2 checkpoint=$BYPASS_S2_CKPT"
 else

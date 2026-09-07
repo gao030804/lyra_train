@@ -67,6 +67,15 @@ def test_stage1_formant_training_schedule():
     assert stage1["stft_recon_loss_weight"] == pytest.approx(0.05)
     assert stage1["stft_recon_loss_start_steps"] == 5_000
     assert stage1["stft_recon_loss_warmup_steps"] == 15_000
+    assert stage1["si_sdr_loss_weight"] == pytest.approx(0.07)
+    assert stage1["si_sdr_loss_start_steps"] == 15_000
+    assert stage1["si_sdr_loss_warmup_steps"] == 15_000
+
+    launcher = (ROOT / "run_bypass_rvq_stage1_stage2.sh").read_text(
+        encoding="utf-8"
+    )
+    assert 'BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS="${BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS:-60000}"' in launcher
+    assert '--early-stopping-min-steps "$BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS"' in launcher
     assert stage1["voiced_highband_loss_weight"] == pytest.approx(0.04)
     assert stage1["upper_highband_loss_weight"] == pytest.approx(0.0025)
 

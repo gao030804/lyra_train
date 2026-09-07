@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 
 from audiolm_pytorch.soundstream import canonicalize_waveform_pair
+from audiolm_pytorch.trainer import SoundStreamTrainer
 
 
 def test_waveform_pair_adds_missing_channel_dimension_without_broadcasting():
@@ -30,3 +31,18 @@ def test_waveform_pair_accepts_unbatched_audio():
     aligned_target, aligned_recon = canonicalize_waveform_pair(target, recon)
 
     assert aligned_target.shape == aligned_recon.shape == (1, 1, 8)
+
+
+def test_lag_alignment_reports_inverted_waveform_instead_of_hiding_polarity():
+    trainer = SoundStreamTrainer.__new__(SoundStreamTrainer)
+    target = torch.sin(torch.linspace(0, 20, 2048)).unsqueeze(0)
+    recon = -target
+
+    correlation, _ = trainer.lag_aligned_reconstruction_metrics(
+        target,
+        recon,
+        max_lag_samples=64,
+    )
+
+    assert correlation.item() < -0.99
+    assert trainer._last_alignment_metrics["alignment_negative_fraction"] == 1.0

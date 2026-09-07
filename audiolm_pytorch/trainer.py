@@ -698,6 +698,7 @@ class SoundStreamTrainer(nn.Module):
         self.quality_retention_rvq_bad_evals = 0
         self.stage1_rvq_retention_patience = stage1_rvq_retention_patience
         self.stage1_rvq_bad_evals = 0
+        self.stage1_polarity_bad_evals = 0
         self.stft_saturation_history = deque(maxlen = 1000)
         self.waveform_grad_clip_histories = {
             float(scale): deque(maxlen = 1000)
@@ -1043,7 +1044,9 @@ class SoundStreamTrainer(nn.Module):
                 seq_len_multiple_of = soundstream.seq_len_multiple_of,
                 max_files = dataset_max_files,
                 fixed_crop = dataset_fixed_crop,
-                min_rms_db = dataset_min_rms_db
+                min_rms_db = dataset_min_rms_db,
+                minimum_length = data_max_length if context_samples else None,
+                deterministic_crop_seed = random_split_seed
             )
 
             assert len(dataset) >= batch_size, 'dataset must have sufficient samples for training'
@@ -1145,6 +1148,17 @@ class SoundStreamTrainer(nn.Module):
                 if exists(self.test_dataset):
                     if not split_by_speaker:
                         split_msg += f'; holding out {len(self.test_dataset)} test samples'
+
+                # Keep held-out boundaries stable across evaluations while
+                # leaving training crops random. This makes context and target
+                # windows repeatable when comparing checkpoints.
+                if isinstance(val_dataset, Subset):
+                    base_dataset = val_dataset.dataset
+                    if hasattr(base_dataset, 'deterministic_crop_indices'):
+                        fixed_indices = set(map(int, val_dataset.indices))
+                        if exists(self.test_dataset) and isinstance(self.test_dataset, Subset):
+                            fixed_indices.update(map(int, self.test_dataset.indices))
+                        base_dataset.deterministic_crop_indices = fixed_indices
 
                 self.print(split_msg)
             else:
@@ -1444,6 +1458,7 @@ class SoundStreamTrainer(nn.Module):
             quality_retention_bad_evals = self.quality_retention_bad_evals,
             quality_retention_rvq_bad_evals = self.quality_retention_rvq_bad_evals,
             stage1_rvq_bad_evals = self.stage1_rvq_bad_evals,
+            stage1_polarity_bad_evals = self.stage1_polarity_bad_evals,
             trainer_step = trainer_step,
             version = __version__
         )
@@ -1854,7 +1869,11 @@ class SoundStreamTrainer(nn.Module):
             recon = model(wave, return_recons_only = True)
             _, indices, commitment_loss = model(wave, return_encoded = True)
 
-        metrics = self.reconstruction_metrics(model, wave, recon)
+        context_samples = int(getattr(model, 'training_context_samples', 0))
+        metric_wave = wave[..., context_samples:] if context_samples else wave
+        metric_recon = recon[..., context_samples:] if context_samples else recon
+        metrics = self.reconstruction_metrics(model, metric_wave, metric_recon)
+        metrics['evaluation_context_samples'] = float(context_samples)
         metrics['commitment_loss'] = float(commitment_loss.sum().detach().cpu())
         return metrics, self.codebook_counts(model, indices)
 
@@ -2328,6 +2347,7 @@ class SoundStreamTrainer(nn.Module):
             si_sdr = float(si_sdr.detach().cpu()),
             aligned_correlation = float(aligned_correlation.detach().cpu()),
             aligned_si_sdr = float(aligned_si_sdr.detach().cpu()),
+            **getattr(self, '_last_alignment_metrics', {}),
             frame_diagnostic_valid = float(frame_diagnostic_valid.detach().cpu()),
             ac_319 = float(ac_319.detach().cpu()),
             ac_320 = float(ac_320.detach().cpu()),
@@ -2367,7 +2387,14 @@ class SoundStreamTrainer(nn.Module):
             cross_correlation[..., -max_lag_samples:],
             cross_correlation[..., :max_lag_samples + 1]
         ), dim = -1)
-        best_lags = lag_window.argmax(dim = -1) - max_lag_samples
+        best_indices = lag_window.abs().argmax(dim = -1)
+        best_lags = best_indices - max_lag_samples
+        peaks = lag_window.gather(-1, best_indices.unsqueeze(-1)).squeeze(-1)
+        self._last_alignment_metrics = {
+            'alignment_negative_fraction': float((peaks < 0).float().mean().cpu()),
+            'alignment_lag_samples': float(best_lags.float().mean().cpu()),
+            'alignment_abs_lag_samples': float(best_lags.abs().float().mean().cpu()),
+        }
 
         correlations = []
         si_sdrs = []
@@ -3010,6 +3037,7 @@ class SoundStreamTrainer(nn.Module):
 
         return (
             metrics.get('aligned_si_sdr', float('-inf')) >= self.clean_gate_min_aligned_si_sdr and
+            metrics.get('alignment_negative_fraction', 0.) <= 0.01 and
             metrics.get('aligned_correlation', float('-inf')) >= self.clean_gate_min_aligned_corr and
             self.clean_gate_min_rms_ratio <= metrics.get('rms_ratio', float('inf')) <= self.clean_gate_max_rms_ratio and
             metrics.get('recon_peak', float('inf')) <= self.clean_gate_max_recon_peak and
@@ -3027,6 +3055,8 @@ class SoundStreamTrainer(nn.Module):
 
         if metrics.get('aligned_si_sdr', float('-inf')) < self.clean_gate_min_aligned_si_sdr:
             reasons.append('aligned_si_sdr')
+        if metrics.get('alignment_negative_fraction', 0.) > 0.01:
+            reasons.append('negative_polarity')
 
         if metrics.get('aligned_correlation', float('-inf')) < self.clean_gate_min_aligned_corr:
             reasons.append('aligned_corr')
@@ -3816,6 +3846,9 @@ class SoundStreamTrainer(nn.Module):
         self.quality_retention_bad_evals = pkg.get('quality_retention_bad_evals', 0)
         self.quality_retention_rvq_bad_evals = pkg.get('quality_retention_rvq_bad_evals', 0)
         self.stage1_rvq_bad_evals = pkg.get('stage1_rvq_bad_evals', 0)
+        self.stage1_polarity_bad_evals = pkg.get(
+            'stage1_polarity_bad_evals', 0
+        )
 
         if not discriminator_reinitialized:
             for key, _ in self.multiscale_discriminator_iter():
@@ -4786,6 +4819,11 @@ class SoundStreamTrainer(nn.Module):
 
         steps = int(self.steps.item())
         log_losses = self.log_losses_every > 0 and not (steps % self.log_losses_every)
+        if self.best_checkpoint_metric == 'recon_pretrain':
+            self.unwrapped_soundstream.correlation_loss_weight = (
+                0.20 if steps < 10000 else 0.15 if steps < 20000
+                else 0.10 if steps < 40000 else 0.05
+            )
         gan_progress = self.update_gan_weights(steps)
         si_sdr_loss_progress = self.update_si_sdr_loss_weight(steps)
         spectral_envelope_loss_progress = self.update_spectral_envelope_loss_weight(steps)
@@ -4959,6 +4997,10 @@ class SoundStreamTrainer(nn.Module):
                             runtime_model.voiced_highband_loss_weight
                         ),
                         'si_sdr': si_sdr_loss * runtime_model.si_sdr_loss_weight,
+                        'correlation': (
+                            correlation_loss *
+                            runtime_model.correlation_loss_weight
+                        ),
                     }
                     for formant_name in ('f1', 'f2', 'f3'):
                         component = formant_diagnostics.get(
@@ -5174,7 +5216,11 @@ class SoundStreamTrainer(nn.Module):
                 f"voiced={logs['formant_voiced_fraction']:.3f},"
                 f"f1={logs['formant_f1_mae_hz']:.1f}Hz,"
                 f"f2={logs['formant_f2_mae_hz']:.1f}Hz,"
-                f"f3={logs['formant_f3_mae_hz']:.1f}Hz]"
+                f"f3={logs['formant_f3_mae_hz']:.1f}Hz,"
+                "valid="
+                f"{logs['formant_f1_valid_fraction']:.2f}/"
+                f"{logs['formant_f2_valid_fraction']:.2f}/"
+                f"{logs['formant_f3_valid_fraction']:.2f}]"
             )
 
         if hasattr(model, 'boundary_loss_weight'):
@@ -5233,6 +5279,7 @@ class SoundStreamTrainer(nn.Module):
                 f"f3={logs.get('grad_formant_f3', 0.):.5f},"
                 f"hf={logs.get('grad_voiced_highband', 0.):.5f},"
                 f"sisdr={logs.get('grad_si_sdr', 0.):.5f},"
+                f"corr={logs.get('grad_correlation', 0.):.5f},"
                 f"formant_ratio={(logs.get('grad_formant_env', 0.) + logs.get('grad_formant_peak', 0.)) / total_grad:.4f}]"
             )
 
@@ -5735,6 +5782,8 @@ class SoundStreamTrainer(nn.Module):
                 f"online_stream_consistency="
                 f"{online_score.get('stream_consistency_loss', 0.):.6f}, "
                 f"online_corr={online_score['correlation']:.3f}, "
+                f"negative_polarity={online_score.get('alignment_negative_fraction', 0.):.3f}, "
+                f"abs_lag_samples={online_score.get('alignment_abs_lag_samples', 0.):.2f}, "
                 f"online_si_sdr={online_score['si_sdr']:.3f}, "
                 f"online_aligned_corr={online_score['aligned_correlation']:.3f}, "
                 f"online_aligned_si_sdr={online_score['aligned_si_sdr']:.3f}, "
@@ -5880,6 +5929,32 @@ class SoundStreamTrainer(nn.Module):
                         f"{steps}: Stage-1 RVQ protective hard stop triggered; "
                         "use the saved gated best or raw-online diagnostic best, "
                         "not latest.pt, for reconstruction."
+                    )
+
+            if self.best_checkpoint_metric == 'recon_pretrain' and steps >= 5000:
+                # Absolute-lag peak signs are unstable while reconstruction is
+                # still nearly uncorrelated. They remain a checkpoint gate and
+                # diagnostic, but only sustained *raw signed correlation*
+                # proves that the network has learned the wrong polarity.
+                polarity_bad = online_score.get('correlation', 0.) < -0.10
+                self.stage1_polarity_bad_evals = (
+                    self.stage1_polarity_bad_evals + 1 if polarity_bad else 0
+                )
+                if polarity_bad:
+                    self.print(
+                        f"{steps}: Stage-1 polarity protection "
+                        f"{self.stage1_polarity_bad_evals}/3 "
+                        f"(corr={online_score.get('correlation', 0.):+.3f}, "
+                        "negative_fraction="
+                        f"{online_score.get('alignment_negative_fraction', 0.):.3f})"
+                    )
+                if self.stage1_polarity_bad_evals >= 3:
+                    self.early_stopping_triggered = True
+                    self.save(str(self.results_folder / 'latest.pt'))
+                    self.print(
+                        f"{steps}: Stage-1 polarity hard stop triggered after "
+                        "three consecutive validation failures. Do not use "
+                        "latest.pt as a qualified reconstruction checkpoint."
                     )
 
             if self.quality_retention_gate and steps >= self.quality_retention_start_step:

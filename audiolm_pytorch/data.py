@@ -70,13 +70,47 @@ class SoundDataset(Dataset):
         seq_len_multiple_of: int | tuple[int | None, ...] | None = None,
         max_files: int | None = None,
         fixed_crop: bool = False,
-        min_rms_db: float | None = None
+        min_rms_db: float | None = None,
+        minimum_length: int | None = None,
+        deterministic_crop_seed: int = 0
     ):
         super().__init__()
         path = Path(folder)
         assert path.exists(), f'folder "{str(path)}" does not exist'
 
         files = sorted(file for ext in exts for file in path.glob(f'**/*.{ext}'))
+        if exists(minimum_length):
+            if minimum_length <= 0:
+                raise ValueError('minimum_length must be positive')
+
+            eligible_files = []
+            for file in files:
+                try:
+                    if sf is not None:
+                        info = sf.info(str(file))
+                        num_frames, sample_rate = info.frames, info.samplerate
+                    else:
+                        info = torchaudio.info(str(file))
+                        num_frames, sample_rate = info.num_frames, info.sample_rate
+                except Exception as exc:
+                    raise RuntimeError(
+                        f'cannot inspect audio duration for {file}'
+                    ) from exc
+
+                resampled_frames = round(
+                    num_frames * max(cast_tuple(target_sample_hz)) / sample_rate
+                )
+                if resampled_frames >= minimum_length:
+                    eligible_files.append(file)
+
+            removed = len(files) - len(eligible_files)
+            files = eligible_files
+            if removed:
+                print(
+                    f'SoundDataset: excluded {removed} files shorter than '
+                    f'{minimum_length} target-rate samples; context is never '
+                    'right-padding disguised as real history.'
+                )
         if exists(max_files):
             files = files[:max_files]
         assert len(files) > 0, 'no sound files found'
@@ -85,6 +119,8 @@ class SoundDataset(Dataset):
 
         self.max_length = max_length
         self.fixed_crop = fixed_crop
+        self.deterministic_crop_seed = int(deterministic_crop_seed)
+        self.deterministic_crop_indices = set()
         self.min_rms = (
             10 ** (min_rms_db / 20)
             if exists(min_rms_db)
@@ -149,7 +185,15 @@ class SoundDataset(Dataset):
                     # training sample.  Do not rank candidate windows by RMS:
                     # the codec must also model pauses, quiet speech, and the
                     # real background-noise distribution.
-                    start = torch.randint(0, max_start + 1, ()).item()
+                    if idx in self.deterministic_crop_indices:
+                        generator = torch.Generator().manual_seed(
+                            self.deterministic_crop_seed + int(idx)
+                        )
+                        start = torch.randint(
+                            0, max_start + 1, (), generator = generator
+                        ).item()
+                    else:
+                        start = torch.randint(0, max_start + 1, ()).item()
                     data = data[:, start:start + max_length]
             else:
                 data = F.pad(data, (0, max_length - audio_length), 'constant')

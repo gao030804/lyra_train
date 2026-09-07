@@ -61,6 +61,34 @@ def default(val, d):
 def cast_tuple(t, l = 1):
     return ((t,) * l) if not isinstance(t, tuple) else t
 
+def canonicalize_waveform_pair(target, recon):
+    """Return two ``[batch, channels, samples]`` tensors without broadcasting.
+
+    Dataset batches are commonly ``[batch, samples]`` while codec outputs are
+    ``[batch, 1, samples]``.  Explicitly insert missing batch/channel axes and
+    reject every remaining mismatch; silent PyTorch broadcasting here can mix
+    samples across the batch and corrupt waveform-direction supervision.
+    """
+    def canonicalize(wave, name):
+        if wave.ndim == 1:
+            return wave.unsqueeze(0).unsqueeze(0)
+        if wave.ndim == 2:
+            return wave.unsqueeze(1)
+        if wave.ndim == 3:
+            return wave
+        raise ValueError(
+            f'{name} waveform must have 1, 2, or 3 dimensions, got {wave.ndim}'
+        )
+
+    target = canonicalize(target, 'target')
+    recon = canonicalize(recon, 'reconstruction')
+    if target.shape != recon.shape:
+        raise ValueError(
+            'target and reconstruction waveform shapes must match after '
+            f'canonicalization, got {tuple(target.shape)} and {tuple(recon.shape)}'
+        )
+    return target, recon
+
 def filter_by_keys(fn, d):
     return {k: v for k, v in d.items() if fn(k)}
 
@@ -1668,6 +1696,7 @@ class SoundStream(Module):
         )
 
     def reconstruction_losses(self, target, recon):
+        target, recon = canonicalize_waveform_pair(target, recon)
         wave_l1 = F.l1_loss(recon, target)
         wave_mse = F.mse_loss(recon, target)
         target_rms = target.square().mean(dim = -1).clamp_min(1e-8).sqrt()
@@ -2051,12 +2080,21 @@ class SoundStream(Module):
         # Stage 1 of direct F1/F2/F3 supervision is always-on diagnostics.
         # Stage 2 is activated only when formant_peak_loss_weight is ramped by
         # the trainer.  Target peaks and confidence masks are detached.
+        # Training uses wider target-only confidence masks to cover weak but
+        # valid F2/F3 frames. Evaluation retains the stricter legacy masks, so
+        # checkpoint comparisons do not improve merely by changing coverage.
+        if self.training:
+            f2_confidence = (0.12, -9.0)
+            f3_confidence = (0.16, -15.0)
+        else:
+            f2_confidence = (0.16, -6.0)
+            f3_confidence = (0.22, -12.0)
         formant_bands = (
             # name, minimum Hz, maximum Hz, runtime weight, prominence floor,
             # minimum target-band energy relative to the full voice band.
             ('f1', 200., 1000., self.formant_peak_f1_weight, 0.12, -2.5),
-            ('f2', 1000., 2500., self.formant_peak_f2_weight, 0.16, -6.0),
-            ('f3', 2500., 4500., self.formant_peak_f3_weight, 0.22, -12.0),
+            ('f2', 1000., 2500., self.formant_peak_f2_weight, *f2_confidence),
+            ('f3', 2500., 4500., self.formant_peak_f3_weight, *f3_confidence),
         )
         peak_loss_terms = []
         peak_weights = []

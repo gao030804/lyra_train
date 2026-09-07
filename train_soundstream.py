@@ -118,7 +118,7 @@ STAGE_DEFAULTS = {
         stft_recon_loss_start_steps=5_000,
         stft_recon_loss_warmup_steps=15_000,
         si_sdr_loss_weight=0.07,
-        si_sdr_loss_start_steps=5_000,
+        si_sdr_loss_start_steps=15_000,
         si_sdr_loss_warmup_steps=15_000,
         gan_start=0, gan_ramp=0,
         gan_adversarial_max=0., gan_feature_max=0.,
@@ -3225,7 +3225,8 @@ def main() -> None:
         )
     print(
         "Signed correlation loss weight: "
-        f"{correlation_loss_weight}"
+        f"{correlation_loss_weight} configured; Stage-1 runtime schedule="
+        "0.20(<10k)/0.15(<20k)/0.10(<40k)/0.05(>=40k)"
     )
     print(
         "Waveform reconstruction loss weight: "
@@ -3246,7 +3247,8 @@ def main() -> None:
     print(
         "Per-loss decoder gradient diagnostics: "
         f"every={args.loss_grad_diagnostics_every} step(s) "
-        "(wave/mel/MR-STFT/envelope/formant-peak/voiced-highband/SI-SDR; 0 disables)"
+        "(wave/mel/MR-STFT/envelope/formant-peak/voiced-highband/"
+        "SI-SDR/signed-correlation; 0 disables)"
     )
     if args.stage == "recon_pretrain":
         print(
