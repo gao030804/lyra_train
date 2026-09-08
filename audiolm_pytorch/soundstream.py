@@ -956,6 +956,8 @@ class SoundStream(Module):
         use_finite_scalar_quantizer = False,            # proposed in https://arxiv.org/abs/2309.15505, adapted for residual quantization
         input_channels = 1,
         discr_multi_scales = (1, 0.5, 0.25),
+        generator_waveform_discr_loss_weights = (1., 1., 1.),
+        generator_stft_discr_loss_weight = 1.,
         stft_normalized = False,
         enc_cycle_dilations = (1, 3, 9),
         encoder_depthwise_separable_blocks = (),
@@ -990,6 +992,7 @@ class SoundStream(Module):
         voiced_hf_retention_margin_db = 0.50,
         si_sdr_loss_weight = 0.,
         correlation_loss_weight = 0.,
+        wave_mse_loss_weight = 0.3,
         energy_loss_weight = 0.1,
         click_loss_weight = 0.,
         jump_loss_weight = 0.,
@@ -1294,6 +1297,20 @@ class SoundStream(Module):
 
         self.discr_multi_scales = discr_multi_scales
         self.discriminators = ModuleList([MultiScaleDiscriminator() for _ in range(len(discr_multi_scales))])
+        if len(generator_waveform_discr_loss_weights) != len(discr_multi_scales):
+            raise ValueError(
+                'generator waveform discriminator weights must match scales'
+            )
+        if any(weight < 0 for weight in generator_waveform_discr_loss_weights):
+            raise ValueError('generator discriminator weights must be non-negative')
+        if generator_stft_discr_loss_weight < 0:
+            raise ValueError('generator STFT discriminator weight must be non-negative')
+        self.generator_waveform_discr_loss_weights = tuple(
+            float(weight) for weight in generator_waveform_discr_loss_weights
+        )
+        self.generator_stft_discr_loss_weight = float(
+            generator_stft_discr_loss_weight
+        )
         discr_rel_factors = [int(s1 / s2) for s1, s2 in zip(discr_multi_scales[:-1], discr_multi_scales[1:])]
         self.downsamples = ModuleList([nn.Identity()] + [nn.AvgPool1d(2 * factor, stride = factor, padding = factor) for factor in discr_rel_factors])
 
@@ -1515,6 +1532,7 @@ class SoundStream(Module):
         )
         self.si_sdr_loss_weight = si_sdr_loss_weight
         self.correlation_loss_weight = correlation_loss_weight
+        self.wave_mse_loss_weight = wave_mse_loss_weight
         self.energy_loss_weight = energy_loss_weight
         self.click_loss_weight = click_loss_weight
         self.jump_loss_weight = jump_loss_weight
@@ -1714,7 +1732,7 @@ class SoundStream(Module):
         correlation_loss = (1. - signed_correlation).mean()
         wave_loss = (
             wave_l1 +
-            0.3 * wave_mse +
+            self.wave_mse_loss_weight * wave_mse +
             self.energy_loss_weight * energy_loss
         )
 
@@ -2083,25 +2101,23 @@ class SoundStream(Module):
         # Training uses wider target-only confidence masks to cover weak but
         # valid F2/F3 frames. Evaluation retains the stricter legacy masks, so
         # checkpoint comparisons do not improve merely by changing coverage.
-        if self.training:
-            f2_confidence = (0.12, -9.0)
-            f3_confidence = (0.16, -15.0)
-        else:
-            f2_confidence = (0.16, -6.0)
-            f3_confidence = (0.22, -12.0)
         formant_bands = (
-            # name, minimum Hz, maximum Hz, runtime weight, prominence floor,
-            # minimum target-band energy relative to the full voice band.
-            ('f1', 200., 1000., self.formant_peak_f1_weight, 0.12, -2.5),
-            ('f2', 1000., 2500., self.formant_peak_f2_weight, *f2_confidence),
-            ('f3', 2500., 4500., self.formant_peak_f3_weight, *f3_confidence),
+            # name, band, runtime weight, train prominence/energy floors,
+            # fixed FORMANT_EVAL_MASK_V1 prominence/energy floors.
+            ('f1', 200., 1000., self.formant_peak_f1_weight,
+             0.12, -2.5, 0.12, -2.5),
+            ('f2', 1000., 2500., self.formant_peak_f2_weight,
+             0.12, -9.0, 0.16, -6.0),
+            ('f3', 2500., 4500., self.formant_peak_f3_weight,
+             0.16, -15.0, 0.22, -12.0),
         )
         peak_loss_terms = []
         peak_weights = []
         peak_diagnostics = {}
         for (
             name, minimum_hz, maximum_hz, formant_weight,
-            prominence_floor, relative_energy_floor_db
+            train_prominence_floor, train_energy_floor_db,
+            eval_prominence_floor, eval_energy_floor_db
         ) in formant_bands:
             band_mask = (
                 (voice_frequencies >= minimum_hz) &
@@ -2134,11 +2150,20 @@ class SoundStream(Module):
             # merely because the frame is voiced and F1 is prominent.  Both
             # tests are target-only, so the reconstruction cannot evade loss
             # by suppressing its own peak or band energy.
-            confidence = (
-                (prominence >= prominence_floor) &
-                (relative_band_energy_db >= relative_energy_floor_db) &
+            train_confidence = (
+                (prominence >= train_prominence_floor) &
+                (relative_band_energy_db >= train_energy_floor_db) &
                 voiced_mask
             )
+            # FORMANT_EVAL_MASK_V1 is deliberately invariant between train and
+            # eval modes so validation MAE remains comparable across mask
+            # experiments.  Only train_confidence can drive the A1.5 loss.
+            eval_confidence = (
+                (prominence >= eval_prominence_floor) &
+                (relative_band_energy_db >= eval_energy_floor_db) &
+                voiced_mask
+            )
+            confidence = train_confidence if self.training else eval_confidence
             confidence_weight = confidence.to(target_band.dtype)
             denominator = confidence_weight.sum().clamp_min(1.)
             position_error_hz = (recon_position - target_position).abs()
@@ -2162,10 +2187,22 @@ class SoundStream(Module):
                 position_error_hz * confidence_weight
             ).sum() / denominator
             peak_diagnostics[f'{name}_valid_fraction'] = confidence.float().mean()
+            for mask_name, diagnostic_confidence in (
+                ('trainmask', train_confidence),
+                ('evalmask', eval_confidence),
+            ):
+                diagnostic_weight = diagnostic_confidence.to(target_band.dtype)
+                diagnostic_denominator = diagnostic_weight.sum().clamp_min(1.)
+                peak_diagnostics[f'{name}_mae_{mask_name}_hz'] = (
+                    position_error_hz * diagnostic_weight
+                ).sum() / diagnostic_denominator
+                peak_diagnostics[f'{name}_valid_{mask_name}'] = (
+                    diagnostic_confidence.float().mean()
+                )
 
         peak_weight_sum = max(sum(peak_weights), 1e-8)
         formant_peak_loss = sum(peak_loss_terms) / peak_weight_sum
-        for name, _, _, formant_weight, _, _ in formant_bands:
+        for name, _, _, formant_weight, *_ in formant_bands:
             peak_diagnostics[f'{name}_weighted_loss'] = (
                 peak_diagnostics[f'{name}_loss'] *
                 (formant_weight / peak_weight_sum)
@@ -2938,11 +2975,14 @@ class SoundStream(Module):
         return preemph_loss, noise_floor_loss
 
     def generator_perceptual_losses(self, real, fake):
+        self._last_generator_perceptual_branch_losses = {}
         if self.adversarial_loss_weight <= 0 and self.feature_loss_weight <= 0:
             return self.zero, self.zero
 
         adversarial_losses = []
         discriminator_intermediates = []
+        branch_names = []
+        branch_weights = []
 
         (stft_real_logits, stft_real_intermediates), (
             stft_fake_logits,
@@ -2954,9 +2994,16 @@ class SoundStream(Module):
         discriminator_intermediates.append(
             (stft_real_intermediates, stft_fake_intermediates)
         )
+        branch_names.append('stft')
+        branch_weights.append(self.generator_stft_discr_loss_weight)
 
         scaled_real, scaled_fake = real, fake
-        for discr, downsample in zip(self.discriminators, self.downsamples):
+        for scale, discr, downsample, branch_weight in zip(
+            self.discr_multi_scales,
+            self.discriminators,
+            self.downsamples,
+            self.generator_waveform_discr_loss_weights,
+        ):
             scaled_real, scaled_fake = map(downsample, (scaled_real, scaled_fake))
             (real_logits, real_intermediates), (
                 fake_logits,
@@ -2967,6 +3014,8 @@ class SoundStream(Module):
             )
             discriminator_intermediates.append((real_intermediates, fake_intermediates))
             adversarial_losses.append(hinge_gen_loss(fake_logits))
+            branch_names.append(f'wave_{scale:g}')
+            branch_weights.append(branch_weight)
 
         per_discriminator_feature_losses = []
         for real_features, fake_features in discriminator_intermediates:
@@ -2983,9 +3032,35 @@ class SoundStream(Module):
                 torch.stack(layer_losses).mean()
             )
 
-        feature_loss = torch.stack(per_discriminator_feature_losses).mean()
-        adversarial_losses.append(hinge_gen_loss(stft_fake_logits))
-        adversarial_loss = torch.stack(adversarial_losses).mean()
+        # Intermediates are ordered STFT, then waveform scales.  Adversarial
+        # terms were accumulated waveform scales first, so align both lists to
+        # the common branch order before applying the normalized D-side weights.
+        adversarial_losses = [hinge_gen_loss(stft_fake_logits), *adversarial_losses]
+        total_branch_weight = max(sum(branch_weights), 1e-8)
+        weighted_adversarial_branches = [
+            loss * weight / total_branch_weight
+            for loss, weight in zip(adversarial_losses, branch_weights)
+        ]
+        weighted_feature_branches = [
+            loss * weight / total_branch_weight
+            for loss, weight in zip(per_discriminator_feature_losses, branch_weights)
+        ]
+        adversarial_loss = torch.stack(weighted_adversarial_branches).sum()
+        feature_loss = torch.stack(weighted_feature_branches).sum()
+        self._last_generator_perceptual_branch_losses = {
+            **{
+                f'adv_{name}': contribution
+                for name, contribution in zip(
+                    branch_names, weighted_adversarial_branches
+                )
+            },
+            **{
+                f'feature_{name}': contribution
+                for name, contribution in zip(
+                    branch_names, weighted_feature_branches
+                )
+            },
+        }
         return adversarial_loss, feature_loss
 
     def decode_from_codebook_indices(self, quantized_indices):
@@ -3587,6 +3662,39 @@ class FrameStreamingSoundStream(SoundStream):
             x = self.decoder_film(x, denoise_input)
         x = rearrange(x, 'b n c -> b c n')
         return self.decoder(x)
+
+    @torch.no_grad()
+    def encoder_stream_consistency_metrics(self, x):
+        """Compare full causal and persistent-state Encoder latent sequences."""
+        x, _ = self.process_input(x)
+        usable = (x.shape[-1] // self.stream_frame_size) * self.stream_frame_size
+        if usable <= 0:
+            return {}
+        x = x[..., :usable]
+        offline = rearrange(self.encoder(x), 'b c n -> b n c').float()
+        state = None
+        streamed = []
+        for frame in x.split(self.stream_frame_size, dim = -1):
+            latent, state = self.encode_frame_latent(frame, state = state)
+            streamed.append(latent.float())
+        streamed = torch.cat(streamed, dim = 1)
+        length = min(offline.shape[1], streamed.shape[1])
+        offline = offline[:, :length]
+        streamed = streamed[:, :length]
+        offline_rows = rearrange(offline, 'b n c -> (b n) c')
+        streamed_rows = rearrange(streamed, 'b n c -> (b n) c')
+        return {
+            'stream_encoder_latent_l1': float(
+                (streamed_rows - offline_rows).abs().mean().cpu()
+            ),
+            'stream_encoder_latent_cosine': float(F.cosine_similarity(
+                streamed_rows, offline_rows, dim = -1, eps = 1e-8
+            ).mean().cpu()),
+            'stream_encoder_latent_rms_ratio': float((
+                streamed_rows.square().mean().sqrt() /
+                offline_rows.square().mean().sqrt().clamp_min(1e-8)
+            ).cpu()),
+        }
 
     def stream_consistency_loss(
         self,

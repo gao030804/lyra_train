@@ -42,7 +42,7 @@ case "$STAGE2_ABLATION" in
     exit 2
     ;;
 esac
-STAGE2_GAN_FEATURE_MAX=1.5
+STAGE2_GAN_FEATURE_MAX=1.0
 # Production Decoder uses learned ConvTranspose1d, so no explicit latent-frame
 # interpolation smoothing is applied.  Linear/cubic interpolation remains an
 # opt-in compatibility/ablation path.
@@ -261,21 +261,21 @@ run_and_log "$STAGE1_LOG" "$RESUME_STAGE1" run_stage "Stage 1: recon_pretrain" 2
   --decoder-residual-scale-warmup-start-steps 0 \
   --decoder-residual-scale-warmup-end-steps 15000 \
   --si-sdr-loss-weight 0.07 \
-  --si-sdr-loss-start-steps 5000 \
+  --si-sdr-loss-start-steps 15000 \
   --si-sdr-loss-warmup-steps 15000 \
-  --spectral-envelope-loss-weight 0.08 \
-  --spectral-envelope-loss-start-steps 5000 \
-  --spectral-envelope-loss-warmup-steps 15000 \
-  --formant-peak-loss-weight 0.02 \
-  --formant-peak-loss-start-steps 15000 \
-  --formant-peak-loss-warmup-steps 20000 \
+  --spectral-envelope-loss-weight 0 \
+  --spectral-envelope-loss-start-steps 0 \
+  --spectral-envelope-loss-warmup-steps 0 \
+  --formant-peak-loss-weight 0 \
+  --formant-peak-loss-start-steps 0 \
+  --formant-peak-loss-warmup-steps 0 \
   --stft-recon-loss-weight 0.05 \
   --stft-recon-loss-start-steps 5000 \
   --stft-recon-loss-warmup-steps 15000 \
   --loss-grad-diagnostics-every 1000 \
-  --voiced-highband-loss-weight 0.04 \
-  --voiced-highband-loss-start-steps 5000 \
-  --voiced-highband-loss-warmup-steps 15000 \
+  --voiced-highband-loss-weight 0 \
+  --voiced-highband-loss-start-steps 0 \
+  --voiced-highband-loss-warmup-steps 0 \
   --voiced-highband-energy-deficit-weight 0.35 \
   --voiced-highband-energy-margin-db 0.10 \
   --stage1-plateau-lr \
@@ -393,27 +393,27 @@ run_stage "Stage 2: gan_pretrain" 29503 \
   --si-sdr-loss-weight 0.05 \
   --si-sdr-loss-start-steps 0 \
   --si-sdr-loss-warmup-steps 0 \
-  --spectral-envelope-loss-weight 0.05 \
-  --formant-peak-loss-weight 0.01 \
+  --spectral-envelope-loss-weight 0.02 \
+  --formant-peak-loss-weight 0 \
   --formant-peak-loss-start-steps 0 \
   --formant-peak-loss-warmup-steps 5000 \
   --loss-grad-diagnostics-every 1000 \
-  --voiced-highband-loss-weight 0.02 \
+  --voiced-highband-loss-weight 0 \
   --voiced-highband-energy-deficit-weight 0.40 \
   --voiced-highband-energy-margin-db 0.05 \
   --voiced-hf-retention-loss-weight 0.01 \
   --voiced-hf-retention-margin-db 0.50 \
   --voiced-highband-loss-start-steps 0 \
   --voiced-highband-loss-warmup-steps 0 \
-  --upper-highband-loss-weight 0.001 \
-  --upper-highband-energy-deficit-weight 0.20 \
+  --upper-highband-loss-weight 0 \
+  --upper-highband-energy-deficit-weight 0 \
   --upper-highband-energy-margin-db 0.50 \
   --upper-highband-loss-start-steps 1000 \
   --upper-highband-loss-warmup-steps 5000 \
-  --active-spectral-detail-loss-weight 0.01 \
   --active-spectral-detail-loss-start-steps 2000 \
   --active-spectral-detail-loss-warmup-steps 8000 \
-  --stage2-active-spectral-score-weight 0.05 \
+  --active-spectral-detail-loss-weight 0 \
+  --stage2-active-spectral-score-weight 0 \
   --noise-floor-loss-weight 0.03 \
   --click-loss-weight 0 \
   --jump-loss-weight 0 \
@@ -423,7 +423,7 @@ run_stage "Stage 2: gan_pretrain" 29503 \
   --stft-recon-loss-warmup-steps 8000 \
   --waveform-discr-lrs 5e-7 5e-7 2.5e-7 \
   --stft-discr-lr 2.5e-7 \
-  --waveform-discr-update-every 2 2 2 \
+  --waveform-discr-update-every 2 4 4 \
   --waveform-discr-loss-weights 1.0 0.25 0.25 \
   --stft-discr-update-every 4 \
   --stft-discr-loss-weight 0.5 \
@@ -431,13 +431,15 @@ run_stage "Stage 2: gan_pretrain" 29503 \
   --discr-max-grad-norm 1.0 \
   --stage2-generator-freeze-steps 2000 \
   --stage2-discriminator-start-steps 0 \
-  --stage2-unfreeze-encoder-rvq-step -1 \
+  --stage2-encoder-unfreeze-step 10000 \
+  --stage2-encoder-trainable-from-block 3 \
+  --stage2-encoder-lr 1e-7 \
   --stage2-generator-hold-steps 5000 \
   --stage2-generator-hold-lr 1e-7 \
-  --stage2-phase2-start-step 50000 \
-  --stage2-phase3-start-step 100000 \
-  --stage2-phase2-generator-lr 2e-7 \
-  --stage2-phase3-generator-lr 1e-7 \
+  --stage2-phase2-start-step 2000 \
+  --stage2-phase3-start-step 10000 \
+  --stage2-phase2-generator-lr 5e-7 \
+  --stage2-phase3-generator-lr 5e-7 \
   --stage2-phase3-gan-adversarial-max 1e-4 \
   --stage2-phase3-gan-feature-max 1.0 \
   --stage2-discriminator-hold-steps 0 \

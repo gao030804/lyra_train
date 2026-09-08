@@ -49,9 +49,10 @@ RECONSTRUCTION_STAGES = frozenset((
     "stream_finetune",
     "stream_finetune_long",
 ))
-# Stage 3 is deliberately reconstruction-only.  Stage 4 is the optional weak
-# streaming-GAN pass after stateful/offline consistency has been established.
-GAN_STAGES = frozenset(("gan_pretrain", "stream_finetune_long"))
+# Stateful alignment is deliberately reconstruction-only. Adversarial training
+# finishes in A2; neither the optional pre-RVQ nor final post-RVQ state pass
+# reopens the GAN objective.
+GAN_STAGES = frozenset(("gan_pretrain",))
 QUALITY_RETENTION_STAGES = frozenset((
     "spectral_refine",
     "gan_pretrain",
@@ -87,27 +88,22 @@ STAGE_DEFAULTS = {
         # transients.  Ramp it quickly enough to affect checkpoint selection.
         click_loss_weight=0.002, jump_loss_weight=0.,
         preemph_loss_weight=0., noise_floor_loss_weight=0.03,
+        wave_mse_loss_weight=0.10, energy_loss_weight=0.,
         transient_loss_warmup_steps=5_000,
-        # Dual-scale cepstral envelope: the fine branch is deliberately only
-        # slightly stronger than the coarse fallback, so narrow formant detail
-        # can improve without forcing an over-smoothed decoder spectrum.
-        spectral_envelope_loss_weight=0.08,
-        spectral_envelope_loss_start_steps=5_000,
-        spectral_envelope_loss_warmup_steps=15_000,
-        # Step 2 of formant learning.  Peak locations are diagnostic from the
-        # start, but receive gradients only after the envelope has stabilized.
-        formant_peak_loss_weight=0.02,
-        formant_peak_loss_start_steps=15_000,
-        formant_peak_loss_warmup_steps=20_000,
-        # The k4-online run retained a -2.2 dB voiced high-band deficit even
-        # though SI-SDR and frame leakage improved.  Give the speech-clarity
-        # band a little more influence without turning this into a broadband
-        # high-frequency boost.
-        voiced_highband_loss_weight=0.04,
-        # The 7-7.8 kHz band is otherwise outside the dedicated Stage-1
-        # objective.  Keep this target-active term two orders of magnitude
-        # below the main voiced-highband weight and share its ramp.
-        upper_highband_loss_weight=0.0025,
+        # A1 is deliberately limited to stable base reconstruction.  Envelope,
+        # formant and high-band objectives are measured during validation but
+        # receive no gradient until the dedicated A1.5 refinement pass.
+        spectral_envelope_loss_weight=0.,
+        spectral_envelope_loss_start_steps=0,
+        spectral_envelope_loss_warmup_steps=0,
+        # Peak locations remain diagnostic-only in A1.
+        formant_peak_loss_weight=0.,
+        formant_peak_loss_start_steps=0,
+        formant_peak_loss_warmup_steps=0,
+        # Speech-clarity and Nyquist-edge shaping belong to A1.5/A2, avoiding
+        # redundant spectral gradients in the base reconstruction stage.
+        voiced_highband_loss_weight=0.,
+        upper_highband_loss_weight=0.,
         upper_highband_energy_deficit_weight=0.,
         upper_highband_energy_margin_db=0.50,
         upper_highband_loss_start_steps=5_000,
@@ -134,6 +130,7 @@ STAGE_DEFAULTS = {
         use_ema=False,
         click_loss_weight=0., jump_loss_weight=0.,
         preemph_loss_weight=0., noise_floor_loss_weight=0.03,
+        wave_mse_loss_weight=0.10, energy_loss_weight=0.,
         transient_loss_warmup_steps=0,
         # The previous 0.12 envelope objective barely moved validation
         # formants while competing with waveform quality.  Keep it as a
@@ -173,9 +170,9 @@ STAGE_DEFAULTS = {
         early_stopping_min_delta=0.003,
         # Keep Stage-2 decoder updates smaller than discriminator updates so a
         # freshly initialized GAN cannot quickly displace the selected codec.
-        lr=5e-7, discr_lr=5e-7, stft_discr_lr=2.5e-7,
+        lr=5e-7, encoder_lr=1e-7, discr_lr=5e-7, stft_discr_lr=2.5e-7,
         waveform_discr_lrs=(5e-7, 5e-7, 2.5e-7),
-        waveform_discr_update_every=(2, 2, 2),
+        waveform_discr_update_every=(2, 4, 4),
         waveform_discr_loss_weights=(1.0, 0.25, 0.25),
         stft_discr_update_every=4,
         stft_discr_loss_weight=0.5,
@@ -185,36 +182,30 @@ STAGE_DEFAULTS = {
         click_loss_weight=0., jump_loss_weight=0.,
         preemph_loss_weight=0., noise_floor_loss_weight=0.03,
         transient_loss_warmup_steps=0,
-        spectral_envelope_loss_weight=0.05,
+        wave_mse_loss_weight=0.10, energy_loss_weight=0.,
+        spectral_envelope_loss_weight=0.02,
         spectral_envelope_loss_start_steps=0,
         spectral_envelope_loss_warmup_steps=0,
-        formant_peak_loss_weight=0.01,
+        formant_peak_loss_weight=0.,
         formant_peak_loss_start_steps=0,
         formant_peak_loss_warmup_steps=5_000,
-        # Preserve the deterministic clarity learned in Stage 1.  Stage 2 GAN
-        # gradients may add natural detail, but must not replace the paired
-        # voiced high-band objective entirely.
-        # Total voiced-band energy is already close to the target in the
-        # latest Stage-2 run.  Keep this as a retention term, but leave more
-        # room for the discriminators to recover fine harmonic texture.
-        voiced_highband_loss_weight=0.02,
+        # Let GAN branches choose high-band texture; retain only the one-sided
+        # energy-deficit guard so excess HF is never rewarded.
+        voiced_highband_loss_weight=0.,
         voiced_hf_retention_loss_weight=0.01,
         voiced_highband_loss_start_steps=0,
         voiced_highband_loss_warmup_steps=0,
-        # Recover target-supported 7-7.8 kHz detail without rewarding quiet
-        # broadband hiss.  Ramp this narrow-band term separately after the
-        # frozen-generator discriminator warmup.
-        upper_highband_loss_weight=0.001,
-        upper_highband_energy_deficit_weight=0.20,
+        # Nyquist-edge and broad active-spectrum objectives are disabled in
+        # the general GAN pass; they can be reintroduced only in a targeted
+        # diagnostic experiment.
+        upper_highband_loss_weight=0.,
+        upper_highband_energy_deficit_weight=0.,
         upper_highband_energy_margin_db=0.50,
-        upper_highband_loss_start_steps=1_000,
-        upper_highband_loss_warmup_steps=5_000,
-        # Broad-band detail correction is restricted to target-voiced,
-        # target-active bins. A small ramped MR-STFT anchor independently
-        # protects the Stage-1 harmonic structure during GAN refinement.
-        active_spectral_detail_loss_weight=0.01,
-        active_spectral_detail_loss_start_steps=2_000,
-        active_spectral_detail_loss_warmup_steps=8_000,
+        upper_highband_loss_start_steps=0,
+        upper_highband_loss_warmup_steps=0,
+        active_spectral_detail_loss_weight=0.,
+        active_spectral_detail_loss_start_steps=0,
+        active_spectral_detail_loss_warmup_steps=0,
         stft_recon_loss_weight=0.02,
         stft_recon_loss_start_steps=2_000,
         stft_recon_loss_warmup_steps=8_000,
@@ -234,12 +225,12 @@ STAGE_DEFAULTS = {
         # feature matching over a stronger adversarial term: it is the safer
         # route to natural detail without raising the learned noise floor.
         gan_start=2_000, gan_ramp=15_000,
-        gan_adversarial_max=2e-4, gan_feature_max=1.50,
+        gan_adversarial_max=2e-4, gan_feature_max=1.00,
     ),
     "stream_finetune": dict(
         steps=20_000, batch_size=4, segment_seconds=4.,
         save_every=1_000, eval_every=250, min_steps=5_000, patience=30,
-        lr=5e-7, discr_lr=5e-7, ema_beta=0.999,
+        lr=5e-7, encoder_lr=1e-7, discr_lr=None, ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
         use_ema=False,
         click_loss_weight=0., jump_loss_weight=0.,
@@ -264,9 +255,9 @@ STAGE_DEFAULTS = {
         gan_adversarial_max=0., gan_feature_max=0.,
     ),
     "stream_finetune_long": dict(
-        steps=20_000, batch_size=2, segment_seconds=4.,
+        steps=10_000, batch_size=2, segment_seconds=4.,
         save_every=1_000, eval_every=250, min_steps=5_000, patience=20,
-        lr=2.5e-7, discr_lr=5e-7, stft_discr_lr=2.5e-7, ema_beta=0.999,
+        lr=2e-7, discr_lr=None, stft_discr_lr=None, ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
         use_ema=False,
         click_loss_weight=0., jump_loss_weight=0.,
@@ -283,8 +274,8 @@ STAGE_DEFAULTS = {
         stream_consistency_loss_weight=0.10,
         stream_consistency_loss_start_steps=0,
         stream_consistency_loss_warmup_steps=0,
-        gan_start=1_000, gan_ramp=10_000,
-        gan_adversarial_max=5e-5, gan_feature_max=0.25,
+        gan_start=0, gan_ramp=0,
+        gan_adversarial_max=0., gan_feature_max=0.,
     ),
 }
 
@@ -1182,13 +1173,31 @@ def parse_args() -> argparse.Namespace:
         help="Independent gradient-norm clipping threshold for each discriminator branch.",
     )
     parser.add_argument(
+        "--stage2-encoder-unfreeze-step",
         "--stage2-unfreeze-encoder-rvq-step",
+        dest="stage2_unfreeze_encoder_rvq_step",
         type=int,
-        default=-1,
+        default=10_000,
         help=(
-            "Joint Encoder/RVQ unfreeze step in Stage 2; -1 keeps both frozen "
-            "for conservative decoder-only training and the 10k diagnostic."
+            "Unfreeze the selected Encoder tail at this Stage-2 step; -1 keeps "
+            "the entire Encoder frozen. RVQ remains frozen in either case. "
+            "The legacy option name is retained as an alias."
         ),
+    )
+    parser.add_argument(
+        "--stage2-encoder-trainable-from-block",
+        type=int,
+        default=3,
+        help=(
+            "Zero-based first trainable Encoder block after Stage-2 unfreeze. "
+            "The default 3 trains Block4 and the final latent convolution only."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-encoder-lr",
+        type=float,
+        default=1e-7,
+        help="Learning rate for the Stage-2 trainable Encoder tail.",
     )
     parser.add_argument(
         "--stage2-targeted-refine",
@@ -1331,25 +1340,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage2-phase2-start-step",
         type=int,
-        default=50_000,
-        help="Absolute Stage-2 step where the stable 2e-7 Decoder phase starts.",
+        default=2_000,
+        help="Absolute Stage-2 step where Decoder training starts.",
     )
     parser.add_argument(
         "--stage2-phase3-start-step",
         type=int,
-        default=100_000,
-        help="Absolute Stage-2 step where the 1e-7 perceptual-refinement phase starts.",
+        default=10_000,
+        help="Absolute Stage-2 step where the selected Encoder tail is released.",
     )
     parser.add_argument(
         "--stage2-phase2-generator-lr",
         type=float,
-        default=2e-7,
+        default=5e-7,
         help="Decoder LR from phase2-start through the start of phase 3.",
     )
     parser.add_argument(
         "--stage2-phase3-generator-lr",
         type=float,
-        default=1e-7,
+        default=5e-7,
         help="Decoder LR from phase3-start through the end of Stage 2.",
     )
     parser.add_argument(
@@ -1863,6 +1872,10 @@ def build_model(
     jump_loss_weight: float,
     preemph_loss_weight: float,
     noise_floor_loss_weight: float,
+    wave_mse_loss_weight: float,
+    energy_loss_weight: float,
+    generator_waveform_discr_loss_weights: tuple[float, ...],
+    generator_stft_discr_loss_weight: float,
     stft_recon_loss_weight: float,
     frame_phase_loss_weight: float,
     gan_adversarial_max: float,
@@ -1879,9 +1892,19 @@ def build_model(
     if sync_codebook is None:
         sync_codebook = int(os.environ.get("WORLD_SIZE", "1")) > 1
 
-    if stage in RECONSTRUCTION_STAGES:
+    if stage == "recon_pretrain":
         recon_loss_weight = 10.
         multi_spectral_recon_loss_weight = 1.1
+        correlation_loss_weight = 0.02
+    elif stage == "spectral_refine":
+        # Keep reconstruction objectives as anchors while allowing the
+        # formant/envelope objectives to drive the refinement pass.
+        recon_loss_weight = 5.
+        multi_spectral_recon_loss_weight = 0.8
+        correlation_loss_weight = 0.02
+    elif stage == "gan_pretrain":
+        recon_loss_weight = 5.
+        multi_spectral_recon_loss_weight = 0.7
         correlation_loss_weight = 0.02
     else:
         recon_loss_weight = 10. if stage == "overfit" else 1.
@@ -1904,6 +1927,10 @@ def build_model(
         use_local_attn=False,
         target_sample_hz=sample_rate,
         strides=strides,
+        generator_waveform_discr_loss_weights=(
+            generator_waveform_discr_loss_weights
+        ),
+        generator_stft_discr_loss_weight=generator_stft_discr_loss_weight,
         # Zero-based Encoder Block2/3/4.  The SoundStream constructor itself
         # defaults to the legacy full-convolution topology so old checkpoint
         # configs that predate this field still rebuild correctly.
@@ -1931,7 +1958,8 @@ def build_model(
         voiced_hf_retention_margin_db=voiced_hf_retention_margin_db,
         si_sdr_loss_weight=si_sdr_loss_weight,
         correlation_loss_weight=correlation_loss_weight,
-        energy_loss_weight=0.1,
+        wave_mse_loss_weight=wave_mse_loss_weight,
+        energy_loss_weight=energy_loss_weight,
         click_loss_weight=click_loss_weight,
         jump_loss_weight=jump_loss_weight,
         preemph_loss_weight=preemph_loss_weight,
@@ -2419,7 +2447,11 @@ def main() -> None:
     if args.clean_gate_max_click_excess < 0:
         raise ValueError("--clean-gate-max-click-excess cannot be negative.")
     if args.stage2_unfreeze_encoder_rvq_step < -1:
-        raise ValueError("--stage2-unfreeze-encoder-rvq-step must be -1 or non-negative.")
+        raise ValueError("--stage2-encoder-unfreeze-step must be -1 or non-negative.")
+    if not 0 <= args.stage2_encoder_trainable_from_block <= 3:
+        raise ValueError("--stage2-encoder-trainable-from-block must be in [0, 3].")
+    if args.stage2_encoder_lr <= 0.:
+        raise ValueError("--stage2-encoder-lr must be positive.")
     if args.stage2_generator_hold_steps < 0:
         raise ValueError("--stage2-generator-hold-steps cannot be negative.")
     if args.stage2_generator_hold_lr <= 0:
@@ -2755,6 +2787,8 @@ def main() -> None:
         if args.noise_floor_loss_weight is not None
         else stage_defaults.get("noise_floor_loss_weight", 0.)
     )
+    wave_mse_loss_weight = stage_defaults.get("wave_mse_loss_weight", 0.3)
+    energy_loss_weight = stage_defaults.get("energy_loss_weight", 0.1)
     spectral_envelope_loss_weight = (
         args.spectral_envelope_loss_weight
         if args.spectral_envelope_loss_weight is not None
@@ -2876,10 +2910,18 @@ def main() -> None:
         if args.frame_phase_loss_warmup_steps is not None
         else stage_defaults.get("frame_phase_loss_warmup_steps", 0)
     )
-    waveform_recon_loss_weight = 10.0 if args.stage in ("overfit", *RECONSTRUCTION_STAGES) else 1.0
-    multi_spectral_recon_loss_weight = 1.1 if args.stage in RECONSTRUCTION_STAGES else 0.7
+    waveform_recon_loss_weight = (
+        10.0 if args.stage in ("overfit", "recon_pretrain")
+        else 5.0 if args.stage in ("spectral_refine", "gan_pretrain")
+        else 1.0
+    )
+    multi_spectral_recon_loss_weight = (
+        1.1 if args.stage == "recon_pretrain"
+        else 0.8 if args.stage == "spectral_refine"
+        else 0.7
+    )
     correlation_loss_weight = (
-        0.02 if args.stage in RECONSTRUCTION_STAGES else 0.0
+        0.02 if args.stage in (*RECONSTRUCTION_STAGES, "gan_pretrain") else 0.0
     )
     decoder_residual_scale_start = args.decoder_residual_scale_start
     decoder_residual_scale_end = args.decoder_residual_scale_end
@@ -3045,11 +3087,16 @@ def main() -> None:
                 "Stage-2 retention phase: Generator frozen through step "
                 f"{args.stage2_generator_freeze_steps}; discriminator updates begin at step "
                 f"{args.stage2_discriminator_start_steps if args.stage2_discriminator_start_steps is not None else stage_defaults['gan_start']}. "
-                "Encoder and RVQ are "
+                "RVQ remains frozen throughout; Encoder is "
                 + (
                     "frozen throughout decoder-only training"
                     if args.stage2_unfreeze_encoder_rvq_step < 0
-                    else f"jointly frozen through step {args.stage2_unfreeze_encoder_rvq_step}"
+                    else (
+                        f"frozen through step {args.stage2_unfreeze_encoder_rvq_step}, "
+                        f"then Block{args.stage2_encoder_trainable_from_block + 1} "
+                        "through the final latent convolution train at "
+                        f"LR={args.stage2_encoder_lr:.3e}"
+                    )
                 )
                 + "; generator adversarial/feature losses begin after step "
                 f"{stage_defaults['gan_start']}; generator LR releases linearly from "
@@ -3070,7 +3117,9 @@ def main() -> None:
         if args.stage2_recon_transition_start_steps is None:
             print(
                 "Stage-2 reconstruction weights: fixed for the full run "
-                f"(wave=10.0, mel=1.1, SI-SDR={si_sdr_loss_weight:g}, "
+                f"(wave={waveform_recon_loss_weight:g}, "
+                f"mel={multi_spectral_recon_loss_weight:g}, "
+                f"SI-SDR={si_sdr_loss_weight:g}, "
                 f"corr=0.02, envelope={spectral_envelope_loss_weight:g}, "
                 f"voiced-highband={voiced_highband_loss_weight:g}, "
                 f"voiced-HF-retention={voiced_hf_retention_loss_weight:g}, "
@@ -3225,12 +3274,18 @@ def main() -> None:
         )
     print(
         "Signed correlation loss weight: "
-        f"{correlation_loss_weight} configured; Stage-1 runtime schedule="
-        "0.20(<10k)/0.15(<20k)/0.10(<40k)/0.05(>=40k)"
+        f"{correlation_loss_weight} configured; "
+        + (
+            "Stage-1 runtime schedule="
+            "0.20(<10k)/0.15(<20k)/0.10(<40k)/0.05(>=40k)"
+            if args.stage == "recon_pretrain"
+            else "fixed anchor for this stage"
+        )
     )
     print(
         "Waveform reconstruction loss weight: "
-        f"{waveform_recon_loss_weight}"
+        f"outer={waveform_recon_loss_weight}, L1=1, "
+        f"MSE={wave_mse_loss_weight}, energy={energy_loss_weight}"
     )
     print(
         "Mel reconstruction loss weight: "
@@ -3359,23 +3414,10 @@ def main() -> None:
     if args.stage in ("stream_finetune", "stream_finetune_long"):
         print("RVQ codebook training: frozen")
     elif args.stage == "gan_pretrain":
-        if args.stage2_unfreeze_encoder_rvq_step < 0:
-            print(
-                "RVQ codebook training: frozen throughout Stage 2 "
-                "(EMA statistics and dead-code replacement disabled)"
-            )
-        elif args.stage2_unfreeze_encoder_rvq_step == 0:
-            print(
-                "RVQ codebook training: enabled throughout Stage 2 "
-                "(including EMA statistics and dead-code replacement)"
-            )
-        else:
-            print(
-                "RVQ codebook training: frozen for steps [0, "
-                f"{args.stage2_unfreeze_encoder_rvq_step}), then enabled "
-                "jointly with the Encoder (including EMA statistics and "
-                "dead-code replacement)"
-            )
+        print(
+            "RVQ codebook training: frozen throughout Stage 2 "
+            "(EMA statistics and dead-code replacement disabled)"
+        )
     elif stage_defaults.get("freeze_codebook_after_step") is not None:
         print(
             "RVQ codebook training: enabled until step "
@@ -3388,6 +3430,19 @@ def main() -> None:
         print(
             f"Final test: continuous stateful full-file streaming, "
             f"{args.test_block_seconds:.1f} s metric blocks"
+        )
+        print(
+            "Stateful optimizer policy: "
+            + (
+                f"Encoder Block{args.stage2_encoder_trainable_from_block + 1} "
+                "and final latent convolution use LR=1e-7; Decoder uses "
+                f"LR={stage_defaults['lr']:.3e}; RVQ is bypassed/frozen"
+                if args.stage == "stream_finetune"
+                else (
+                    "Encoder and RVQ are frozen; Decoder-only LR="
+                    f"{stage_defaults['lr']:.3e}; GAN is disabled"
+                )
+            )
         )
     else:
         print(
@@ -3436,6 +3491,10 @@ def main() -> None:
         voiced_hf_retention_margin_db=args.voiced_hf_retention_margin_db,
         preemph_loss_weight=preemph_loss_weight,
         noise_floor_loss_weight=noise_floor_loss_weight,
+        wave_mse_loss_weight=wave_mse_loss_weight,
+        energy_loss_weight=energy_loss_weight,
+        generator_waveform_discr_loss_weights=waveform_discr_loss_weights,
+        generator_stft_discr_loss_weight=stft_discr_loss_weight,
         stft_recon_loss_weight=stft_recon_loss_weight,
         frame_phase_loss_weight=frame_phase_loss_weight,
         gan_adversarial_max=stage_defaults.get("gan_adversarial_max", 0.001),
@@ -3484,10 +3543,24 @@ def main() -> None:
 
     if args.stream_tbptt_frames < 0:
         raise ValueError('--stream-tbptt-frames must be non-negative')
-    if args.preceding_context_seconds and not args.bypass_rvq_during_training:
-        raise ValueError('Context training currently requires --bypass-rvq-during-training; RVQ burn-in updates are not yet isolated.')
+    if (
+        args.preceding_context_seconds and
+        not args.bypass_rvq_during_training and
+        args.stage not in ("stream_finetune", "stream_finetune_long")
+    ):
+        raise ValueError(
+            'Context training with an updating RVQ is not isolated. Use '
+            '--bypass-rvq-during-training, or a stream stage where RVQ is frozen.'
+        )
     soundstream.stream_tbptt_frames = args.stream_tbptt_frames
     print(f'Preceding real context: {args.preceding_context_seconds}s; target: {segment_seconds}s; TBPTT: {args.stream_tbptt_frames} frames')
+    if args.stage in RECONSTRUCTION_STAGES:
+        print(
+            "Training crop: uniform random continuous crop; validation/test "
+            "crop: deterministic by file index and split seed; A1/A1.5 use "
+            "ordinary causal forward with real preceding context, not "
+            "stateful-stream training."
+        )
     trainer = SoundStreamTrainer(
         soundstream,
         folder=str(audio_dir),
@@ -3500,20 +3573,41 @@ def main() -> None:
         num_train_steps=num_train_steps,
         rvq_calibration_only=args.rvq_calibration_only,
         lr=stage_defaults["lr"],
-        encoder_lr=stage_defaults.get("encoder_lr"),
+        encoder_lr=(
+            args.stage2_encoder_lr
+            if (
+                args.stage == "gan_pretrain" and
+                not args.stage2_targeted_refine and
+                args.stage2_unfreeze_encoder_rvq_step >= 0
+            )
+            else stage_defaults.get("encoder_lr")
+            if args.stage != "gan_pretrain" or args.stage2_targeted_refine
+            else None
+        ),
+        encoder_trainable_from_block=(
+            args.stage2_encoder_trainable_from_block
+            if (
+                (
+                    args.stage == "gan_pretrain" and
+                    not args.stage2_targeted_refine and
+                    args.stage2_unfreeze_encoder_rvq_step >= 0
+                ) or
+                args.stage == "stream_finetune"
+            )
+            else None
+        ),
         # EMA codebook updates do not require optimizer parameters. Keep RVQ
         # parameters out of Adam even in the midband mode; freeze_codebook=False
         # below is what enables EMA/dead-code state updates.
         exclude_rq_from_generator_optimizer=(
             args.bypass_rvq_during_training or
             args.stage2_targeted_refine or
-            (
-                args.stage == "gan_pretrain" and
-                args.stage2_unfreeze_encoder_rvq_step < 0
-            )
+            args.stage == "gan_pretrain" or
+            args.stage in ("stream_finetune", "stream_finetune_long")
         ),
         exclude_encoder_from_generator_optimizer=(
             stage25_decoder_only_refine or
+            args.stage == "stream_finetune_long" or
             (
                 args.stage == "gan_pretrain" and
                 args.stage2_unfreeze_encoder_rvq_step < 0 and
@@ -3908,18 +4002,11 @@ def main() -> None:
         quality_retention_rvq_patience=args.stage2_rvq_retention_patience,
         stage1_rvq_retention_patience=args.stage1_rvq_retention_patience,
         freeze_codebook_after_step=stage_defaults.get("freeze_codebook_after_step"),
-        freeze_codebook_before_step=(
-            args.stage2_unfreeze_encoder_rvq_step
-            if (
-                args.stage == "gan_pretrain" and
-                args.stage2_unfreeze_encoder_rvq_step >= 0
-            )
-            else None
-        ),
+        freeze_codebook_before_step=None,
         freeze_encoder_before_step=(
             num_train_steps + 1
             if (
-                args.stage in ("stream_finetune", "stream_finetune_long") or
+                args.stage == "stream_finetune_long" or
                 stage25_decoder_only_refine
             )
             else
@@ -3945,7 +4032,7 @@ def main() -> None:
             ) or
             (
                 args.stage == "gan_pretrain" and
-                args.stage2_unfreeze_encoder_rvq_step < 0
+                not args.stage2_targeted_refine
             )
         ),
         use_ema=use_ema,
@@ -4186,6 +4273,12 @@ def main() -> None:
             if trainer.use_ema:
                 trainer.copy_online_to_ema()
                 print("Synchronized EMA from initialized online weights.")
+            if args.stage == "gan_pretrain" and not args.stage2_targeted_refine:
+                trainer.capture_stage2_latent_reference()
+                print(
+                    "Captured the Stage-2 initialization Encoder as the latent "
+                    "drift reference (diagnostic only; no latent penalty)."
+                )
 
         print("Starting a new training run.")
 
@@ -4217,6 +4310,14 @@ def main() -> None:
             "formant_f1_valid_fraction",
             "formant_f2_valid_fraction",
             "formant_f3_valid_fraction",
+            "formant_f2_mae_trainmask_hz",
+            "formant_f2_valid_trainmask",
+            "formant_f2_mae_evalmask_hz",
+            "formant_f2_valid_evalmask",
+            "formant_f3_mae_trainmask_hz",
+            "formant_f3_valid_trainmask",
+            "formant_f3_mae_evalmask_hz",
+            "formant_f3_valid_evalmask",
             "stft_scale_512",
             "stft_scale_1024",
             "stft_scale_2048",
@@ -4579,6 +4680,9 @@ def main() -> None:
             'wave_mse',
             'boundary_loss',
             'stream_consistency_loss',
+            'stream_encoder_latent_l1',
+            'stream_encoder_latent_cosine',
+            'stream_encoder_latent_rms_ratio',
             'commitment_loss',
             'energy_loss',
             'rms_ratio',
@@ -4611,6 +4715,14 @@ def main() -> None:
             'formant_f1_valid_fraction',
             'formant_f2_valid_fraction',
             'formant_f3_valid_fraction',
+            'formant_f2_mae_trainmask_hz',
+            'formant_f2_valid_trainmask',
+            'formant_f2_mae_evalmask_hz',
+            'formant_f2_valid_evalmask',
+            'formant_f3_mae_trainmask_hz',
+            'formant_f3_valid_trainmask',
+            'formant_f3_mae_evalmask_hz',
+            'formant_f3_valid_evalmask',
             'voiced_highband_loss',
             'voiced_hf_energy_ratio_db',
             'voiced_hf_logmag_error',
@@ -4704,6 +4816,9 @@ def main() -> None:
                 f"mse={test_metrics['wave_mse']:.6f}, "
                 f"boundary={test_metrics['boundary_loss']:.6f}, "
                 f"stream_consistency={test_metrics['stream_consistency_loss']:.6f}, "
+                f"stream_encoder_l1={test_metrics['stream_encoder_latent_l1']:.6f}, "
+                f"stream_encoder_cos={test_metrics['stream_encoder_latent_cosine']:.6f}, "
+                f"stream_encoder_rms_ratio={test_metrics['stream_encoder_latent_rms_ratio']:.6f}, "
                 f"commitment={test_metrics['commitment_loss']:.6f}, "
                 f"energy={test_metrics['energy_loss']:.6f}, "
                 f"rms_ratio={test_metrics['rms_ratio']:.6f}, "

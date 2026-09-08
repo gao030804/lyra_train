@@ -37,7 +37,7 @@ from audiolm_pytorch.optimizer import get_optimizer, separate_weight_decayable_p
 import wandb
 from ema_pytorch import EMA
 
-from audiolm_pytorch.soundstream import SoundStream
+from audiolm_pytorch.soundstream import SoundStream, canonicalize_waveform_pair
 from audiolm_pytorch.encodec import EncodecWrapper
 
 try:
@@ -292,6 +292,7 @@ class SoundStreamTrainer(nn.Module):
         val_dataloader: DataLoader | None = None,
         lr: float = 2e-4,
         encoder_lr: float | None = None,
+        encoder_trainable_from_block: int | None = None,
         exclude_rq_from_generator_optimizer: bool = False,
         exclude_encoder_from_generator_optimizer: bool = False,
         exclude_first_decoder_block_from_generator_optimizer: bool = False,
@@ -719,6 +720,7 @@ class SoundStreamTrainer(nn.Module):
             "gradient_accum_every": grad_accum_every,
             "learning_rate": lr,
             "encoder_learning_rate": encoder_lr,
+            "encoder_trainable_from_block": encoder_trainable_from_block,
             "rq_excluded_from_generator_optimizer": exclude_rq_from_generator_optimizer,
             "encoder_excluded_from_generator_optimizer": (
                 exclude_encoder_from_generator_optimizer
@@ -741,6 +743,7 @@ class SoundStreamTrainer(nn.Module):
         self.encoder_excluded_from_generator_optimizer = bool(
             exclude_encoder_from_generator_optimizer
         )
+        self._stage2_latent_reference_encoder = None
         self.first_decoder_block_excluded_from_generator_optimizer = bool(
             exclude_first_decoder_block_from_generator_optimizer
         )
@@ -766,6 +769,40 @@ class SoundStreamTrainer(nn.Module):
             for module in encoder_modules
             for parameter in module.parameters()
         }
+        if exists(encoder_trainable_from_block) and not exclude_encoder_from_generator_optimizer:
+            encoder = soundstream.encoder
+            if not isinstance(encoder, nn.Sequential) or len(encoder) < 3:
+                raise RuntimeError(
+                    "Partial Encoder training requires encoder to be Sequential "
+                    "with initial convolution, blocks, and final convolution."
+                )
+            num_encoder_blocks = len(encoder) - 2
+            if not 0 <= encoder_trainable_from_block < num_encoder_blocks:
+                raise ValueError(
+                    "encoder_trainable_from_block must select an existing "
+                    f"Encoder block in [0, {num_encoder_blocks - 1}]"
+                )
+            first_trainable_module = 1 + encoder_trainable_from_block
+            frozen_encoder_modules = list(encoder.children())[:first_trainable_module]
+            frozen_encoder_modules.append(soundstream.encoder_film)
+            if exists(soundstream.encoder_attn):
+                frozen_encoder_modules.append(soundstream.encoder_attn)
+            for module in frozen_encoder_modules:
+                module.requires_grad_(False)
+            frozen_encoder_parameter_ids = {
+                id(parameter)
+                for module in frozen_encoder_modules
+                for parameter in module.parameters()
+            }
+            generator_parameters = [
+                parameter for parameter in generator_parameters
+                if id(parameter) not in frozen_encoder_parameter_ids
+            ]
+            encoder_parameter_ids = {
+                id(parameter)
+                for module in list(encoder.children())[first_trainable_module:]
+                for parameter in module.parameters()
+            }
         if exclude_encoder_from_generator_optimizer:
             for module in encoder_modules:
                 module.requires_grad_(False)
@@ -1919,6 +1956,7 @@ class SoundStreamTrainer(nn.Module):
         return averaged_metrics
 
     def reconstruction_metrics(self, model, target, recon):
+        target, recon = canonicalize_waveform_pair(target, recon)
         wave_l1 = F.l1_loss(recon, target)
         wave_mse = F.mse_loss(recon, target)
         target_rms = target.square().mean(dim = -1).clamp_min(1e-8).sqrt()
@@ -1927,6 +1965,7 @@ class SoundStreamTrainer(nn.Module):
         rms_ratio = (recon_rms / target_rms).mean()
         boundary_loss = target.new_tensor(0.)
         stream_consistency_loss = target.new_tensor(0.)
+        stream_encoder_metrics = {}
 
         # Validation-only 50 Hz / 320-sample leakage diagnostics.  These use
         # exactly the same full residual for every checkpoint candidate and do
@@ -2064,6 +2103,8 @@ class SoundStreamTrainer(nn.Module):
             boundary_loss = model.frame_boundary_loss(recon)
         if hasattr(model, 'stream_consistency_loss'):
             stream_consistency_loss = model.stream_consistency_loss(target, recon)
+        if hasattr(model, 'encoder_stream_consistency_metrics'):
+            stream_encoder_metrics = model.encoder_stream_consistency_metrics(target)
 
         min_mel_samples = max(
             transform.n_fft
@@ -2141,7 +2182,7 @@ class SoundStreamTrainer(nn.Module):
 
         wave_loss = (
             wave_l1 +
-            0.3 * wave_mse +
+            model.wave_mse_loss_weight * wave_mse +
             model.energy_loss_weight * energy_loss +
             (
                 model.correlation_loss_weight /
@@ -2238,6 +2279,30 @@ class SoundStreamTrainer(nn.Module):
             formant_f3_valid_fraction = float(
                 formant_diagnostics.get('f3_valid_fraction', model.zero).detach().cpu()
             ),
+            formant_f2_mae_trainmask_hz = float(
+                formant_diagnostics.get('f2_mae_trainmask_hz', model.zero).detach().cpu()
+            ),
+            formant_f2_valid_trainmask = float(
+                formant_diagnostics.get('f2_valid_trainmask', model.zero).detach().cpu()
+            ),
+            formant_f2_mae_evalmask_hz = float(
+                formant_diagnostics.get('f2_mae_evalmask_hz', model.zero).detach().cpu()
+            ),
+            formant_f2_valid_evalmask = float(
+                formant_diagnostics.get('f2_valid_evalmask', model.zero).detach().cpu()
+            ),
+            formant_f3_mae_trainmask_hz = float(
+                formant_diagnostics.get('f3_mae_trainmask_hz', model.zero).detach().cpu()
+            ),
+            formant_f3_valid_trainmask = float(
+                formant_diagnostics.get('f3_valid_trainmask', model.zero).detach().cpu()
+            ),
+            formant_f3_mae_evalmask_hz = float(
+                formant_diagnostics.get('f3_mae_evalmask_hz', model.zero).detach().cpu()
+            ),
+            formant_f3_valid_evalmask = float(
+                formant_diagnostics.get('f3_valid_evalmask', model.zero).detach().cpu()
+            ),
             stft_scale_256 = float(
                 stft_scale_diagnostics.get('256', model.zero).detach().cpu()
             ),
@@ -2321,6 +2386,15 @@ class SoundStreamTrainer(nn.Module):
             stream_consistency_loss = float(
                 stream_consistency_loss.detach().cpu()
             ),
+            stream_encoder_latent_l1 = stream_encoder_metrics.get(
+                'stream_encoder_latent_l1', 0.
+            ),
+            stream_encoder_latent_cosine = stream_encoder_metrics.get(
+                'stream_encoder_latent_cosine', 1.
+            ),
+            stream_encoder_latent_rms_ratio = stream_encoder_metrics.get(
+                'stream_encoder_latent_rms_ratio', 1.
+            ),
             energy_loss = float(energy_loss.detach().cpu()),
             rms_ratio = float(rms_ratio.detach().cpu()),
             target_peak = float(target_peak.detach().cpu()),
@@ -2395,7 +2469,6 @@ class SoundStreamTrainer(nn.Module):
             'alignment_lag_samples': float(best_lags.float().mean().cpu()),
             'alignment_abs_lag_samples': float(best_lags.abs().float().mean().cpu()),
         }
-
         correlations = []
         si_sdrs = []
         for row_index, lag_tensor in enumerate(best_lags):
@@ -3611,7 +3684,23 @@ class SoundStreamTrainer(nn.Module):
 
         self.plateau_scheduler._last_lr = list(optimizer_lrs)
 
-        self.optim.sync_warmup_lrs_from_optimizer()
+        if completed_step < self.generator_warmup_steps:
+            # The optimizer LR stored in an early checkpoint is the correctly
+            # dampened *instantaneous* LR (for example 4e-7 at step 0), not the
+            # undampened 2e-4 target.  Copying that value into warmup.lrs makes
+            # every subsequent dampening context compound from 4e-7 and leaves
+            # Stage-1 effectively frozen.  Preserve the configured base LR;
+            # the restored warmup.last_step still determines the next factor.
+            self.optim.warmup.lrs = list(self.generator_hold_base_lrs)
+            self.print(
+                'Preserved configured generator base LR while resuming inside '
+                f'warmup at step {completed_step}: '
+                f'instantaneous={optimizer_lrs}, base={list(self.generator_hold_base_lrs)}'
+            )
+        else:
+            # Once warmup is complete the optimizer LR is authoritative and
+            # may legitimately include a ReduceLROnPlateau reduction.
+            self.optim.sync_warmup_lrs_from_optimizer()
 
     def scale_discriminator_lrs_from_plateau(self, factor):
         """Apply a generator plateau reduction to every Stage-2 discriminator.
@@ -4671,6 +4760,48 @@ class SoundStreamTrainer(nn.Module):
             for parameter, requires_grad in zip(parameters, original_requires_grad):
                 parameter.requires_grad_(requires_grad)
 
+    @torch.no_grad()
+    def capture_stage2_latent_reference(self):
+        """Snapshot the initialized Encoder for diagnostic-only latent drift."""
+        reference = copy.deepcopy(self.unwrapped_soundstream.encoder)
+        reference.requires_grad_(False)
+        reference.eval()
+        reference.to(self.device)
+        # Bypass nn.Module.__setattr__ so this diagnostic copy is not included
+        # in trainer state or optimizer traversal.
+        object.__setattr__(self, '_stage2_latent_reference_encoder', reference)
+
+    @torch.no_grad()
+    def stage2_latent_drift_metrics(self, wave):
+        reference = self._stage2_latent_reference_encoder
+        if reference is None:
+            return {}
+        model = self.unwrapped_soundstream
+        encoder_input, _ = model.process_input(wave)
+        current = model.encoder(encoder_input).float()
+        baseline = reference(encoder_input).float()
+        current_rows = rearrange(current, 'b c n -> (b n) c')
+        baseline_rows = rearrange(baseline, 'b c n -> (b n) c')
+        current_rms = current_rows.square().mean().sqrt()
+        baseline_rms = baseline_rows.square().mean().sqrt()
+        return {
+            'latent_drift_l1': float((current_rows - baseline_rows).abs().mean().cpu()),
+            'latent_cosine': float(F.cosine_similarity(
+                current_rows, baseline_rows, dim = -1, eps = 1e-8
+            ).mean().cpu()),
+            'latent_current_rms': float(current_rms.cpu()),
+            'latent_reference_rms': float(baseline_rms.cpu()),
+            'latent_current_variance': float(current_rows.var(unbiased = False).cpu()),
+            'latent_reference_variance': float(baseline_rows.var(unbiased = False).cpu()),
+            'latent_per_dim_mean_delta': float((
+                current_rows.mean(dim = 0) - baseline_rows.mean(dim = 0)
+            ).abs().mean().cpu()),
+            'latent_per_dim_std_delta': float((
+                current_rows.std(dim = 0, unbiased = False) -
+                baseline_rows.std(dim = 0, unbiased = False)
+            ).abs().mean().cpu()),
+        }
+
     @contextmanager
     def frozen_decoder_stack(self):
         """Temporarily update Encoder/RVQ while keeping all Decoder modules fixed."""
@@ -4931,6 +5062,12 @@ class SoundStreamTrainer(nn.Module):
                     if is_streaming_model and len(loss_breakdown) > 16
                     else loss.new_zeros(())
                 )
+                if (
+                    self.gan_grad_diagnostics_every > 0 and
+                    not (steps % self.gan_grad_diagnostics_every) and
+                    i == 0
+                ):
+                    logs.update(self.stage2_latent_drift_metrics(wave))
                 upper_highband_index = 17 if is_streaming_model else 16
                 active_spectral_detail_index = (
                     18 if is_streaming_model else 17
@@ -4967,6 +5104,11 @@ class SoundStreamTrainer(nn.Module):
                 )
                 formant_diagnostics = getattr(
                     runtime_model, '_last_formant_metrics', {}
+                )
+                perceptual_branch_losses = getattr(
+                    runtime_model,
+                    '_last_generator_perceptual_branch_losses',
+                    {},
                 )
 
                 run_loss_grad_diagnostic = (
@@ -5050,6 +5192,17 @@ class SoundStreamTrainer(nn.Module):
                     logs['g_gan_to_reconstruction_grad_ratio'] = (
                         gan_grad_norm / max(reconstruction_grad_norm, 1e-12)
                     )
+                    for branch_name, branch_loss in perceptual_branch_losses.items():
+                        global_weight = (
+                            runtime_model.adversarial_loss_weight
+                            if branch_name.startswith('adv_')
+                            else runtime_model.feature_loss_weight
+                        )
+                        safe_name = branch_name.replace('.', 'p')
+                        logs[f'g_grad_{safe_name}'] = self.objective_grad_norm(
+                            branch_loss * global_weight,
+                            decoder_parameters,
+                        )
 
                 if not generator_frozen:
                     self.accelerator.backward(loss / self.grad_accum_every)
@@ -5105,6 +5258,12 @@ class SoundStreamTrainer(nn.Module):
             for name, value in formant_diagnostics.items():
                 accum_log(logs, {
                     f'formant_{name}': value.detach().item() / self.grad_accum_every
+                })
+            for name, value in perceptual_branch_losses.items():
+                accum_log(logs, {
+                    f'g_branch_{name.replace(".", "p")}': (
+                        value.detach().item() / self.grad_accum_every
+                    )
                 })
 
         if exists(self.max_grad_norm) and not generator_frozen:
@@ -5221,6 +5380,15 @@ class SoundStreamTrainer(nn.Module):
                 f"{logs['formant_f1_valid_fraction']:.2f}/"
                 f"{logs['formant_f2_valid_fraction']:.2f}/"
                 f"{logs['formant_f3_valid_fraction']:.2f}]"
+                " | formant_masks["
+                f"f2_train={logs.get('formant_f2_mae_trainmask_hz', 0.):.1f}Hz/"
+                f"{logs.get('formant_f2_valid_trainmask', 0.):.2f},"
+                f"f2_eval={logs.get('formant_f2_mae_evalmask_hz', 0.):.1f}Hz/"
+                f"{logs.get('formant_f2_valid_evalmask', 0.):.2f},"
+                f"f3_train={logs.get('formant_f3_mae_trainmask_hz', 0.):.1f}Hz/"
+                f"{logs.get('formant_f3_valid_trainmask', 0.):.2f},"
+                f"f3_eval={logs.get('formant_f3_mae_evalmask_hz', 0.):.1f}Hz/"
+                f"{logs.get('formant_f3_valid_evalmask', 0.):.2f}]"
             )
 
         if hasattr(model, 'boundary_loss_weight'):
@@ -5247,6 +5415,36 @@ class SoundStreamTrainer(nn.Module):
             f"lr_d_stft_next={stft_discriminator_lr:.3e} | "
             f"lr_d_wave_next={waveform_discriminator_lr:.3e}"
         )
+        branch_values = sorted(
+            (name.removeprefix('g_branch_'), value)
+            for name, value in logs.items()
+            if name.startswith('g_branch_')
+        )
+        if branch_values:
+            losses_str += " | g_branches[" + ",".join(
+                f"{name}={value:.6f}" for name, value in branch_values
+            ) + "]"
+        branch_grads = sorted(
+            (name.removeprefix('g_grad_'), value)
+            for name, value in logs.items()
+            if name.startswith('g_grad_')
+        )
+        if branch_grads:
+            losses_str += " | g_branch_grads[" + ",".join(
+                f"{name}={value:.5f}" for name, value in branch_grads
+            ) + "]"
+        if 'latent_drift_l1' in logs:
+            losses_str += (
+                " | latent_drift["
+                f"l1={logs['latent_drift_l1']:.6f},"
+                f"cos={logs['latent_cosine']:.6f},"
+                f"rms={logs['latent_current_rms']:.6f}/"
+                f"{logs['latent_reference_rms']:.6f},"
+                f"var={logs['latent_current_variance']:.6f}/"
+                f"{logs['latent_reference_variance']:.6f},"
+                f"mean_delta={logs['latent_per_dim_mean_delta']:.6f},"
+                f"std_delta={logs['latent_per_dim_std_delta']:.6f}]"
+            )
 
         if exists(self.stage2_phase2_start_step):
             stage2_phase = (
@@ -5781,6 +5979,12 @@ class SoundStreamTrainer(nn.Module):
                 f"online_boundary={online_score.get('boundary_loss', 0.):.6f}, "
                 f"online_stream_consistency="
                 f"{online_score.get('stream_consistency_loss', 0.):.6f}, "
+                f"online_stream_encoder_l1="
+                f"{online_score.get('stream_encoder_latent_l1', 0.):.6f}, "
+                f"online_stream_encoder_cos="
+                f"{online_score.get('stream_encoder_latent_cosine', 1.):.6f}, "
+                f"online_stream_encoder_rms_ratio="
+                f"{online_score.get('stream_encoder_latent_rms_ratio', 1.):.6f}, "
                 f"online_corr={online_score['correlation']:.3f}, "
                 f"negative_polarity={online_score.get('alignment_negative_fraction', 0.):.3f}, "
                 f"abs_lag_samples={online_score.get('alignment_abs_lag_samples', 0.):.2f}, "
@@ -5802,6 +6006,16 @@ class SoundStreamTrainer(nn.Module):
                 f"{online_score.get('formant_f1_valid_fraction', 0.):.2f}/"
                 f"{online_score.get('formant_f2_valid_fraction', 0.):.2f}/"
                 f"{online_score.get('formant_f3_valid_fraction', 0.):.2f}, "
+                "online_f2_masks="
+                f"train({online_score.get('formant_f2_mae_trainmask_hz', 0.):.1f}Hz/"
+                f"{online_score.get('formant_f2_valid_trainmask', 0.):.2f})/"
+                f"eval({online_score.get('formant_f2_mae_evalmask_hz', 0.):.1f}Hz/"
+                f"{online_score.get('formant_f2_valid_evalmask', 0.):.2f}), "
+                "online_f3_masks="
+                f"train({online_score.get('formant_f3_mae_trainmask_hz', 0.):.1f}Hz/"
+                f"{online_score.get('formant_f3_valid_trainmask', 0.):.2f})/"
+                f"eval({online_score.get('formant_f3_mae_evalmask_hz', 0.):.1f}Hz/"
+                f"{online_score.get('formant_f3_valid_evalmask', 0.):.2f}), "
                 f"online_stft_scales="
                 f"{online_score.get('stft_scale_64', 0.):.4f}/"
                 f"{online_score.get('stft_scale_128', 0.):.4f}/"
@@ -5931,30 +6145,29 @@ class SoundStreamTrainer(nn.Module):
                         "not latest.pt, for reconstruction."
                     )
 
-            if self.best_checkpoint_metric == 'recon_pretrain' and steps >= 5000:
-                # Absolute-lag peak signs are unstable while reconstruction is
-                # still nearly uncorrelated. They remain a checkpoint gate and
-                # diagnostic, but only sustained *raw signed correlation*
-                # proves that the network has learned the wrong polarity.
-                polarity_bad = online_score.get('correlation', 0.) < -0.10
-                self.stage1_polarity_bad_evals = (
-                    self.stage1_polarity_bad_evals + 1 if polarity_bad else 0
-                )
-                if polarity_bad:
+            if self.best_checkpoint_metric == 'recon_pretrain' and steps >= 10000:
+                # At 10k a negative raw correlation is a warning only.  At
+                # 20k the waveform direction should be established; remaining
+                # negative correlation is a fail-fast condition.
+                raw_correlation = online_score.get('correlation', 0.)
+                polarity_bad = raw_correlation < 0.
+                self.stage1_polarity_bad_evals = int(polarity_bad)
+                if polarity_bad and steps < 20000:
                     self.print(
-                        f"{steps}: Stage-1 polarity protection "
-                        f"{self.stage1_polarity_bad_evals}/3 "
-                        f"(corr={online_score.get('correlation', 0.):+.3f}, "
+                        f"{steps}: WARNING Stage-1 polarity has not locked "
+                        f"(raw_corr={raw_correlation:+.3f}, "
                         "negative_fraction="
-                        f"{online_score.get('alignment_negative_fraction', 0.):.3f})"
+                        f"{online_score.get('alignment_negative_fraction', 0.):.3f}); "
+                        "training may continue until the 20k fail-fast check."
                     )
-                if self.stage1_polarity_bad_evals >= 3:
+                if polarity_bad and steps >= 20000:
                     self.early_stopping_triggered = True
                     self.save(str(self.results_folder / 'latest.pt'))
                     self.print(
-                        f"{steps}: Stage-1 polarity hard stop triggered after "
-                        "three consecutive validation failures. Do not use "
-                        "latest.pt as a qualified reconstruction checkpoint."
+                        f"{steps}: Stage-1 polarity fail-fast triggered "
+                        f"(raw_corr={raw_correlation:+.3f} remains negative at "
+                        "or after 20k). Do not use latest.pt as a qualified "
+                        "reconstruction checkpoint."
                     )
 
             if self.quality_retention_gate and steps >= self.quality_retention_start_step:

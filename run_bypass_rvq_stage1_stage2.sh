@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Five-phase training:
+# Deployment-oriented training:
 #   A1 Encoder -> Decoder reconstruction (RVQ bypassed)
 #   A1.5 low-LR Encoder/Decoder formant refinement (RVQ bypassed)
 #   A2 Encoder -> Decoder GAN refinement (RVQ bypassed)
+#   optional A2.5 persistent-state alignment before RVQ calibration
 #   B1 Encoder -> RVQ EMA calibration (Encoder/Decoder weights frozen)
 #   B2 Encoder -> frozen RVQ -> Decoder GAN adaptation (Encoder/RVQ frozen)
+#   final persistent-state Decoder fine-tune (Encoder/RVQ frozen, no GAN)
 
 cd "${LYRA_REPO_DIR:-$HOME/gyh/lyra_md}"
 mkdir -p logs results
@@ -26,9 +28,13 @@ BYPASS_FORMANT_REFINE_STEPS="${BYPASS_FORMANT_REFINE_STEPS:-20000}"
 BYPASS_STAGE2_STEPS="${BYPASS_STAGE2_STEPS:-150000}"
 RVQ_CALIBRATION_STEPS="${RVQ_CALIBRATION_STEPS:-5000}"
 RVQ_STAGE2_STEPS="${RVQ_STAGE2_STEPS:-150000}"
+ENABLE_PRE_RVQ_STATE_FT="${ENABLE_PRE_RVQ_STATE_FT:-0}"
+PRE_RVQ_STATE_STEPS="${PRE_RVQ_STATE_STEPS:-20000}"
+FINAL_STATE_STEPS="${FINAL_STATE_STEPS:-10000}"
 RESUME_BYPASS_STAGE1="${RESUME_BYPASS_STAGE1:-0}"
 START_PHASE="${START_PHASE:-bypass_stage1}"
 STOP_AFTER_PHASE="${STOP_AFTER_PHASE:-}"
+BYPASS_STAGE1_CKPT="${BYPASS_STAGE1_CKPT:-}"
 BYPASS_STAGE2_CKPT="${BYPASS_STAGE2_CKPT:-}"
 PRECEDING_CONTEXT_SECONDS="${PRECEDING_CONTEXT_SECONDS:-0.5}"
 
@@ -42,16 +48,26 @@ BYPASS_FORMANT_DIR="$PWD/results/bypass-formant-refine-$BASE"
 BYPASS_S2_DIR="$PWD/results/bypass-gan-$BASE"
 RVQ_S1_DIR="$PWD/results/rvq-calibration-$BASE"
 RVQ_S2_DIR="$PWD/results/rvq-gan-$BASE"
+PRE_RVQ_STATE_DIR="$PWD/results/state-pre-rvq-$BASE"
+FINAL_STATE_DIR="$PWD/results/state-final-rvq-$BASE"
 
-if [[ "$START_PHASE" != "bypass_stage1" && "$START_PHASE" != "rvq_stage1" ]]; then
-  echo "ERROR: START_PHASE must be bypass_stage1 or rvq_stage1." >&2
+if [[ "$ENABLE_PRE_RVQ_STATE_FT" != "0" && "$ENABLE_PRE_RVQ_STATE_FT" != "1" ]]; then
+  echo "ERROR: ENABLE_PRE_RVQ_STATE_FT must be 0 or 1." >&2
+  exit 2
+fi
+
+if [[ "$START_PHASE" != "bypass_stage1" && \
+      "$START_PHASE" != "bypass_formant_refine" && \
+      "$START_PHASE" != "rvq_stage1" ]]; then
+  echo "ERROR: START_PHASE must be bypass_stage1, bypass_formant_refine, or rvq_stage1." >&2
   exit 2
 fi
 
 if [[ -n "$STOP_AFTER_PHASE" && \
       "$STOP_AFTER_PHASE" != "bypass_stage1" && \
-      "$STOP_AFTER_PHASE" != "bypass_formant_refine" ]]; then
-  echo "ERROR: STOP_AFTER_PHASE must be empty, bypass_stage1, or bypass_formant_refine." >&2
+      "$STOP_AFTER_PHASE" != "bypass_formant_refine" && \
+      "$STOP_AFTER_PHASE" != "bypass_stage2" ]]; then
+  echo "ERROR: STOP_AFTER_PHASE must be empty, bypass_stage1, bypass_formant_refine, or bypass_stage2." >&2
   exit 2
 fi
 
@@ -71,6 +87,17 @@ if [[ "$START_PHASE" == "rvq_stage1" ]]; then
     exit 2
   fi
   BYPASS_S2_CKPT="$BYPASS_STAGE2_CKPT"
+elif [[ "$START_PHASE" == "bypass_formant_refine" ]]; then
+  if [[ "$RESUME_BYPASS_STAGE1" != "0" ]]; then
+    echo "ERROR: RESUME_BYPASS_STAGE1 is not valid with START_PHASE=bypass_formant_refine." >&2
+    exit 2
+  fi
+  if [[ -z "$BYPASS_STAGE1_CKPT" || ! -f "$BYPASS_STAGE1_CKPT" ]]; then
+    echo "ERROR: START_PHASE=bypass_formant_refine requires an existing BYPASS_STAGE1_CKPT." >&2
+    echo "received: ${BYPASS_STAGE1_CKPT:-<empty>}" >&2
+    exit 2
+  fi
+  BYPASS_S1_CKPT="$(readlink -f "$BYPASS_STAGE1_CKPT")"
 elif [[ "$RESUME_BYPASS_STAGE1" == "1" ]]; then
   if [[ ! -f "$BYPASS_S1_DIR/latest.pt" ]]; then
     echo "ERROR: resume requires $BYPASS_S1_DIR/latest.pt" >&2
@@ -87,9 +114,13 @@ else
   fi
 fi
 
-CHECK_DIRS=("$RVQ_S1_DIR" "$RVQ_S2_DIR")
-if [[ "$START_PHASE" == "bypass_stage1" ]]; then
+CHECK_DIRS=("$RVQ_S1_DIR" "$RVQ_S2_DIR" "$FINAL_STATE_DIR")
+if [[ "$START_PHASE" == "bypass_stage1" || \
+      "$START_PHASE" == "bypass_formant_refine" ]]; then
   CHECK_DIRS=("$BYPASS_FORMANT_DIR" "$BYPASS_S2_DIR" "${CHECK_DIRS[@]}")
+  if [[ "$ENABLE_PRE_RVQ_STATE_FT" == "1" ]]; then
+    CHECK_DIRS+=("$PRE_RVQ_STATE_DIR")
+  fi
 fi
 for dir in "${CHECK_DIRS[@]}"; do
   if [ -e "$dir" ]; then
@@ -145,27 +176,34 @@ COMMON=(
 
 RECON_LOSSES=(
   --si-sdr-loss-weight 0.07 --si-sdr-loss-start-steps 15000 --si-sdr-loss-warmup-steps 15000
-  --spectral-envelope-loss-weight 0.08 --spectral-envelope-loss-start-steps 5000 --spectral-envelope-loss-warmup-steps 15000
-  --formant-peak-loss-weight 0.02 --formant-peak-loss-start-steps 15000 --formant-peak-loss-warmup-steps 20000
+  --spectral-envelope-loss-weight 0 --spectral-envelope-loss-start-steps 0 --spectral-envelope-loss-warmup-steps 0
+  --formant-peak-loss-weight 0 --formant-peak-loss-start-steps 0 --formant-peak-loss-warmup-steps 0
   --stft-recon-loss-weight 0.05 --stft-recon-loss-start-steps 5000 --stft-recon-loss-warmup-steps 15000
-  --voiced-highband-loss-weight 0.04 --voiced-highband-loss-start-steps 5000 --voiced-highband-loss-warmup-steps 15000
+  --voiced-highband-loss-weight 0 --voiced-highband-loss-start-steps 0 --voiced-highband-loss-warmup-steps 0
+  --upper-highband-loss-weight 0 --upper-highband-loss-start-steps 0 --upper-highband-loss-warmup-steps 0
   --noise-floor-loss-weight 0.03 --click-loss-weight 0.002 --jump-loss-weight 0 --preemph-loss-weight 0
   --loss-grad-diagnostics-every 1000
 )
 
 GAN_LOSSES=(
-  --generator-lr 5e-7 --gan-adversarial-max 2e-4 --gan-feature-max 1.5
-  --si-sdr-loss-weight 0.05 --spectral-envelope-loss-weight 0.05 --formant-peak-loss-weight 0.01
-  --stft-recon-loss-weight 0.02 --voiced-highband-loss-weight 0.02 --noise-floor-loss-weight 0.03
+  --generator-lr 5e-7 --gan-adversarial-max 2e-4 --gan-feature-max 1.0
+  --si-sdr-loss-weight 0.05 --spectral-envelope-loss-weight 0.02 --formant-peak-loss-weight 0
+  --stft-recon-loss-weight 0.02 --voiced-highband-loss-weight 0 --noise-floor-loss-weight 0.03
+  --voiced-hf-retention-loss-weight 0.01 --upper-highband-loss-weight 0
+  --active-spectral-detail-loss-weight 0
   --waveform-discr-lrs 5e-7 5e-7 2.5e-7 --stft-discr-lr 2.5e-7
-  --waveform-discr-update-every 2 2 2 --waveform-discr-loss-weights 1.0 0.25 0.25
+  --waveform-discr-update-every 2 4 4 --waveform-discr-loss-weights 1.0 0.25 0.25
   --stft-discr-update-every 4 --stft-discr-loss-weight 0.5
   --stage2-generator-freeze-steps 2000 --stage2-generator-hold-steps 5000 --stage2-generator-hold-lr 1e-7
-  --stage2-unfreeze-encoder-rvq-step -1 --early-stopping-min-steps 150000
+  --stage2-encoder-unfreeze-step 10000 --stage2-encoder-trainable-from-block 3 --stage2-encoder-lr 1e-7
+  --stage2-phase2-start-step 2000 --stage2-phase3-start-step 10000
+  --stage2-phase2-generator-lr 5e-7 --stage2-phase3-generator-lr 5e-7
+  --early-stopping-min-steps 150000
   --no-stage2-quality-hard-stop --gan-grad-diagnostics-every 500 --loss-grad-diagnostics-every 1000
 )
 
-if [[ "$START_PHASE" == "bypass_stage1" ]]; then
+if [[ "$START_PHASE" != "rvq_stage1" ]]; then
+  if [[ "$START_PHASE" == "bypass_stage1" ]]; then
   # A1: RVQ is absent from both the forward signal and checkpoint selection gate.
   run_stage "A1 bypass-RVQ reconstruction" 29511 "$PWD/logs/bypass-recon-$BASE.log" "$A1_APPEND_LOG" \
     --stage recon_pretrain --results-dir "$BYPASS_S1_DIR" \
@@ -181,6 +219,9 @@ if [[ "$START_PHASE" == "bypass_stage1" ]]; then
     echo "Stopping after A1 as requested."
     exit 0
   fi
+  else
+    echo "Skipping A1; starting A1.5 from $BYPASS_S1_CKPT"
+  fi
 
   # A1.5: keep RVQ bypassed, update Decoder at 1e-5 and Encoder at 2e-6,
   # and select a formant-preserving reconstruction before adversarial training.
@@ -191,6 +232,21 @@ if [[ "$START_PHASE" == "bypass_stage1" ]]; then
     --num-train-steps "$BYPASS_FORMANT_REFINE_STEPS" \
     --bypass-rvq-during-training \
     --preceding-context-seconds "$PRECEDING_CONTEXT_SECONDS" \
+    --spectral-envelope-loss-weight 0.10 \
+    --spectral-envelope-loss-start-steps 0 \
+    --spectral-envelope-loss-warmup-steps 0 \
+    --formant-peak-loss-weight 0.05 \
+    --formant-peak-loss-start-steps 0 \
+    --formant-peak-loss-warmup-steps 5000 \
+    --voiced-highband-loss-weight 0.02 \
+    --voiced-highband-loss-start-steps 0 \
+    --voiced-highband-loss-warmup-steps 5000 \
+    --upper-highband-loss-weight 0 \
+    --stft-recon-loss-weight 0.05 \
+    --stft-recon-loss-start-steps 0 \
+    --stft-recon-loss-warmup-steps 5000 \
+    --si-sdr-loss-weight 0.05 \
+    --noise-floor-loss-weight 0.03 \
     "${COMMON[@]}" --no-resume
   if [[ -f "$BYPASS_FORMANT_DIR/best_by_formant.pt" ]]; then
     BYPASS_FORMANT_CKPT="$BYPASS_FORMANT_DIR/best_by_formant.pt"
@@ -206,8 +262,9 @@ if [[ "$START_PHASE" == "bypass_stage1" ]]; then
     exit 0
   fi
 
-  # A2: standard Stage-2 policy keeps the bypass Encoder fixed while Decoder and
-  # discriminators refine the continuous latent path with GAN losses.
+  # A2: warm up discriminators, train Decoder from 2k, then jointly train the
+  # Encoder Block4/final latent convolution and Decoder from 10k. RVQ remains
+  # bypassed and frozen throughout this phase.
   run_stage "A2 bypass-RVQ GAN" 29512 "$PWD/logs/bypass-gan-$BASE.log" 0 \
     --stage gan_pretrain --results-dir "$BYPASS_S2_DIR" \
     --init-checkpoint "$BYPASS_FORMANT_CKPT" --num-train-steps "$BYPASS_STAGE2_STEPS" \
@@ -216,6 +273,25 @@ if [[ "$START_PHASE" == "bypass_stage1" ]]; then
     "${GAN_LOSSES[@]}" "${COMMON[@]}" --no-resume
   BYPASS_S2_CKPT="$(pick_best "$BYPASS_S2_DIR")"
   echo "A2 checkpoint=$BYPASS_S2_CKPT"
+  if [[ "$STOP_AFTER_PHASE" == "bypass_stage2" ]]; then
+    echo "Stopping after bypass A2 as requested."
+    exit 0
+  fi
+  if [[ "$ENABLE_PRE_RVQ_STATE_FT" == "1" ]]; then
+    run_stage "A2.5 pre-RVQ stateful alignment" 29516 \
+      "$PWD/logs/state-pre-rvq-$BASE.log" 0 \
+      --stage stream_finetune --results-dir "$PRE_RVQ_STATE_DIR" \
+      --init-checkpoint "$BYPASS_S2_CKPT" \
+      --num-train-steps "$PRE_RVQ_STATE_STEPS" \
+      --bypass-rvq-during-training \
+      --preceding-context-seconds "$PRECEDING_CONTEXT_SECONDS" \
+      --stream-frame-size 320 --stream-tbptt-frames 20 \
+      "${COMMON[@]}" --no-resume
+    BYPASS_S2_CKPT="$(pick_best "$PRE_RVQ_STATE_DIR")"
+    echo "A2.5 state-aligned checkpoint=$BYPASS_S2_CKPT"
+  else
+    echo "A2.5 pre-RVQ stateful alignment skipped; run the consistency check before B1."
+  fi
 else
   echo "Skipping bypass stages; starting RVQ Stage-1 from $BYPASS_S2_CKPT"
 fi
@@ -237,10 +313,30 @@ run_stage "B2 RVQ GAN decoder adaptation" 29514 "$PWD/logs/rvq-gan-$BASE.log" 0 
   --stage gan_pretrain --results-dir "$RVQ_S2_DIR" \
   --init-checkpoint "$RVQ_S1_CKPT" --num-train-steps "$RVQ_STAGE2_STEPS" \
   --no-bypass-rvq-during-training "${GAN_LOSSES[@]}" "${COMMON[@]}" --no-resume
+RVQ_S2_CKPT="$(pick_best "$RVQ_S2_DIR")"
+echo "B2 checkpoint=$RVQ_S2_CKPT"
+
+# Final state alignment is mandatory for the deployable path. Encoder and RVQ
+# remain frozen; only Decoder adapts to persistent 20 ms execution.
+run_stage "Final post-RVQ stateful Decoder fine-tune" 29517 \
+  "$PWD/logs/state-final-rvq-$BASE.log" 0 \
+  --stage stream_finetune_long --results-dir "$FINAL_STATE_DIR" \
+  --init-checkpoint "$RVQ_S2_CKPT" \
+  --num-train-steps "$FINAL_STATE_STEPS" \
+  --no-bypass-rvq-during-training \
+  --preceding-context-seconds "$PRECEDING_CONTEXT_SECONDS" \
+  --stream-frame-size 320 --stream-tbptt-frames 20 \
+  "${COMMON[@]}" --no-resume
+FINAL_STATE_CKPT="$(pick_best "$FINAL_STATE_DIR")"
+echo "Final stateful checkpoint=$FINAL_STATE_CKPT"
 
 echo "===== five-phase training complete ====="
 echo "bypass Stage-1: $BYPASS_S1_DIR"
 echo "bypass formant refine: $BYPASS_FORMANT_DIR"
 echo "bypass Stage-2: $BYPASS_S2_DIR"
+if [[ "$ENABLE_PRE_RVQ_STATE_FT" == "1" ]]; then
+  echo "pre-RVQ stateful fine-tune: $PRE_RVQ_STATE_DIR"
+fi
 echo "RVQ calibration: $RVQ_S1_DIR"
 echo "RVQ Stage-2: $RVQ_S2_DIR"
+echo "Final stateful fine-tune: $FINAL_STATE_DIR"

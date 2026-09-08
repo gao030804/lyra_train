@@ -58,12 +58,14 @@ def test_ac320_is_diagnostic_only():
 def test_stage1_formant_training_schedule():
     stage1 = STAGE_DEFAULTS["recon_pretrain"]
 
-    assert stage1["spectral_envelope_loss_weight"] == pytest.approx(0.08)
-    assert stage1["spectral_envelope_loss_start_steps"] == 5_000
-    assert stage1["spectral_envelope_loss_warmup_steps"] == 15_000
-    assert stage1["formant_peak_loss_weight"] == pytest.approx(0.02)
-    assert stage1["formant_peak_loss_start_steps"] == 15_000
-    assert stage1["formant_peak_loss_warmup_steps"] == 20_000
+    assert stage1["wave_mse_loss_weight"] == pytest.approx(0.10)
+    assert stage1["energy_loss_weight"] == pytest.approx(0.)
+    assert stage1["spectral_envelope_loss_weight"] == pytest.approx(0.)
+    assert stage1["spectral_envelope_loss_start_steps"] == 0
+    assert stage1["spectral_envelope_loss_warmup_steps"] == 0
+    assert stage1["formant_peak_loss_weight"] == pytest.approx(0.)
+    assert stage1["formant_peak_loss_start_steps"] == 0
+    assert stage1["formant_peak_loss_warmup_steps"] == 0
     assert stage1["stft_recon_loss_weight"] == pytest.approx(0.05)
     assert stage1["stft_recon_loss_start_steps"] == 5_000
     assert stage1["stft_recon_loss_warmup_steps"] == 15_000
@@ -76,8 +78,8 @@ def test_stage1_formant_training_schedule():
     )
     assert 'BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS="${BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS:-60000}"' in launcher
     assert '--early-stopping-min-steps "$BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS"' in launcher
-    assert stage1["voiced_highband_loss_weight"] == pytest.approx(0.04)
-    assert stage1["upper_highband_loss_weight"] == pytest.approx(0.0025)
+    assert stage1["voiced_highband_loss_weight"] == pytest.approx(0.)
+    assert stage1["upper_highband_loss_weight"] == pytest.approx(0.)
 
 
 def test_spectral_refine_matches_formant_refinement_profile():
@@ -87,6 +89,8 @@ def test_spectral_refine_matches_formant_refinement_profile():
     assert refine["lr"] == pytest.approx(1e-5)
     assert refine["encoder_lr"] == pytest.approx(2e-6)
     assert refine["use_ema"] is False
+    assert refine["wave_mse_loss_weight"] == pytest.approx(0.10)
+    assert refine["energy_loss_weight"] == pytest.approx(0.)
     assert refine["patience"] == 30
     assert refine["spectral_envelope_loss_weight"] == pytest.approx(0.10)
     assert refine["formant_peak_loss_weight"] == pytest.approx(0.05)
@@ -97,6 +101,28 @@ def test_spectral_refine_matches_formant_refinement_profile():
     assert refine["decoder_x8_residual_scale_ramp_steps"] == 3_000
 
 
+def test_a1_a15_use_random_train_and_deterministic_validation_crops():
+    source = (ROOT / "train_soundstream.py").read_text(encoding="utf-8")
+    trainer_source = (ROOT / "audiolm_pytorch" / "trainer.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'dataset_fixed_crop=(args.stage == "overfit")' in source
+    assert "base_dataset.deterministic_crop_indices = fixed_indices" in trainer_source
+
+
+def test_formant_train_and_eval_masks_are_reported_separately():
+    source = (ROOT / "audiolm_pytorch" / "soundstream.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "('f2', 1000., 2500." in source
+    assert "0.12, -9.0, 0.16, -6.0" in source
+    assert "0.16, -15.0, 0.22, -12.0" in source
+    assert "f'{name}_valid_trainmask'" in source
+    assert "f'{name}_valid_evalmask'" in source
+
+
 def test_loss_gradient_diagnostic_default(monkeypatch):
     monkeypatch.setattr("sys.argv", ["train_soundstream.py"])
     args = train_soundstream.parse_args()
@@ -105,26 +131,80 @@ def test_loss_gradient_diagnostic_default(monkeypatch):
     assert args.decoder_upsample_mode == "convtranspose"
 
 
-def test_stage2_uses_decoder_only_150k_schedule():
+def test_stage2_uses_decoder_then_encoder_tail_150k_schedule():
     stage2 = STAGE_DEFAULTS["gan_pretrain"]
 
     assert stage2["steps"] == 150_000
+    assert stage2["encoder_lr"] == pytest.approx(1e-7)
     assert stage2["patience"] is None
     assert stage2["gan_start"] == 2_000
     assert stage2["gan_ramp"] == 15_000
-    assert stage2["waveform_discr_update_every"] == (2, 2, 2)
+    assert stage2["waveform_discr_update_every"] == (2, 4, 4)
+    assert stage2["waveform_discr_loss_weights"] == (1.0, 0.25, 0.25)
+    assert stage2["stft_discr_loss_weight"] == pytest.approx(0.5)
+    assert stage2["gan_feature_max"] == pytest.approx(1.0)
     assert stage2["stft_recon_loss_weight"] == pytest.approx(0.02)
-    assert stage2["voiced_highband_loss_weight"] == pytest.approx(0.02)
+    assert stage2["spectral_envelope_loss_weight"] == pytest.approx(0.02)
+    assert stage2["formant_peak_loss_weight"] == pytest.approx(0.)
+    assert stage2["voiced_highband_loss_weight"] == pytest.approx(0.)
     assert stage2["voiced_hf_retention_loss_weight"] == pytest.approx(0.01)
+    assert stage2["upper_highband_loss_weight"] == pytest.approx(0.)
+    assert stage2["active_spectral_detail_loss_weight"] == pytest.approx(0.)
 
     launcher = (ROOT / "run_stage1_stage15_stage2.sh").read_text(
         encoding="utf-8"
     )
-    assert '--stage2-unfreeze-encoder-rvq-step -1' in launcher
-    assert '--stage2-phase2-start-step 50000' in launcher
-    assert '--stage2-phase3-start-step 100000' in launcher
+    assert '--stage2-encoder-unfreeze-step 10000' in launcher
+    assert '--stage2-encoder-trainable-from-block 3' in launcher
+    assert '--stage2-encoder-lr 1e-7' in launcher
+    assert '--stage2-phase2-start-step 2000' in launcher
+    assert '--stage2-phase3-start-step 10000' in launcher
     assert '--no-stage2-quality-hard-stop' in launcher
     assert '--early-stopping-patience' not in launcher
+
+    soundstream_source = (
+        ROOT / "audiolm_pytorch" / "soundstream.py"
+    ).read_text(encoding="utf-8")
+    assert "total_branch_weight = max(sum(branch_weights), 1e-8)" in soundstream_source
+    assert "weighted_adversarial_branches" in soundstream_source
+    assert "weighted_feature_branches" in soundstream_source
+
+
+def test_stateful_stages_have_distinct_pre_and_post_rvq_roles():
+    pre_rvq = STAGE_DEFAULTS["stream_finetune"]
+    final = STAGE_DEFAULTS["stream_finetune_long"]
+
+    assert pre_rvq["encoder_lr"] == pytest.approx(1e-7)
+    assert pre_rvq["lr"] == pytest.approx(5e-7)
+    assert final["steps"] == 10_000
+    assert final["lr"] == pytest.approx(2e-7)
+    assert final["gan_adversarial_max"] == pytest.approx(0.)
+    assert final["gan_feature_max"] == pytest.approx(0.)
+
+    launcher = (ROOT / "run_bypass_rvq_stage1_stage2.sh").read_text(
+        encoding="utf-8"
+    )
+    assert 'ENABLE_PRE_RVQ_STATE_FT="${ENABLE_PRE_RVQ_STATE_FT:-0}"' in launcher
+    assert '--stage stream_finetune --results-dir "$PRE_RVQ_STATE_DIR"' in launcher
+    assert '--stage stream_finetune_long --results-dir "$FINAL_STATE_DIR"' in launcher
+    assert launcher.index('A2.5 pre-RVQ stateful alignment') < launcher.index(
+        'B1 RVQ calibration with codec frozen'
+    )
+    assert launcher.index('B2 RVQ GAN decoder adaptation') < launcher.index(
+        'Final post-RVQ stateful Decoder fine-tune'
+    )
+
+
+def test_pipeline_can_start_from_bypass_formant_refine_checkpoint():
+    launcher = (ROOT / "run_bypass_rvq_stage1_stage2.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'BYPASS_STAGE1_CKPT="${BYPASS_STAGE1_CKPT:-}"' in launcher
+    assert '"$START_PHASE" != "bypass_formant_refine"' in launcher
+    assert 'START_PHASE=bypass_formant_refine requires an existing BYPASS_STAGE1_CKPT' in launcher
+    assert 'BYPASS_S1_CKPT="$(readlink -f "$BYPASS_STAGE1_CKPT")"' in launcher
+    assert 'Skipping A1; starting A1.5 from $BYPASS_S1_CKPT' in launcher
 
 
 def test_stage2_phase_boundaries_adjust_lr_and_gan_weights():
@@ -134,11 +214,11 @@ def test_stage2_phase_boundaries_adjust_lr_and_gan_weights():
     trainer.gan_start_step = 2_000
     trainer.gan_ramp_steps = 15_000
     trainer.gan_adversarial_max = 2e-4
-    trainer.gan_feature_max = 1.5
-    trainer.stage2_phase2_start_step = 50_000
-    trainer.stage2_phase3_start_step = 100_000
-    trainer.stage2_phase2_generator_lr = 2e-7
-    trainer.stage2_phase3_generator_lr = 1e-7
+    trainer.gan_feature_max = 1.0
+    trainer.stage2_phase2_start_step = 2_000
+    trainer.stage2_phase3_start_step = 10_000
+    trainer.stage2_phase2_generator_lr = 5e-7
+    trainer.stage2_phase3_generator_lr = 5e-7
     trainer.stage2_phase3_gan_adversarial_max = 1e-4
     trainer.stage2_phase3_gan_feature_max = 1.0
     trainer.generator_hold_steps = 5_000
@@ -156,15 +236,86 @@ def test_stage2_phase_boundaries_adjust_lr_and_gan_weights():
     trainer.soundstream = model
     trainer.accelerator = SimpleNamespace(unwrap_model=lambda value: value)
 
-    trainer.update_gan_weights(99_999)
-    assert model.adversarial_loss_weight == pytest.approx(2e-4)
-    assert model.feature_loss_weight == pytest.approx(1.5)
-    assert trainer.cap_generator_lr_for_retention(50_000) == pytest.approx(2e-7)
+    trainer.update_gan_weights(9_999)
+    gan_progress = (9_999 - 2_000) / 15_000
+    assert model.adversarial_loss_weight == pytest.approx(2e-4 * gan_progress)
+    assert model.feature_loss_weight == pytest.approx(1.0 * gan_progress)
+    assert trainer.cap_generator_lr_for_retention(2_000) == pytest.approx(5e-7)
 
-    trainer.update_gan_weights(100_000)
+    trainer.update_gan_weights(10_000)
     assert model.adversarial_loss_weight == pytest.approx(1e-4)
     assert model.feature_loss_weight == pytest.approx(1.0)
-    assert trainer.cap_generator_lr_for_retention(100_000) == pytest.approx(1e-7)
+    assert trainer.cap_generator_lr_for_retention(10_000) == pytest.approx(5e-7)
+
+
+@pytest.mark.parametrize(
+    ("completed_step", "instantaneous_lr"),
+    (
+        (0, 4e-7),
+        (500, 1.004e-4),
+        (999, 2e-4),
+    ),
+)
+def test_stage1_resume_inside_warmup_preserves_undampened_base_lr(
+    completed_step,
+    instantaneous_lr,
+):
+    trainer = object.__new__(SoundStreamTrainer)
+    torch.nn.Module.__init__(trainer)
+    sync_calls = []
+    trainer.optim = SimpleNamespace(
+        optimizer=SimpleNamespace(param_groups=[{"lr": instantaneous_lr}]),
+        warmup=SimpleNamespace(lrs=[instantaneous_lr]),
+        sync_warmup_lrs_from_optimizer=lambda: sync_calls.append(True),
+    )
+    trainer.plateau_scheduler = SimpleNamespace(_last_lr=[])
+    trainer.best_checkpoint_metric = "recon_pretrain"
+    trainer.generator_warmup_steps = 1_000
+    trainer.generator_hold_base_lrs = (2e-4,)
+    trainer.plateau_lr_min_lr = 1e-5
+    trainer.plateau_lr_start_steps = 60_000
+    trainer.print = lambda *_: None
+
+    trainer.sync_plateau_scheduler_from_optimizer(completed_step=completed_step)
+
+    assert trainer.optim.optimizer.param_groups[0]["lr"] == pytest.approx(
+        instantaneous_lr
+    )
+    assert trainer.optim.warmup.lrs == pytest.approx([2e-4])
+    assert trainer.plateau_scheduler._last_lr == pytest.approx([instantaneous_lr])
+    assert sync_calls == []
+
+
+def test_stage1_resume_after_warmup_repairs_invalid_lr_and_syncs_state():
+    trainer = object.__new__(SoundStreamTrainer)
+    torch.nn.Module.__init__(trainer)
+    sync_calls = []
+    optimizer = SimpleNamespace(param_groups=[{"lr": 4e-7}])
+    warmup_state = SimpleNamespace(lrs=[4e-7])
+
+    def sync_warmup_lrs():
+        sync_calls.append(True)
+        warmup_state.lrs = [group["lr"] for group in optimizer.param_groups]
+
+    trainer.optim = SimpleNamespace(
+        optimizer=optimizer,
+        warmup=warmup_state,
+        sync_warmup_lrs_from_optimizer=sync_warmup_lrs,
+    )
+    trainer.plateau_scheduler = SimpleNamespace(_last_lr=[])
+    trainer.best_checkpoint_metric = "recon_pretrain"
+    trainer.generator_warmup_steps = 1_000
+    trainer.generator_hold_base_lrs = (2e-4,)
+    trainer.plateau_lr_min_lr = 1e-5
+    trainer.plateau_lr_start_steps = 60_000
+    trainer.print = lambda *_: None
+
+    trainer.sync_plateau_scheduler_from_optimizer(completed_step=1_000)
+
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(2e-4)
+    assert warmup_state.lrs == pytest.approx([2e-4])
+    assert trainer.plateau_scheduler._last_lr == pytest.approx([2e-4])
+    assert sync_calls == [True]
 
 
 def test_distributed_test_report_keeps_formant_and_stft_metrics():
