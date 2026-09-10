@@ -185,6 +185,10 @@ def test_stateful_stages_have_distinct_pre_and_post_rvq_roles():
         encoding="utf-8"
     )
     assert 'ENABLE_PRE_RVQ_STATE_FT="${ENABLE_PRE_RVQ_STATE_FT:-0}"' in launcher
+    assert 'FINAL_STATE_STEPS="${FINAL_STATE_STEPS:-10000}"' in launcher
+    assert "FINAL_STATE_STEPS <= 0" in launcher
+    assert "post-RVQ state alignment is mandatory" in launcher
+    assert "--reinitialize-rvq-from-bypass-checkpoint" in launcher
     assert '--stage stream_finetune --results-dir "$PRE_RVQ_STATE_DIR"' in launcher
     assert '--stage stream_finetune_long --results-dir "$FINAL_STATE_DIR"' in launcher
     assert launcher.index('A2.5 pre-RVQ stateful alignment') < launcher.index(
@@ -193,6 +197,8 @@ def test_stateful_stages_have_distinct_pre_and_post_rvq_roles():
     assert launcher.index('B2 RVQ GAN decoder adaptation') < launcher.index(
         'Final post-RVQ stateful Decoder fine-tune'
     )
+    assert '--num-train-steps "$FINAL_STATE_STEPS"' in launcher
+    assert '--no-bypass-rvq-during-training' in launcher
 
 
 def test_pipeline_can_start_from_bypass_formant_refine_checkpoint():
@@ -350,10 +356,17 @@ class GeneratorOnlyModel:
     num_quantizers = 16
     codebook_size = 16
     codebook_dim = 64
+    loaded_without_rvq = False
 
     def load_generator_state_dict(self, state_dict):
         assert state_dict == {}
         return []
+
+    def load_state_dict_without_rvq(self, state_dict, *, include_discriminators):
+        assert state_dict == {}
+        assert include_discriminators is False
+        self.loaded_without_rvq = True
+        return ("rq.rvqs.0.layers.0._codebook.embed",)
 
 
 class LinearGeneratorOnlyModel(GeneratorOnlyModel):
@@ -379,6 +392,23 @@ def matching_config(**overrides):
     }
     config.update(overrides)
     return config
+
+
+def test_current_rvq_profile_is_16_by_16_by_64_and_3p2kbps():
+    config = matching_config()
+    frame_rate = 16000 / 320
+    bits_per_index = 4
+
+    assert config["rq_num_quantizers"] == 16
+    assert config["codebook_size"] == 16
+    assert config["codebook_dim"] == 64
+    assert frame_rate * config["rq_num_quantizers"] * bits_per_index == 3200
+    assert (
+        config["rq_num_quantizers"]
+        * config["codebook_size"]
+        * config["codebook_dim"]
+        == 16384
+    )
 
 
 def save_generator_checkpoint(path, config):
@@ -419,6 +449,62 @@ def test_generator_checkpoint_rejects_old_rvq_shape(tmp_path):
     with pytest.raises(ValueError, match="RVQ topology mismatch"):
         load_model_weights_only(
             GeneratorOnlyModel(), checkpoint, generator_only=True
+        )
+
+
+def test_generator_checkpoint_rebuilds_rvq_from_confirmed_bypass(tmp_path):
+    checkpoint = tmp_path / "bypass-rvq-10x64.pt"
+    save_generator_checkpoint(
+        checkpoint,
+        matching_config(
+            rq_num_quantizers=10,
+            codebook_size=64,
+            bypass_rvq=True,
+        ),
+    )
+    model = GeneratorOnlyModel()
+
+    config = load_model_weights_only(
+        model,
+        checkpoint,
+        generator_only=True,
+        reinitialize_rvq_from_bypass=True,
+    )
+
+    assert model.loaded_without_rvq is True
+    assert config["bypass_rvq"] is True
+
+
+def test_rvq_rebuild_rejects_checkpoint_not_marked_as_bypass(tmp_path):
+    checkpoint = tmp_path / "quantized-rvq-10x64.pt"
+    save_generator_checkpoint(
+        checkpoint,
+        matching_config(
+            rq_num_quantizers=10,
+            codebook_size=64,
+            bypass_rvq=False,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="records bypass_rvq=True"):
+        load_model_weights_only(
+            GeneratorOnlyModel(),
+            checkpoint,
+            generator_only=True,
+            reinitialize_rvq_from_bypass=True,
+        )
+
+
+def test_rvq_rebuild_rejects_checkpoint_without_config(tmp_path):
+    checkpoint = tmp_path / "missing-config.pt"
+    torch.save({"model": {}}, checkpoint)
+
+    with pytest.raises(ValueError, match="metadata proving bypass_rvq=True"):
+        load_model_weights_only(
+            GeneratorOnlyModel(),
+            checkpoint,
+            generator_only=True,
+            reinitialize_rvq_from_bypass=True,
         )
 
 

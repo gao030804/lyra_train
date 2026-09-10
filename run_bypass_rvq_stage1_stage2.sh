@@ -56,6 +56,14 @@ if [[ "$ENABLE_PRE_RVQ_STATE_FT" != "0" && "$ENABLE_PRE_RVQ_STATE_FT" != "1" ]];
   exit 2
 fi
 
+# The deployable graph is Encoder -> RVQ -> Decoder with persistent 20 ms
+# state.  Therefore the post-RVQ state pass is not optional: a zero/negative
+# length would silently leave B2's offline checkpoint as the final artifact.
+if (( FINAL_STATE_STEPS <= 0 )); then
+  echo "ERROR: FINAL_STATE_STEPS must be positive; post-RVQ state alignment is mandatory." >&2
+  exit 2
+fi
+
 if [[ "$START_PHASE" != "bypass_stage1" && \
       "$START_PHASE" != "bypass_formant_refine" && \
       "$START_PHASE" != "rvq_stage1" ]]; then
@@ -296,11 +304,14 @@ else
   echo "Skipping bypass stages; starting RVQ Stage-1 from $BYPASS_S2_CKPT"
 fi
 
+echo "State policy: pre-RVQ A2.5 enabled=$ENABLE_PRE_RVQ_STATE_FT; post-RVQ state fine-tune is mandatory (${FINAL_STATE_STEPS} steps)."
+
 # B1: no Decoder call and no optimizer/backward step.  Only RVQ EMA and
 # dead-code replacement state changes; Encoder/Decoder tensors remain bitwise fixed.
 run_stage "B1 RVQ calibration with codec frozen" 29513 "$PWD/logs/rvq-calibration-$BASE.log" 0 \
   --stage recon_pretrain --results-dir "$RVQ_S1_DIR" \
   --init-checkpoint "$BYPASS_S2_CKPT" --num-train-steps "$RVQ_CALIBRATION_STEPS" \
+  --reinitialize-rvq-from-bypass-checkpoint \
   --rvq-calibration-only --early-stopping-min-steps 0 \
   --no-bypass-rvq-during-training "${COMMON[@]}" --no-resume
 RVQ_S1_CKPT="$RVQ_S1_DIR/latest.pt"
@@ -316,8 +327,10 @@ run_stage "B2 RVQ GAN decoder adaptation" 29514 "$PWD/logs/rvq-gan-$BASE.log" 0 
 RVQ_S2_CKPT="$(pick_best "$RVQ_S2_DIR")"
 echo "B2 checkpoint=$RVQ_S2_CKPT"
 
-# Final state alignment is mandatory for the deployable path. Encoder and RVQ
-# remain frozen; only Decoder adapts to persistent 20 ms execution.
+# Final state alignment is mandatory for the deployable path. The
+# stream_finetune_long policy freezes Encoder and RVQ for the complete stage,
+# keeps GAN losses disabled, and updates only Decoder parameters against
+# persistent 20 ms state / boundary consistency losses.
 run_stage "Final post-RVQ stateful Decoder fine-tune" 29517 \
   "$PWD/logs/state-final-rvq-$BASE.log" 0 \
   --stage stream_finetune_long --results-dir "$FINAL_STATE_DIR" \

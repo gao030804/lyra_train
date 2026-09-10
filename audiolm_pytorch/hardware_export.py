@@ -218,6 +218,13 @@ def export_hardware_encoder_package(
             "kernel": conv.kernel_size[0],
             "stride": conv.stride[0],
             "dilation": conv.dilation[0],
+            # RTL 必须据此选择 Dense 脉动阵列或 group-aware Depthwise 通路。
+            "groups": conv.groups,
+            "is_depthwise": (
+                conv.groups == conv.in_channels and
+                conv.out_channels == conv.in_channels
+            ),
+            "weight_cin_per_group": conv.weight.shape[1],
             "left_pad": module.causal_padding,
             "input_scale": float(input_scale.item()),
             "output_scale": float(output_scale.item()),

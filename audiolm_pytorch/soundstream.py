@@ -3156,6 +3156,37 @@ class SoundStream(Module):
             )
         return tuple(incompatible.missing_keys)
 
+    def load_state_dict_without_rvq(
+        self,
+        state_dict,
+        *,
+        include_discriminators = True,
+    ):
+        """Strictly load compatible state while keeping this model's RVQ fresh."""
+        retained_state = {
+            key: value
+            for key, value in state_dict.items()
+            if not key.startswith('rq.') and (
+                include_discriminators or
+                not self.is_discriminator_state_key(key)
+            )
+        }
+        incompatible = self.load_state_dict(retained_state, strict = False)
+        unexpected = list(incompatible.unexpected_keys)
+        illegal_missing = [
+            key for key in incompatible.missing_keys
+            if not key.startswith('rq.') and not (
+                not include_discriminators and
+                self.is_discriminator_state_key(key)
+            )
+        ]
+        if unexpected or illegal_missing:
+            raise RuntimeError(
+                "bypass-checkpoint migration was not strict outside RVQ: "
+                f"missing={illegal_missing}, unexpected={unexpected}"
+            )
+        return tuple(incompatible.missing_keys)
+
     def non_discr_parameters(self):
         return [
             *self.encoder.parameters(),

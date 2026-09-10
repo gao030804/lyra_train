@@ -32,8 +32,8 @@ refuse_stale_fresh_run() {
 }
 
 run_stage0() {
-    local results="results/overfit-dscnn-relu-fp-64d-8q"
-    local log="logs/overfit-dscnn-relu-fp-64d-8q.log"
+    local results="results/overfit-dscnn-relu-fp-64d-16q16"
+    local log="logs/overfit-dscnn-relu-fp-64d-16q16.log"
     local marker="$results/.stage_complete"
 
     if [[ -f "$marker" ]]; then
@@ -114,32 +114,32 @@ run_stage0
 
 run_6gpu_stage \
   recon_pretrain \
-  results/recon-pretrain-dscnn-relu-fp-64d-8q \
-  logs/recon-pretrain-dscnn-relu-fp-64d-8q.log \
+  results/recon-pretrain-dscnn-relu-fp-64d-16q16 \
+  logs/recon-pretrain-dscnn-relu-fp-64d-16q16.log \
   150000 4 no
 
 run_6gpu_stage \
   spectral_refine \
-  results/spectral-refine-dscnn-relu-fp-64d-8q \
-  logs/spectral-refine-dscnn-relu-fp-64d-8q.log \
+  results/spectral-refine-dscnn-relu-fp-64d-16q16 \
+  logs/spectral-refine-dscnn-relu-fp-64d-16q16.log \
   20000 4 no
 
 run_6gpu_stage \
   gan_pretrain \
-  results/gan-pretrain-dscnn-relu-fp-64d-8q \
-  logs/gan-pretrain-dscnn-relu-fp-64d-8q.log \
+  results/gan-pretrain-dscnn-relu-fp-64d-16q16 \
+  logs/gan-pretrain-dscnn-relu-fp-64d-16q16.log \
   50000 4 no
 
 run_6gpu_stage \
   stream_finetune \
-  results/stream-finetune-dscnn-relu-fp-64d-8q \
-  logs/stream-finetune-dscnn-relu-fp-64d-8q.log \
+  results/stream-finetune-dscnn-relu-fp-64d-16q16 \
+  logs/stream-finetune-dscnn-relu-fp-64d-16q16.log \
   20000 4 no
 
 run_6gpu_stage \
   stream_finetune_long \
-  results/stream-finetune-long-dscnn-relu-fp-64d-8q \
-  logs/stream-finetune-long-dscnn-relu-fp-64d-8q.log \
+  results/stream-finetune-long-dscnn-relu-fp-64d-16q16 \
+  logs/stream-finetune-long-dscnn-relu-fp-64d-16q16.log \
   20000 2 yes
 
 echo "All non-quantized stages completed successfully at 3.2 kbps."

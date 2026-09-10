@@ -346,6 +346,17 @@ def parse_args() -> argparse.Namespace:
         help="Optional model-only checkpoint used to initialize a new stage.",
     )
     parser.add_argument(
+        "--reinitialize-rvq-from-bypass-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Load Encoder/Decoder (and, when applicable, discriminator) state "
+            "from a checkpoint explicitly saved with bypass_rvq=True, discard "
+            "all checkpoint rq.* tensors, and keep the current model's freshly "
+            "initialized RVQ. Only valid with --rvq-calibration-only."
+        ),
+    )
+    parser.add_argument(
         "--predecessor-results-dir",
         type=Path,
         default=None,
@@ -1667,9 +1678,15 @@ def load_model_weights_only(
     checkpoint: Path,
     *,
     generator_only: bool = False,
+    reinitialize_rvq_from_bypass: bool = False,
 ) -> dict:
     pkg = torch.load(str(checkpoint), map_location="cpu")
     checkpoint_config = {}
+    if reinitialize_rvq_from_bypass and "config" not in pkg:
+        raise ValueError(
+            "--reinitialize-rvq-from-bypass-checkpoint requires checkpoint "
+            "configuration metadata proving bypass_rvq=True."
+        )
     if "config" in pkg:
         checkpoint_config = pickle.loads(pkg["config"])
         rvq_fields = (
@@ -1690,7 +1707,13 @@ def load_model_weights_only(
                     f"{config_name}: checkpoint={checkpoint_value}, "
                     f"current_model={model_value}"
                 )
-        if rvq_mismatches:
+        checkpoint_bypassed_rvq = bool(checkpoint_config.get("bypass_rvq", False))
+        if reinitialize_rvq_from_bypass and not checkpoint_bypassed_rvq:
+            raise ValueError(
+                "--reinitialize-rvq-from-bypass-checkpoint requires a source "
+                "checkpoint whose saved config records bypass_rvq=True."
+            )
+        if rvq_mismatches and not reinitialize_rvq_from_bypass:
             raise ValueError(
                 "Checkpoint RVQ topology mismatch: "
                 + "; ".join(rvq_mismatches)
@@ -1823,7 +1846,35 @@ def load_model_weights_only(
                     "fresh run or use a checkpoint with matching ranks."
                 )
     state_dict = pkg["model"] if "model" in pkg else pkg
-    if generator_only:
+    if reinitialize_rvq_from_bypass:
+        if not hasattr(model, "load_state_dict_without_rvq"):
+            raise TypeError(
+                "model does not support loading a bypass checkpoint while "
+                "reinitializing RVQ"
+            )
+        skipped_keys = model.load_state_dict_without_rvq(
+            state_dict,
+            include_discriminators=not generator_only,
+        )
+        old_topology = (
+            checkpoint_config.get("rq_num_quantizers", "unknown"),
+            checkpoint_config.get("codebook_size", "unknown"),
+            checkpoint_config.get("codebook_dim", "unknown"),
+        )
+        new_topology = (
+            getattr(model, "num_quantizers", "unknown"),
+            getattr(model, "codebook_size", "unknown"),
+            getattr(model, "codebook_dim", "unknown"),
+        )
+        print(
+            "Loaded non-RVQ state from a confirmed bypass checkpoint; "
+            f"discarded RVQ topology {old_topology[0]}x{old_topology[1]}x"
+            f"{old_topology[2]} and initialized current RVQ topology "
+            f"{new_topology[0]}x{new_topology[1]}x{new_topology[2]} "
+            f"({len(skipped_keys)} state keys left freshly initialized)."
+        )
+        print("Optimizer, scheduler, and training step will start fresh.")
+    elif generator_only:
         if not hasattr(model, "load_generator_state_dict"):
             raise TypeError("model does not support generator-only checkpoint loading")
         skipped_keys = model.load_generator_state_dict(state_dict)
@@ -2233,6 +2284,14 @@ def main() -> None:
                 "--rvq-calibration-only requires --init-checkpoint from the "
                 "completed bypass phase"
             )
+    if (
+        args.reinitialize_rvq_from_bypass_checkpoint and
+        not args.rvq_calibration_only
+    ):
+        raise ValueError(
+            "--reinitialize-rvq-from-bypass-checkpoint is only valid with "
+            "--rvq-calibration-only"
+        )
     if args.gan_adversarial_max is not None:
         if args.gan_adversarial_max < 0:
             raise ValueError("--gan-adversarial-max cannot be negative.")
@@ -2744,7 +2803,7 @@ def main() -> None:
     stream_context_frames = args.stream_context_frames
     # 50 frames/s * 16 quantizers * 4 bits/index = 3.2 kbps.
     # Each 64-D deployment codeword is INT8, so the complete RVQ table is
-    # 16 * 16 * 64 = 16 KiB (indices must be packed two per byte).
+    # 16 * 16 * 64 = 16 KiB. Two 4-bit indices can be packed per byte.
     codebook_size = 16
     num_quantizers = 16
     if args.stage in RECONSTRUCTION_STAGES:
@@ -3450,7 +3509,7 @@ def main() -> None:
             f"{args.test_context_ms:.1f} ms previous context discarded from output"
         )
 
-    # Fixed 3.2 kbps hardware profile:
+    # Fixed 3.2 kbps RVQ profile:
     # 16000 / 320 = 50 frames/s
     # log2(16) = 4 bits/token; 16 quantizers = 3.2 kbps
     soundstream = build_model(
@@ -4216,6 +4275,9 @@ def main() -> None:
                 generator_only=(
                     predecessor_stage is not None and
                     not args.stage2_targeted_refine
+                ),
+                reinitialize_rvq_from_bypass=(
+                    args.reinitialize_rvq_from_bypass_checkpoint
                 ),
             )
             if args.stage in (
