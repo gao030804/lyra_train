@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import math
+import json
 import copy
 import pickle
 import random
@@ -430,6 +431,11 @@ class SoundStreamTrainer(nn.Module):
         gan_adversarial_max: float = 0.1,
         gan_feature_max: float = 10.,
         rvq_calibration_only: bool = False,
+        rvq_projection_only: bool = False,
+        rvq_projection_pca_batches: int = 0,
+        rvq_projection_min_evr: float = 0.90,
+        rvq_projection_latent_mse_weight: float = 0.,
+        rvq_projection_latent_cosine_weight: float = 0.,
         freeze_codebook_after_step: int | None = None,
         freeze_codebook_before_step: int | None = None,
         freeze_codebook_during_training: bool = False,
@@ -728,6 +734,11 @@ class SoundStreamTrainer(nn.Module):
             "freeze_encoder_before_step": freeze_encoder_before_step,
             "freeze_encoder_after_step": freeze_encoder_after_step,
             "rvq_warm_in_steps": rvq_warm_in_steps,
+            "rvq_projection_only": rvq_projection_only,
+            "rvq_projection_pca_batches": rvq_projection_pca_batches,
+            "rvq_projection_min_evr": rvq_projection_min_evr,
+            "rvq_projection_latent_mse_weight": rvq_projection_latent_mse_weight,
+            "rvq_projection_latent_cosine_weight": rvq_projection_latent_cosine_weight,
             "decoder_lr_after_step": decoder_lr_after_step,
             "rq_excluded_from_generator_optimizer": exclude_rq_from_generator_optimizer,
             "encoder_excluded_from_generator_optimizer": (
@@ -781,6 +792,17 @@ class SoundStreamTrainer(nn.Module):
                 parameter for parameter in generator_parameters
                 if id(parameter) not in rq_parameter_ids
             ]
+        if rvq_projection_only:
+            projection_parameters = [
+                *soundstream.rq_input_projection.parameters(),
+                *soundstream.rq_output_projection.parameters(),
+            ]
+            if not projection_parameters:
+                raise ValueError(
+                    'RVQ projection-only training requires rq_lookup_dim '
+                    'to be smaller than codebook_dim'
+                )
+            generator_parameters = projection_parameters
 
         encoder_modules = [soundstream.encoder, soundstream.encoder_film]
         if exists(soundstream.encoder_attn):
@@ -1385,6 +1407,21 @@ class SoundStreamTrainer(nn.Module):
         self.gan_adversarial_max = gan_adversarial_max
         self.gan_feature_max = gan_feature_max
         self.rvq_calibration_only = bool(rvq_calibration_only)
+        self.rvq_projection_only = bool(rvq_projection_only)
+        self.rvq_projection_pca_batches = int(rvq_projection_pca_batches)
+        self.rvq_projection_pca_initialized = False
+        self.rvq_projection_min_evr = float(rvq_projection_min_evr)
+        self.rvq_projection_latent_mse_weight = float(rvq_projection_latent_mse_weight)
+        self.rvq_projection_latent_cosine_weight = float(rvq_projection_latent_cosine_weight)
+        self.best_rvq_projection_aligned_si_sdr = float('-inf')
+        if self.rvq_projection_pca_batches < 0:
+            raise ValueError('rvq_projection_pca_batches must be non-negative')
+        if not 0. <= self.rvq_projection_min_evr <= 1.:
+            raise ValueError('rvq_projection_min_evr must be in [0, 1]')
+        if self.rvq_projection_latent_mse_weight < 0.:
+            raise ValueError('rvq_projection_latent_mse_weight must be non-negative')
+        if self.rvq_projection_latent_cosine_weight < 0.:
+            raise ValueError('rvq_projection_latent_cosine_weight must be non-negative')
         assert not exists(freeze_codebook_after_step) or freeze_codebook_after_step >= 0
         assert not exists(freeze_codebook_before_step) or freeze_codebook_before_step >= 0
         assert not exists(freeze_encoder_before_step) or freeze_encoder_before_step >= 0
@@ -3554,7 +3591,10 @@ class SoundStreamTrainer(nn.Module):
         averaged_metrics['rvq_deployable_distribution_eligible'] = float(
             bool(deployable_levels) and all(deployable_levels)
         )
-        bypass_rvq = bool(getattr(model, 'bypass_rvq', False))
+        bypass_rvq = bool(
+            getattr(model, 'bypass_rvq', False) or
+            getattr(model, 'rq_projection_only', False)
+        )
         if bypass_rvq:
             # No RVQ tokens exist by design.  Reconstruction/cleanliness gates
             # remain active, but codebook-health gates are not applicable.
@@ -4286,6 +4326,16 @@ class SoundStreamTrainer(nn.Module):
         if not hasattr(model, 'set_decoder_residual_scale'):
             return 1.
 
+        # Q0 isolates Win/Wout quality. Do not mutate the frozen Decoder state
+        # inherited from the bypass A2 checkpoint.
+        if self.rvq_projection_only:
+            get_scales = getattr(model, 'get_decoder_block_residual_scales', None)
+            if callable(get_scales):
+                current = get_scales()
+                if current:
+                    return float(current[0])
+            return float(getattr(model, 'decoder_residual_scale', 1.))
+
         if exists(self.decoder_x8_residual_scale_target):
             if not hasattr(model, 'set_decoder_block_residual_scales'):
                 raise RuntimeError('per-block decoder residual scaling is not supported by this model')
@@ -4955,6 +5005,152 @@ class SoundStreamTrainer(nn.Module):
         self.steps.add_(1)
         return logs
 
+    @torch.no_grad()
+    def initialize_rvq_projections_from_pca(self):
+        if (
+            not self.rvq_projection_only or
+            self.rvq_projection_pca_initialized or
+            self.rvq_projection_pca_batches <= 0
+        ):
+            return
+
+        model = self.unwrapped_soundstream
+        projection_in = model.rq_input_projection
+        projection_out = model.rq_output_projection
+        if not isinstance(projection_in, nn.Linear) or not isinstance(projection_out, nn.Linear):
+            raise TypeError('PCA projection initialization requires Linear Win/Wout')
+
+        latent_dim = projection_in.in_features
+        count = torch.zeros((), dtype = torch.float64, device = self.device)
+        latent_sum = torch.zeros(latent_dim, dtype = torch.float64, device = self.device)
+        latent_cross = torch.zeros(
+            latent_dim, latent_dim, dtype = torch.float64, device = self.device
+        )
+        encoder_was_training = model.encoder.training
+        model.encoder.eval()
+        for _ in range(self.rvq_projection_pca_batches):
+            wave, = next(self.dl_iter)
+            wave = wave.to(self.device)
+            encoder_input, _ = model.process_input(wave)
+            latent = model.encoder(encoder_input)
+            latent = rearrange(latent, 'b c n -> b n c')
+            if exists(model.encoder_attn):
+                latent = model.encoder_attn(latent)
+            latent = rearrange(latent, 'b n c -> (b n) c').to(torch.float64)
+            count += latent.shape[0]
+            latent_sum += latent.sum(dim = 0)
+            latent_cross += latent.t().matmul(latent)
+        model.encoder.train(encoder_was_training)
+
+        count = self.accelerator.reduce(count, reduction = 'sum')
+        latent_sum = self.accelerator.reduce(latent_sum, reduction = 'sum')
+        latent_cross = self.accelerator.reduce(latent_cross, reduction = 'sum')
+        mean = latent_sum / count.clamp_min(1.)
+        covariance = latent_cross / count.clamp_min(1.) - mean[:, None] * mean[None, :]
+        covariance = (covariance + covariance.t()) * 0.5
+        eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
+        order = eigenvalues.argsort(descending = True)
+        eigenvalues = eigenvalues[order].clamp_min(0.)
+        eigenvectors = eigenvectors[:, order]
+        lookup_dim = projection_in.out_features
+        basis = eigenvectors[:, :lookup_dim].to(
+            device = projection_in.weight.device,
+            dtype = projection_in.weight.dtype,
+        )
+        projection_in.weight.copy_(basis.t())
+        projection_out.weight.copy_(basis)
+
+        total_variance = eigenvalues.sum().clamp_min(torch.finfo(eigenvalues.dtype).eps)
+        effective_rank = eigenvalues.sum().square() / eigenvalues.square().sum().clamp_min(
+            torch.finfo(eigenvalues.dtype).eps
+        )
+        evr = {
+            str(dim): float(eigenvalues[:min(dim, latent_dim)].sum() / total_variance)
+            for dim in (8, 16, 24, 32, 48)
+        }
+        report = {
+            'latent_frames': int(count.item()),
+            'latent_dimension': latent_dim,
+            'lookup_dimension': lookup_dim,
+            'effective_rank': float(effective_rank),
+            'explained_variance_ratio': evr,
+            'latent_mean_rms': float(mean.square().mean().sqrt()),
+        }
+        self.rvq_projection_pca_initialized = True
+        self.print(
+            'RVQ projection PCA initialized: '
+            f"frames={report['latent_frames']}, effective_rank={report['effective_rank']:.2f}, "
+            + ', '.join(f'EVR@{dim}={value:.4f}' for dim, value in evr.items())
+        )
+        if self.is_main:
+            report_path = self.results_folder / 'latent_pca_report.json'
+            report_path.write_text(json.dumps(report, indent = 2), encoding = 'utf-8')
+            self.save_model_only(self.results_folder / 'pca_initialized.pt', model)
+            self.print(f'PCA report saved to: {report_path}')
+        self.accelerator.wait_for_everyone()
+        current_evr = evr[str(lookup_dim)]
+        if current_evr < self.rvq_projection_min_evr:
+            raise RuntimeError(
+                f'lookup dimension {lookup_dim} retains only {current_evr:.4f} '
+                f'latent variance, below required {self.rvq_projection_min_evr:.4f}; '
+                'retry Q0 with --rq-lookup-dim 24 or 32'
+            )
+
+    @torch.no_grad()
+    def rvq_projection_latent_metrics(self, wave):
+        if not self.rvq_projection_only:
+            return {}
+        model = self.unwrapped_soundstream
+        encoder_input, _ = model.process_input(wave)
+        latent = rearrange(model.encoder(encoder_input), 'b c n -> b n c')
+        if exists(model.encoder_attn):
+            latent = model.encoder_attn(latent)
+        reconstructed = model.rq_output_projection(
+            model.rq_input_projection(latent)
+        )
+        latent_f = latent.float()
+        reconstructed_f = reconstructed.float()
+        return {
+            'projection_latent_mse': float(F.mse_loss(reconstructed_f, latent_f).cpu()),
+            'projection_latent_cosine': float(F.cosine_similarity(
+                reconstructed_f, latent_f, dim = -1, eps = 1e-8
+            ).mean().cpu()),
+            'projection_latent_rms_ratio': float(
+                reconstructed_f.square().mean().sqrt() /
+                latent_f.square().mean().sqrt().clamp_min(1e-8)
+            ),
+        }
+
+    def rvq_projection_latent_loss(self, wave):
+        """Differentiable Q0-only fidelity objective for PCA Win/Wout."""
+        if not self.rvq_projection_only:
+            zero = wave.new_zeros(())
+            return zero, zero, zero
+
+        model = self.unwrapped_soundstream
+        with torch.no_grad():
+            encoder_input, _ = model.process_input(wave)
+            latent = rearrange(model.encoder(encoder_input), 'b c n -> b n c')
+            if exists(model.encoder_attn):
+                latent = model.encoder_attn(latent)
+            latent = latent.detach()
+
+        reconstructed = model.rq_output_projection(model.rq_input_projection(latent))
+        latent_f = latent.float()
+        reconstructed_f = reconstructed.float()
+        normalized_mse = (
+            F.mse_loss(reconstructed_f, latent_f) /
+            latent_f.square().mean().clamp_min(1e-8)
+        )
+        cosine_loss = 1. - F.cosine_similarity(
+            reconstructed_f, latent_f, dim = -1, eps = 1e-8
+        ).mean()
+        weighted = (
+            normalized_mse * self.rvq_projection_latent_mse_weight +
+            cosine_loss * self.rvq_projection_latent_cosine_weight
+        )
+        return weighted, normalized_mse, cosine_loss
+
     def train_step(self):
         if self.rvq_calibration_only:
             return self.rvq_calibration_step()
@@ -4994,8 +5190,10 @@ class SoundStreamTrainer(nn.Module):
         # with the RVQ freeze policy instead of accidentally training them as
         # ordinary Decoder parameters during B2.
         train_rvq_projections = (
-            not freeze_codebook and
-            not self.rq_excluded_from_generator_optimizer
+            self.rvq_projection_only or (
+                not freeze_codebook and
+                not self.rq_excluded_from_generator_optimizer
+            )
         )
         model.rq_input_projection.requires_grad_(train_rvq_projections)
         model.rq_output_projection.requires_grad_(train_rvq_projections)
@@ -5043,6 +5241,8 @@ class SoundStreamTrainer(nn.Module):
 
             wave, = next(self.dl_iter)
             wave = wave.to(device)
+            if self.rvq_projection_only and log_losses and i == 0:
+                logs.update(self.rvq_projection_latent_metrics(wave))
 
             freeze_discriminators = (
                 self.frozen_discriminators
@@ -5074,6 +5274,23 @@ class SoundStreamTrainer(nn.Module):
                     freeze_codebook = freeze_codebook,
                     rvq_warm_in_alpha = rvq_warm_in_alpha
                 )
+                if self.rvq_projection_only:
+                    (
+                        projection_fidelity_loss,
+                        projection_normalized_mse,
+                        projection_cosine_loss,
+                    ) = self.rvq_projection_latent_loss(wave)
+                    loss = loss + projection_fidelity_loss
+                    if i == 0:
+                        logs['projection_fidelity_loss'] = float(
+                            projection_fidelity_loss.detach().cpu()
+                        )
+                        logs['projection_normalized_mse'] = float(
+                            projection_normalized_mse.detach().cpu()
+                        )
+                        logs['projection_cosine_loss'] = float(
+                            projection_cosine_loss.detach().cpu()
+                        )
                 (
                     recon_loss,
                     multi_spectral_recon_loss,
@@ -5409,6 +5626,18 @@ class SoundStreamTrainer(nn.Module):
             f" | code_balance={logs['codebook_balance_loss']:.6f}"
             f"(w={getattr(model, 'rq_codebook_balance_loss_weight', 0.):.4g})"
         )
+        if 'projection_latent_mse' in logs:
+            losses_str += (
+                f" | projection_latent_mse={logs['projection_latent_mse']:.6f}"
+                f" | projection_latent_cos={logs['projection_latent_cosine']:.6f}"
+                f" | projection_latent_rms_ratio={logs['projection_latent_rms_ratio']:.6f}"
+            )
+        if 'projection_fidelity_loss' in logs:
+            losses_str += (
+                f" | projection_fidelity={logs['projection_fidelity_loss']:.6f}"
+                f" | projection_nmse={logs['projection_normalized_mse']:.6f}"
+                f" | projection_cos_loss={logs['projection_cosine_loss']:.6f}"
+            )
         if rvq_ema_decay is not None:
             losses_str += f" | rvq_ema_decay={rvq_ema_decay:.3f}"
         if 'rvq_soft_perplexity_mean' in logs:
@@ -5955,6 +6184,15 @@ class SoundStreamTrainer(nn.Module):
                 isfinite(clarity_score) and
                 clarity_score > self.best_clean_online_clarity_score
             )
+            projection_checkpoint_improved = (
+                self.rvq_projection_only and
+                steps >= self.best_checkpoint_min_step and
+                online_score.get('validation_eligible', 0.) >= 0.5 and
+                not quality_reasons['online'] and
+                isfinite(online_score.get('aligned_si_sdr', float('-inf'))) and
+                online_score['aligned_si_sdr'] >
+                self.best_rvq_projection_aligned_si_sdr
+            )
             formant_score = self.formant_refinement_score(online_score)
             formant_improved = (
                 self.best_checkpoint_metric in ('recon_pretrain', 'spectral_refine') and
@@ -6461,6 +6699,24 @@ class SoundStreamTrainer(nn.Module):
                     "clean gate, q00, and RVQ passed)"
                 )
 
+            if projection_checkpoint_improved:
+                self.best_rvq_projection_aligned_si_sdr = online_score[
+                    'aligned_si_sdr'
+                ]
+                self.save_model_only(
+                    self.results_folder / 'best_rvq_projection.pt',
+                    online_model,
+                    score = self.best_rvq_projection_aligned_si_sdr,
+                    step = steps,
+                    weight_source = 'q0_projection_clean_gated',
+                )
+                self.save(str(self.results_folder / 'latest.pt'))
+                self.print(
+                    f"{steps}: saving best_rvq_projection.pt "
+                    f"(aligned_si_sdr={self.best_rvq_projection_aligned_si_sdr:.3f}; "
+                    "Q0 clean gate passed)"
+                )
+
             if formant_improved:
                 self.best_formant_score = formant_score
                 self.save_model_only(
@@ -6796,6 +7052,8 @@ class SoundStreamTrainer(nn.Module):
         return logs
 
     def train(self, log_fn = noop):
+
+        self.initialize_rvq_projections_from_pca()
 
         while self.steps < self.num_train_steps and not self.early_stopping_triggered:
             logs = self.train_step()

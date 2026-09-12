@@ -6,6 +6,7 @@ set -euo pipefail
 #   A1.5 low-LR Encoder/Decoder formant refinement (RVQ bypassed)
 #   A2 Encoder -> Decoder GAN refinement (RVQ bypassed)
 #   optional A2.5 persistent-state alignment before RVQ calibration
+#   Q0 PCA initialization + projection-only reconstruction pretraining
 #   B1 Encoder -> RVQ EMA calibration (Encoder/Decoder weights frozen)
 #   B1.5 non-GAN STE adaptation (Decoder + Encoder tail + RVQ EMA schedule)
 #   B2 Encoder -> frozen RVQ -> Decoder GAN adaptation (Encoder/RVQ frozen)
@@ -23,10 +24,17 @@ NUM_PROCESSES="${NUM_PROCESSES:-6}"
 AUDIO_DIR="${AUDIO_DIR:-$PWD/data/librispeech/LibriSpeech/train-clean-100}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
 SEED="${SEED:-42}"
+RVQ_LOOKUP_DIM="${RVQ_LOOKUP_DIM:-32}"
 BYPASS_STAGE1_STEPS="${BYPASS_STAGE1_STEPS:-150000}"
 BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS="${BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS:-60000}"
 BYPASS_FORMANT_REFINE_STEPS="${BYPASS_FORMANT_REFINE_STEPS:-20000}"
 BYPASS_STAGE2_STEPS="${BYPASS_STAGE2_STEPS:-150000}"
+RVQ_PROJECTION_STEPS="${RVQ_PROJECTION_STEPS:-10000}"
+RVQ_PROJECTION_PCA_BATCHES="${RVQ_PROJECTION_PCA_BATCHES:-100}"
+RVQ_PROJECTION_MIN_EVR="${RVQ_PROJECTION_MIN_EVR:-0.90}"
+RVQ_PROJECTION_MIN_ALIGNED_SI_SDR="${RVQ_PROJECTION_MIN_ALIGNED_SI_SDR:-7.3}"
+RVQ_PROJECTION_LATENT_MSE_WEIGHT="${RVQ_PROJECTION_LATENT_MSE_WEIGHT:-0.25}"
+RVQ_PROJECTION_LATENT_COSINE_WEIGHT="${RVQ_PROJECTION_LATENT_COSINE_WEIGHT:-0.10}"
 RVQ_CALIBRATION_STEPS="${RVQ_CALIBRATION_STEPS:-5000}"
 RVQ_JOINT_ADAPT_STEPS="${RVQ_JOINT_ADAPT_STEPS:-20000}"
 RVQ_STAGE2_STEPS="${RVQ_STAGE2_STEPS:-50000}"
@@ -40,14 +48,20 @@ BYPASS_STAGE1_CKPT="${BYPASS_STAGE1_CKPT:-}"
 BYPASS_STAGE2_CKPT="${BYPASS_STAGE2_CKPT:-}"
 PRECEDING_CONTEXT_SECONDS="${PRECEDING_CONTEXT_SECONDS:-0.5}"
 
+case "$RVQ_LOOKUP_DIM" in
+  16|24|32) ;;
+  *) echo "ERROR: RVQ_LOOKUP_DIM must be 16, 24, or 32." >&2; exit 2 ;;
+esac
+
 if (( BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS > BYPASS_STAGE1_STEPS )); then
   BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS="$BYPASS_STAGE1_STEPS"
 fi
 
-BASE="lowrank-dscnn-b234-relu-convtranspose-fp-64d-8q256-l16-${RUN_TAG}"
+BASE="lowrank-dscnn-b234-relu-convtranspose-fp-64d-8q256-l${RVQ_LOOKUP_DIM}-${RUN_TAG}"
 BYPASS_S1_DIR="$PWD/results/bypass-recon-$BASE"
 BYPASS_FORMANT_DIR="$PWD/results/bypass-formant-refine-$BASE"
 BYPASS_S2_DIR="$PWD/results/bypass-gan-$BASE"
+RVQ_PROJECTION_DIR="$PWD/results/rvq-projection-$BASE"
 RVQ_S1_DIR="$PWD/results/rvq-calibration-$BASE"
 RVQ_B15_DIR="$PWD/results/rvq-joint-adapt-$BASE"
 RVQ_S2_DIR="$PWD/results/rvq-gan-$BASE"
@@ -133,7 +147,7 @@ else
   fi
 fi
 
-CHECK_DIRS=("$RVQ_S1_DIR" "$RVQ_B15_DIR" "$RVQ_S2_DIR" "$FINAL_STATE_DIR")
+CHECK_DIRS=("$RVQ_PROJECTION_DIR" "$RVQ_S1_DIR" "$RVQ_B15_DIR" "$RVQ_S2_DIR" "$FINAL_STATE_DIR")
 if [[ "$START_PHASE" == "bypass_stage1" || \
       "$START_PHASE" == "bypass_formant_refine" ]]; then
   CHECK_DIRS=("$BYPASS_FORMANT_DIR" "$BYPASS_S2_DIR" "${CHECK_DIRS[@]}")
@@ -170,6 +184,7 @@ run_stage() {
 pick_best() {
   local dir="$1" candidate
   for candidate in \
+    best_rvq_projection.pt \
     best_by_formant.pt \
     best_full_gan_formant_balanced.pt \
     best_full_gan_balanced.pt \
@@ -188,6 +203,7 @@ pick_best() {
 
 COMMON=(
   --audio-dir "$AUDIO_DIR" --batch-size 4 --grad-accum-every 1
+  --rq-lookup-dim "$RVQ_LOOKUP_DIM"
   --segment-seconds 4 --dl-num-workers 6 --seed "$SEED"
   --decoder-upsample-mode convtranspose --no-decoder-split-first-upsample
   --save-model-every 5000 --test-eval-batches 100
@@ -317,12 +333,35 @@ fi
 
 echo "State policy: pre-RVQ A2.5 enabled=$ENABLE_PRE_RVQ_STATE_FT; post-RVQ state fine-tune is mandatory (${FINAL_STATE_STEPS} steps)."
 
+# Q0: estimate the frozen Encoder latent rank across all workers, initialize
+# Win/Wout from centered PCA, and train only the two projections through the
+# frozen Decoder.  Do not enter B1 unless reconstruction selection succeeds.
+run_stage "Q0 PCA projection-only pretraining" 29519 \
+  "$PWD/logs/rvq-projection-$BASE.log" 0 \
+  --stage recon_pretrain --results-dir "$RVQ_PROJECTION_DIR" \
+  --init-checkpoint "$BYPASS_S2_CKPT" --num-train-steps "$RVQ_PROJECTION_STEPS" \
+  --reinitialize-rvq-from-bypass-checkpoint \
+  --rvq-projection-only \
+  --rvq-projection-pca-batches "$RVQ_PROJECTION_PCA_BATCHES" \
+  --rvq-projection-min-evr "$RVQ_PROJECTION_MIN_EVR" \
+  --rvq-projection-latent-mse-weight "$RVQ_PROJECTION_LATENT_MSE_WEIGHT" \
+  --rvq-projection-latent-cosine-weight "$RVQ_PROJECTION_LATENT_COSINE_WEIGHT" \
+  --clean-gate-min-aligned-si-sdr "$RVQ_PROJECTION_MIN_ALIGNED_SI_SDR" \
+  --generator-lr 1e-4 --early-stopping-min-steps "$RVQ_PROJECTION_STEPS" \
+  --no-bypass-rvq-during-training "${RECON_LOSSES[@]}" "${COMMON[@]}" --no-resume
+RVQ_PROJECTION_CKPT="$(pick_best "$RVQ_PROJECTION_DIR" 2>/dev/null || true)"
+if [[ -z "$RVQ_PROJECTION_CKPT" ]]; then
+  echo "ERROR: Q0 projection path produced no clean validation-selected checkpoint." >&2
+  echo "Inspect $RVQ_PROJECTION_DIR/latent_pca_report.json and test lookup dim 24 or 32." >&2
+  exit 2
+fi
+echo "Q0 projection checkpoint=$RVQ_PROJECTION_CKPT"
+
 # B1: no Decoder call and no optimizer/backward step.  Only RVQ EMA and
 # dead-code replacement state changes; Encoder/Decoder tensors remain bitwise fixed.
 run_stage "B1 RVQ calibration with codec frozen" 29513 "$PWD/logs/rvq-calibration-$BASE.log" 0 \
   --stage recon_pretrain --results-dir "$RVQ_S1_DIR" \
-  --init-checkpoint "$BYPASS_S2_CKPT" --num-train-steps "$RVQ_CALIBRATION_STEPS" \
-  --reinitialize-rvq-from-bypass-checkpoint \
+  --init-checkpoint "$RVQ_PROJECTION_CKPT" --num-train-steps "$RVQ_CALIBRATION_STEPS" \
   --rvq-calibration-only --early-stopping-min-steps 0 \
   --no-bypass-rvq-during-training "${COMMON[@]}" --no-resume
 RVQ_S1_CKPT="$RVQ_S1_DIR/latest.pt"
@@ -330,14 +369,14 @@ test -f "$RVQ_S1_CKPT" || { echo "ERROR: missing $RVQ_S1_CKPT" >&2; exit 2; }
 echo "B1 checkpoint=$RVQ_S1_CKPT"
 
 # B1.5: non-adversarial quantization adaptation.  The first 2k steps train
-# Decoder only while alpha ramps z -> z_q over 3k steps.  From 2k to 15k only
+# Decoder only while alpha ramps z -> z_q over 10k steps. From 2k to 15k only
 # Encoder Block4/final latent conv joins Decoder while RVQ EMA follows the
 # changing latent distribution.  At 15k Encoder and RVQ refreeze.
 run_stage "B1.5 joint STE quantization adaptation" 29518 \
   "$PWD/logs/rvq-joint-adapt-$BASE.log" 0 \
   --stage gan_pretrain --results-dir "$RVQ_B15_DIR" \
   --init-checkpoint "$RVQ_S1_CKPT" --num-train-steps "$RVQ_JOINT_ADAPT_STEPS" \
-  --rvq-joint-adapt --rvq-warm-in-steps 3000 \
+  --rvq-joint-adapt --rvq-warm-in-steps 10000 \
   --rvq-codebook-balance-loss-weight 0.01 \
   --rvq-codebook-balance-target-perplexity 64 \
   --rvq-codebook-balance-temperature 0.1 \
@@ -384,6 +423,7 @@ echo "bypass Stage-2: $BYPASS_S2_DIR"
 if [[ "$ENABLE_PRE_RVQ_STATE_FT" == "1" ]]; then
   echo "pre-RVQ stateful fine-tune: $PRE_RVQ_STATE_DIR"
 fi
+echo "RVQ projection pretraining: $RVQ_PROJECTION_DIR"
 echo "RVQ calibration: $RVQ_S1_DIR"
 echo "RVQ joint adaptation: $RVQ_B15_DIR"
 echo "RVQ Stage-2: $RVQ_S2_DIR"

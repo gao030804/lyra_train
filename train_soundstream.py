@@ -353,7 +353,7 @@ def parse_args() -> argparse.Namespace:
             "Load Encoder/Decoder (and, when applicable, discriminator) state "
             "from a checkpoint explicitly saved with bypass_rvq=True, discard "
             "all checkpoint rq.* tensors, and keep the current model's freshly "
-            "initialized RVQ. Only valid with --rvq-calibration-only."
+            "initialized RVQ. Valid for RVQ projection pretraining or calibration."
         ),
     )
     parser.add_argument(
@@ -532,6 +532,46 @@ def parse_args() -> argparse.Namespace:
             "Run Encoder -> RVQ only under no_grad so EMA codebooks are "
             "calibrated while Encoder and Decoder weights remain unchanged."
         ),
+    )
+    parser.add_argument(
+        "--rvq-projection-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Train only PCA-initialized 64->lookup->64 projections while "
+            "bypassing discrete RVQ lookup and freezing Encoder/Decoder."
+        ),
+    )
+    parser.add_argument(
+        "--rvq-projection-pca-batches",
+        type=int,
+        default=100,
+        help="Distributed batches used to estimate latent PCA before projection training.",
+    )
+    parser.add_argument(
+        "--rq-lookup-dim",
+        type=int,
+        choices=(16, 24, 32),
+        default=16,
+        help="RVQ lookup/PCA dimension; bitrate is unchanged, storage scales with this value.",
+    )
+    parser.add_argument(
+        "--rvq-projection-min-evr",
+        type=float,
+        default=0.90,
+        help="Stop Q0 before training when PCA variance retention is below this floor.",
+    )
+    parser.add_argument(
+        "--rvq-projection-latent-mse-weight",
+        type=float,
+        default=0.0,
+        help="Q0 normalized latent reconstruction-MSE weight.",
+    )
+    parser.add_argument(
+        "--rvq-projection-latent-cosine-weight",
+        type=float,
+        default=0.0,
+        help="Q0 latent cosine-distance weight.",
     )
     parser.add_argument(
         "--rvq-joint-adapt",
@@ -1969,6 +2009,7 @@ def build_model(
     rq_codebook_balance_target_perplexity: float = 8.,
     rq_codebook_balance_temperature: float = 1.,
     bypass_rvq: bool = False,
+    rq_projection_only: bool = False,
 ) -> SoundStream:
     if sync_codebook is None:
         sync_codebook = int(os.environ.get("WORLD_SIZE", "1")) > 1
@@ -1997,6 +2038,7 @@ def build_model(
         channel_mults=(2, 4, 8, 16),
         codebook_dim=64,
         rq_lookup_dim=rq_lookup_dim,
+        rq_projection_only=rq_projection_only,
         codebook_size=codebook_size,
         rq_num_quantizers=num_quantizers,
         rq_groups=1,
@@ -2337,13 +2379,30 @@ def main() -> None:
                 "--rvq-calibration-only requires --init-checkpoint from the "
                 "completed bypass phase"
             )
+    if args.rvq_projection_only:
+        if args.bypass_rvq_during_training or args.rvq_calibration_only:
+            raise ValueError(
+                "--rvq-projection-only is mutually exclusive with bypass and calibration modes"
+            )
+        if args.stage != "recon_pretrain":
+            raise ValueError("--rvq-projection-only requires --stage recon_pretrain")
+        if args.init_checkpoint is None:
+            raise ValueError("--rvq-projection-only requires a bypass --init-checkpoint")
+    if args.rvq_projection_pca_batches < 0:
+        raise ValueError("--rvq-projection-pca-batches cannot be negative")
+    if not 0. <= args.rvq_projection_min_evr <= 1.:
+        raise ValueError("--rvq-projection-min-evr must be in [0, 1]")
+    if args.rvq_projection_latent_mse_weight < 0.:
+        raise ValueError("--rvq-projection-latent-mse-weight cannot be negative")
+    if args.rvq_projection_latent_cosine_weight < 0.:
+        raise ValueError("--rvq-projection-latent-cosine-weight cannot be negative")
     if (
         args.reinitialize_rvq_from_bypass_checkpoint and
-        not args.rvq_calibration_only
+        not (args.rvq_calibration_only or args.rvq_projection_only)
     ):
         raise ValueError(
-            "--reinitialize-rvq-from-bypass-checkpoint is only valid with "
-            "--rvq-calibration-only"
+            "--reinitialize-rvq-from-bypass-checkpoint requires projection-only "
+            "pretraining or RVQ calibration"
         )
     if args.gan_adversarial_max is not None:
         if args.gan_adversarial_max < 0:
@@ -2871,9 +2930,10 @@ def main() -> None:
     stream_context_frames = args.stream_context_frames
     # RVQ v2: 50 frames/s * 8 quantizers * 8 bits/index = 3.2 kbps.
     # The codec representation remains 64-D while lookup happens in 16-D.
-    # INT8 tables use 8 * 256 * 16 = 32 KiB; projection weights add 2 KiB.
+    # Bitrate depends on indices only; lookup dimension changes table/storage cost.
     codebook_size = 256
     num_quantizers = 8
+    rq_lookup_dim = args.rq_lookup_dim
     if args.stage in RECONSTRUCTION_STAGES:
         si_sdr_loss_weight = (
             args.si_sdr_loss_weight
@@ -3054,6 +3114,12 @@ def main() -> None:
     decoder_residual_scale_end = args.decoder_residual_scale_end
     decoder_residual_scale_warmup_start_steps = args.decoder_residual_scale_warmup_start_steps
     decoder_residual_scale_warmup_end_steps = args.decoder_residual_scale_warmup_end_steps
+    if args.rvq_projection_only:
+        # Loading the bypass checkpoint below restores its exact block scales.
+        # Q0 must not apply the ordinary Stage-1 residual-scale schedule.
+        decoder_residual_scale_start = decoder_residual_scale_end
+        decoder_residual_scale_warmup_start_steps = 0
+        decoder_residual_scale_warmup_end_steps = 0
     stage1_plateau_lr_enabled = (
         args.stage == "recon_pretrain" and
         args.stage1_plateau_lr
@@ -3122,7 +3188,12 @@ def main() -> None:
             f"Encoder LR={stage_defaults['encoder_lr']:.3e}, "
             "RVQ excluded from the generator optimizer."
         )
-    if args.stage == "recon_pretrain":
+    if args.rvq_projection_only:
+        print(
+            "Q0 checkpoint eligibility begins at step 0; Decoder residual "
+            "scales stay fixed at the init-checkpoint values."
+        )
+    elif args.stage == "recon_pretrain":
         if stage1_plateau_lr_enabled:
             print(
                 "Stage-1 LR schedule: "
@@ -3543,10 +3614,22 @@ def main() -> None:
     print(f"Codebook size: {codebook_size}")
     print(f"RVQ quantizers: {num_quantizers}")
     print("Codec latent dimension: 64")
-    print("RVQ lookup dimension: 16")
+    print(f"RVQ lookup dimension: {rq_lookup_dim}")
     print("RVQ distance: cosine (unit-normalized lookup)")
     print("RVQ gradient estimator: standard STE (rotation trick disabled)")
-    print("RVQ INT8 storage: 32 KiB codebooks + 2 KiB projections")
+    if args.rvq_projection_only:
+        print(
+            "Q0 projection-only mode: PCA initialize Win/Wout from "
+            f"{args.rvq_projection_pca_batches} distributed batches; "
+            "Encoder/Decoder/RVQ frozen; discrete lookup bypassed."
+        )
+    codebook_storage = num_quantizers * codebook_size * rq_lookup_dim
+    projection_storage = 2 * 64 * rq_lookup_dim
+    print(
+        "RVQ INT8 storage: "
+        f"{codebook_storage / 1024:.0f} KiB codebooks + "
+        f"{projection_storage / 1024:.0f} KiB projections"
+    )
     print("RVQ quantize dropout: False")
     print("RVQ dead-code threshold: 2")
     print(f"RVQ codebook synchronization: {world_size > 1}")
@@ -3607,8 +3690,9 @@ def main() -> None:
         stream_consistency_loss_warmup_steps=args.stream_consistency_loss_warmup_steps,
         codebook_size=codebook_size,
         num_quantizers=num_quantizers,
-        rq_lookup_dim=16,
+        rq_lookup_dim=rq_lookup_dim,
         rq_use_cosine_sim=True,
+        rq_projection_only=args.rvq_projection_only,
         si_sdr_loss_weight=si_sdr_loss_weight,
         click_loss_weight=click_loss_weight,
         jump_loss_weight=jump_loss_weight,
@@ -3716,6 +3800,17 @@ def main() -> None:
         dataset_fixed_crop=(args.stage == "overfit"),
         num_train_steps=num_train_steps,
         rvq_calibration_only=args.rvq_calibration_only,
+        rvq_projection_only=args.rvq_projection_only,
+        rvq_projection_pca_batches=args.rvq_projection_pca_batches,
+        rvq_projection_min_evr=args.rvq_projection_min_evr,
+        rvq_projection_latent_mse_weight=(
+            args.rvq_projection_latent_mse_weight
+            if args.rvq_projection_only else 0.
+        ),
+        rvq_projection_latent_cosine_weight=(
+            args.rvq_projection_latent_cosine_weight
+            if args.rvq_projection_only else 0.
+        ),
         lr=stage_defaults["lr"],
         encoder_lr=(
             args.stage2_encoder_lr
@@ -3751,6 +3846,7 @@ def main() -> None:
             args.stage in ("stream_finetune", "stream_finetune_long")
         ),
         exclude_encoder_from_generator_optimizer=(
+            args.rvq_projection_only or
             stage25_decoder_only_refine or
             args.stage == "stream_finetune_long" or
             (
@@ -4003,7 +4099,9 @@ def main() -> None:
         decoder_x8_residual_scale_target=stage_defaults.get("decoder_x8_residual_scale_target"),
         decoder_x8_residual_scale_ramp_steps=stage_defaults.get("decoder_x8_residual_scale_ramp_steps", 0),
         best_checkpoint_min_step=(
-            decoder_residual_scale_warmup_end_steps
+            0
+            if args.rvq_projection_only
+            else decoder_residual_scale_warmup_end_steps
             if args.stage == "recon_pretrain"
             else (
                 args.stage2_best_checkpoint_min_step
@@ -4152,7 +4250,9 @@ def main() -> None:
         ),
         freeze_codebook_before_step=None,
         freeze_encoder_before_step=(
-            2_000
+            num_train_steps + 1
+            if args.rvq_projection_only
+            else 2_000
             if rvq_joint_adapt
             else
             num_train_steps + 1
@@ -4176,9 +4276,12 @@ def main() -> None:
         rvq_warm_in_steps=args.rvq_warm_in_steps,
         decoder_lr_after_step=((15_000, 1e-6) if rvq_joint_adapt else None),
         freeze_decoder_before_step=(
-            num_train_steps if stage25_rvq_midband_refine else None
+            num_train_steps
+            if (args.rvq_projection_only or stage25_rvq_midband_refine)
+            else None
         ),
         freeze_codebook_during_training=(
+            args.rvq_projection_only or
             args.stage in ("stream_finetune", "stream_finetune_long") or
             (
                 args.stage2_targeted_refine and
@@ -4376,7 +4479,7 @@ def main() -> None:
                     args.reinitialize_rvq_from_bypass_checkpoint
                 ),
             )
-            if args.stage in (
+            if args.rvq_projection_only or args.stage in (
                 "spectral_refine",
                 "gan_pretrain",
                 "stream_finetune",

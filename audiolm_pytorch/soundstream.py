@@ -951,6 +951,7 @@ class SoundStream(Module):
         rq_stochastic_sample_codes = False,
         rq_rotation_trick = False,
         rq_use_cosine_sim = False,
+        rq_projection_only = False,
         rq_codebook_balance_loss_weight = 0.,
         rq_codebook_balance_target_perplexity = 8.,
         rq_codebook_balance_temperature = 1.,
@@ -1201,6 +1202,7 @@ class SoundStream(Module):
         if self.rq_lookup_dim <= 0:
             raise ValueError('rq_lookup_dim must be positive')
         self.rq_use_cosine_sim = bool(rq_use_cosine_sim)
+        self.rq_projection_only = bool(rq_projection_only)
         # Preserve the 64-D codec representation while performing RVQ lookup
         # in a smaller hardware-friendly space. nn.Linear on [B, T, C] is
         # exactly a bias-free 1x1 Conv1d after a channel/time transpose.
@@ -3422,7 +3424,16 @@ class SoundStream(Module):
             x = self.encoder_film(x, denoise_input)
 
         continuous_x = x
-        if self.bypass_rvq:
+        if self.rq_projection_only:
+            x = self.rq_output_projection(self.rq_input_projection(x))
+            indices = torch.full(
+                (self.rq_groups, x.shape[0], x.shape[1], self.num_quantizers),
+                -1,
+                dtype = torch.long,
+                device = x.device,
+            )
+            commit_loss = self.zero
+        elif self.bypass_rvq:
             indices = torch.full(
                 (self.rq_groups, x.shape[0], x.shape[1], self.num_quantizers),
                 -1,
@@ -3447,7 +3458,7 @@ class SoundStream(Module):
             x = self.rq_output_projection(x)
             commit_loss = self.zero
 
-        if not self.bypass_rvq:
+        if not self.bypass_rvq and not self.rq_projection_only:
             alpha = float(max(0., min(1., rvq_warm_in_alpha)))
             x = continuous_x + alpha * (x - continuous_x)
             self.rq_warm_in_alpha = alpha
@@ -3457,7 +3468,7 @@ class SoundStream(Module):
         else:
             codebook_balance_loss = self.zero
 
-        if exists(num_quantizers) and not self.bypass_rvq:
+        if exists(num_quantizers) and not self.bypass_rvq and not self.rq_projection_only:
             assert 0 < num_quantizers <= self.num_quantizers
             indices = indices[..., :num_quantizers]
             x = self.rq_output_projection(

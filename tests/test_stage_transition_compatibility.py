@@ -48,6 +48,64 @@ def test_bypass_rvq_is_saved_runtime_mode_and_emits_sentinel_indices():
     )
 
 
+def test_projection_only_path_uses_paired_linear_maps_without_rvq_codes():
+    from audiolm_pytorch.soundstream import SoundStream
+
+    model = SoundStream(
+        channels=4,
+        channel_mults=(2, 2),
+        strides=(2, 2),
+        codebook_dim=8,
+        rq_lookup_dim=4,
+        codebook_size=16,
+        rq_num_quantizers=2,
+        discr_multi_scales=(1,),
+        generator_waveform_discr_loss_weights=(1.,),
+        pad_mode="constant",
+        rq_projection_only=True,
+    )
+    latent, indices, commitment = model(
+        torch.randn(1, 256),
+        return_encoded=True,
+    )
+
+    assert latent.shape == (1, 64, 8)
+    assert torch.all(indices == -1)
+    assert commitment.item() == 0
+    assert model.rq_input_projection.weight.shape == (4, 8)
+    assert model.rq_output_projection.weight.shape == (8, 4)
+    assert model.configs["rq_projection_only"] is True
+
+
+def test_rvq_pipeline_runs_projection_gate_before_calibration():
+    launcher = (ROOT / "run_bypass_rvq_stage1_stage2.sh").read_text(
+        encoding="utf-8"
+    )
+    q0 = launcher.index('Q0 PCA projection-only pretraining')
+    b1 = launcher.index('B1 RVQ calibration with codec frozen')
+    assert q0 < b1
+    assert '--rvq-projection-only' in launcher
+    assert 'latent_pca_report.json' in launcher
+    assert '--init-checkpoint "$RVQ_PROJECTION_CKPT"' in launcher
+    assert 'RVQ_LOOKUP_DIM="${RVQ_LOOKUP_DIM:-32}"' in launcher
+    assert 'best_rvq_projection.pt' in launcher
+    assert '--rvq-projection-latent-mse-weight' in launcher
+    assert '--rvq-projection-latent-cosine-weight' in launcher
+
+
+def test_q0_has_independent_checkpoint_and_fixed_decoder_scale_paths():
+    trainer = (ROOT / "audiolm_pytorch" / "trainer.py").read_text(
+        encoding="utf-8"
+    )
+    entrypoint = (ROOT / "train_soundstream.py").read_text(encoding="utf-8")
+
+    assert "if self.rvq_projection_only:" in trainer
+    assert "best_rvq_projection.pt" in trainer
+    assert "projection_fidelity_loss" in trainer
+    assert "0\n            if args.rvq_projection_only" in entrypoint
+    assert "if args.rvq_projection_only or args.stage in (" in entrypoint
+
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -210,7 +268,7 @@ def test_pipeline_inserts_joint_rvq_adaptation_and_shortens_b2():
     assert 'RVQ_JOINT_ADAPT_STEPS="${RVQ_JOINT_ADAPT_STEPS:-20000}"' in launcher
     assert 'RVQ_STAGE2_STEPS="${RVQ_STAGE2_STEPS:-50000}"' in launcher
     assert 'B1.5 joint STE quantization adaptation' in launcher
-    assert '--rvq-warm-in-steps 3000' in launcher
+    assert '--rvq-warm-in-steps 10000' in launcher
     assert '--rvq-codebook-balance-loss-weight 0.01' in launcher
     assert '--rvq-codebook-balance-target-perplexity 64' in launcher
     assert '--stage2-encoder-unfreeze-step -1' in launcher
