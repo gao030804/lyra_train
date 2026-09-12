@@ -36,5 +36,6 @@ def test_trainer_keeps_upper_highband_diagnostic_only():
     assert "'codebook_q00_perplexity'," in source
     assert "reasons.append('missing_upper_hf_baseline')" not in source
     assert "High-frequency metrics remain diagnostics/loss targets" in source
-    assert "reasons.append('q00_active_drop')" in source
-    assert "reasons.append('q00_perplexity_drop')" in source
+    assert "reasons.append('q00_active_drop')" not in source
+    assert "reasons.append('q00_perplexity_drop')" not in source
+    assert "rvq_deployable_distribution_eligible" in source

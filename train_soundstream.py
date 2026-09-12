@@ -34,12 +34,12 @@ DEFAULT_AUDIO_DIR = (
 )
 
 STAGE_RESULTS_DIRS = {
-    "overfit": PROJECT_DIR / "results" / "overfit-lowrank-dscnn-fp-64d-16q16",
-    "recon_pretrain": PROJECT_DIR / "results" / "recon-pretrain-lowrank-dscnn-fp-64d-16q16",
-    "spectral_refine": PROJECT_DIR / "results" / "spectral-refine-lowrank-dscnn-fp-64d-16q16",
-    "gan_pretrain": PROJECT_DIR / "results" / "gan-pretrain-lowrank-dscnn-fp-64d-16q16",
-    "stream_finetune": PROJECT_DIR / "results" / "stream-finetune-lowrank-dscnn-fp-64d-16q16",
-    "stream_finetune_long": PROJECT_DIR / "results" / "stream-finetune-long-lowrank-dscnn-fp-64d-16q16",
+    "overfit": PROJECT_DIR / "results" / "overfit-lowrank-dscnn-fp-64d-8q256-l16",
+    "recon_pretrain": PROJECT_DIR / "results" / "recon-pretrain-lowrank-dscnn-fp-64d-8q256-l16",
+    "spectral_refine": PROJECT_DIR / "results" / "spectral-refine-lowrank-dscnn-fp-64d-8q256-l16",
+    "gan_pretrain": PROJECT_DIR / "results" / "gan-pretrain-lowrank-dscnn-fp-64d-8q256-l16",
+    "stream_finetune": PROJECT_DIR / "results" / "stream-finetune-lowrank-dscnn-fp-64d-8q256-l16",
+    "stream_finetune_long": PROJECT_DIR / "results" / "stream-finetune-long-lowrank-dscnn-fp-64d-8q256-l16",
 }
 
 RECONSTRUCTION_STAGES = frozenset((
@@ -533,6 +533,19 @@ def parse_args() -> argparse.Namespace:
             "calibrated while Encoder and Decoder weights remain unchanged."
         ),
     )
+    parser.add_argument(
+        "--rvq-joint-adapt",
+        action="store_true",
+        help="Run non-GAN B1.5 joint Encoder-tail/RVQ-EMA/Decoder adaptation.",
+    )
+    parser.add_argument("--rvq-warm-in-steps", type=int, default=0,
+                        help="Linearly mix continuous latent into full RVQ latent over N steps.")
+    parser.add_argument("--rvq-codebook-balance-loss-weight", type=float, default=0.,
+                        help="Weight of the differentiable per-level entropy-floor loss.")
+    parser.add_argument("--rvq-codebook-balance-target-perplexity", type=float, default=8.,
+                        help="Soft-assignment perplexity floor for each RVQ level.")
+    parser.add_argument("--rvq-codebook-balance-temperature", type=float, default=1.,
+                        help="Squared-distance soft-assignment temperature.")
     parser.add_argument(
         "--formant-peak-loss-weight",
         type=float,
@@ -1693,6 +1706,7 @@ def load_model_weights_only(
             ("rq_num_quantizers", "num_quantizers"),
             ("codebook_size", "codebook_size"),
             ("codebook_dim", "codebook_dim"),
+            ("rq_lookup_dim", "rq_lookup_dim"),
         )
         rvq_mismatches = []
         for config_name, model_name in rvq_fields:
@@ -1718,6 +1732,14 @@ def load_model_weights_only(
                 "Checkpoint RVQ topology mismatch: "
                 + "; ".join(rvq_mismatches)
                 + ". Start a fresh run or use a matching checkpoint."
+            )
+        checkpoint_cosine = bool(checkpoint_config.get("rq_use_cosine_sim", False))
+        model_cosine = bool(getattr(model, "rq_use_cosine_sim", False))
+        if checkpoint_cosine != model_cosine and not reinitialize_rvq_from_bypass:
+            raise ValueError(
+                "Checkpoint RVQ distance mismatch: "
+                f"checkpoint_cosine={checkpoint_cosine}, current_model_cosine={model_cosine}. "
+                "Start a fresh RVQ run or rebuild it from a confirmed bypass checkpoint."
             )
         checkpoint_upsample = checkpoint_config.get(
             "decoder_upsample_mode",
@@ -1860,17 +1882,20 @@ def load_model_weights_only(
             checkpoint_config.get("rq_num_quantizers", "unknown"),
             checkpoint_config.get("codebook_size", "unknown"),
             checkpoint_config.get("codebook_dim", "unknown"),
+            checkpoint_config.get("rq_lookup_dim", checkpoint_config.get("codebook_dim", "unknown")),
         )
         new_topology = (
             getattr(model, "num_quantizers", "unknown"),
             getattr(model, "codebook_size", "unknown"),
             getattr(model, "codebook_dim", "unknown"),
+            getattr(model, "rq_lookup_dim", "unknown"),
         )
         print(
             "Loaded non-RVQ state from a confirmed bypass checkpoint; "
             f"discarded RVQ topology {old_topology[0]}x{old_topology[1]}x"
-            f"{old_topology[2]} and initialized current RVQ topology "
+            f"{old_topology[2]} (lookup={old_topology[3]}) and initialized current RVQ topology "
             f"{new_topology[0]}x{new_topology[1]}x{new_topology[2]} "
+            f"(lookup={new_topology[3]}, cosine={getattr(model, 'rq_use_cosine_sim', False)}) "
             f"({len(skipped_keys)} state keys left freshly initialized)."
         )
         print("Optimizer, scheduler, and training step will start fresh.")
@@ -1906,6 +1931,8 @@ def build_model(
     stream_consistency_loss_warmup_steps: int,
     codebook_size: int,
     num_quantizers: int,
+    rq_lookup_dim: int,
+    rq_use_cosine_sim: bool,
     si_sdr_loss_weight: float,
     spectral_envelope_loss_weight: float,
     formant_peak_loss_weight: float,
@@ -1938,6 +1965,9 @@ def build_model(
     decoder_split_first_upsample: bool,
     commitment_loss_weight: float | None = None,
     sync_codebook: bool | None = None,
+    rq_codebook_balance_loss_weight: float = 0.,
+    rq_codebook_balance_target_perplexity: float = 8.,
+    rq_codebook_balance_temperature: float = 1.,
     bypass_rvq: bool = False,
 ) -> SoundStream:
     if sync_codebook is None:
@@ -1966,6 +1996,7 @@ def build_model(
         channels=16,
         channel_mults=(2, 4, 8, 16),
         codebook_dim=64,
+        rq_lookup_dim=rq_lookup_dim,
         codebook_size=codebook_size,
         rq_num_quantizers=num_quantizers,
         rq_groups=1,
@@ -1973,6 +2004,10 @@ def build_model(
         # vector-quantize-pytorch falls back to standard STE when the mutually
         # exclusive rotation trick is disabled.
         rq_rotation_trick=False,
+        rq_use_cosine_sim=rq_use_cosine_sim,
+        rq_codebook_balance_loss_weight=rq_codebook_balance_loss_weight,
+        rq_codebook_balance_target_perplexity=rq_codebook_balance_target_perplexity,
+        rq_codebook_balance_temperature=rq_codebook_balance_temperature,
         use_lookup_free_quantizer=False,
         use_finite_scalar_quantizer=False,
         use_local_attn=False,
@@ -2067,20 +2102,23 @@ def main() -> None:
     stage25_decoder_only_refine = bool(args.stage25_decoder_only_refine)
     stage25_joint_recon_refine = bool(args.stage25_joint_recon_refine)
     stage25_rvq_midband_refine = bool(args.stage25_rvq_midband_refine)
+    rvq_joint_adapt = bool(args.rvq_joint_adapt)
     stage25_refine_mode_count = sum((
         stage25_decoder_only_refine,
         stage25_joint_recon_refine,
         stage25_rvq_midband_refine,
+        rvq_joint_adapt,
     ))
     if stage25_refine_mode_count > 1:
         raise ValueError(
             "--stage25-decoder-only-refine, --stage25-joint-recon-refine, "
-            "and --stage25-rvq-midband-refine are mutually exclusive."
+            "--stage25-rvq-midband-refine, and --rvq-joint-adapt are mutually exclusive."
         )
     stage25_reconstruction_only_refine = (
         stage25_decoder_only_refine or
         stage25_joint_recon_refine or
-        stage25_rvq_midband_refine
+        stage25_rvq_midband_refine or
+        rvq_joint_adapt
     )
     if stage25_reconstruction_only_refine:
         # Reuse Stage-2.5 initialization and quality-retention logic while
@@ -2096,6 +2134,9 @@ def main() -> None:
             )
             stage_defaults.update(
                 steps=(
+                    20_000
+                    if rvq_joint_adapt
+                    else
                     3_000
                     if stage25_rvq_midband_refine
                     else 2_000
@@ -2113,6 +2154,9 @@ def main() -> None:
                     100 if stage25_rvq_midband_refine else 250
                 ),
                 min_steps=(
+                    20_000
+                    if rvq_joint_adapt
+                    else
                     1_000
                     if stage25_rvq_midband_refine
                     else 1_000
@@ -2120,6 +2164,9 @@ def main() -> None:
                     else 3_000
                 ),
                 patience=(
+                    None
+                    if rvq_joint_adapt
+                    else
                     10 if stage25_rvq_midband_refine
                     else 8
                 ),
@@ -2127,11 +2174,17 @@ def main() -> None:
                     0.001 if is_short_frameguard_refine else 0.002
                 ),
                 lr=(
+                    5e-6
+                    if rvq_joint_adapt
+                    else
                     1e-7
                     if stage25_rvq_midband_refine
                     else args.stage25_decoder_lr
                 ),
                 encoder_lr=(
+                    1e-6
+                    if rvq_joint_adapt
+                    else
                     2e-8
                     if stage25_rvq_midband_refine
                     else args.stage25_encoder_lr
@@ -2201,7 +2254,7 @@ def main() -> None:
         # Encoder weights plus codebook EMA/dead-code state. Decoder weights
         # remain fixed for the complete controlled experiment.
         args.stage2_unfreeze_encoder_rvq_step = (
-            0 if stage25_rvq_midband_refine else -1
+            2_000 if rvq_joint_adapt else 0 if stage25_rvq_midband_refine else -1
         )
         if stage25_rvq_midband_refine:
             args.stage2_quality_retention_patience = 4
@@ -2296,6 +2349,21 @@ def main() -> None:
         if args.gan_adversarial_max < 0:
             raise ValueError("--gan-adversarial-max cannot be negative.")
         stage_defaults["gan_adversarial_max"] = args.gan_adversarial_max
+    if args.rvq_warm_in_steps < 0:
+        raise ValueError("--rvq-warm-in-steps cannot be negative.")
+    if args.rvq_codebook_balance_loss_weight < 0.:
+        raise ValueError("--rvq-codebook-balance-loss-weight cannot be negative.")
+    if not 1. <= args.rvq_codebook_balance_target_perplexity <= 256.:
+        raise ValueError("--rvq-codebook-balance-target-perplexity must be in [1, 256].")
+    if args.rvq_codebook_balance_temperature <= 0.:
+        raise ValueError("--rvq-codebook-balance-temperature must be positive.")
+    if args.rvq_joint_adapt:
+        if args.stage != "gan_pretrain":
+            raise ValueError("--rvq-joint-adapt requires --stage gan_pretrain.")
+        if args.bypass_rvq_during_training or args.rvq_calibration_only:
+            raise ValueError("--rvq-joint-adapt requires RVQ in the training path.")
+        if (args.num_train_steps or stage_defaults["steps"]) < 15_000:
+            raise ValueError("--rvq-joint-adapt requires at least 15000 training steps.")
     if args.gan_feature_max is not None:
         if args.gan_feature_max < 0:
             raise ValueError("--gan-feature-max cannot be negative.")
@@ -2801,11 +2869,11 @@ def main() -> None:
     strides = (2, 4, 5, 8)
     stream_frame_size = math.prod(strides)
     stream_context_frames = args.stream_context_frames
-    # 50 frames/s * 16 quantizers * 4 bits/index = 3.2 kbps.
-    # Each 64-D deployment codeword is INT8, so the complete RVQ table is
-    # 16 * 16 * 64 = 16 KiB. Two 4-bit indices can be packed per byte.
-    codebook_size = 16
-    num_quantizers = 16
+    # RVQ v2: 50 frames/s * 8 quantizers * 8 bits/index = 3.2 kbps.
+    # The codec representation remains 64-D while lookup happens in 16-D.
+    # INT8 tables use 8 * 256 * 16 = 32 KiB; projection weights add 2 KiB.
+    codebook_size = 256
+    num_quantizers = 8
     if args.stage in RECONSTRUCTION_STAGES:
         si_sdr_loss_weight = (
             args.si_sdr_loss_weight
@@ -3021,7 +3089,13 @@ def main() -> None:
         "RVQ gradient estimator: standard STE "
         "(rotation_trick=False; codebook remains EMA-updated)"
     )
-    if stage25_decoder_only_refine:
+    if rvq_joint_adapt:
+        print(
+            "B1.5 joint RVQ adaptation: Decoder LR=5e-6; Encoder Block4/final "
+            "LR=1e-6 from step 2k to 15k; RVQ EMA follows until 15k; "
+            "quantization warm-in and entropy-floor balance are enabled; GAN disabled."
+        )
+    elif stage25_decoder_only_refine:
         print(
             "Stage-2.5 optimizer groups: "
             f"Decoder LR={stage_defaults['lr']:.3e}; "
@@ -3314,7 +3388,8 @@ def main() -> None:
             "active_spectral_score_weight="
             f"{args.stage2_active_spectral_score_weight:g}, "
             "AC320/comb/high-frequency scores=diagnostic-only, "
-            "q00=(active>=0.70, perplexity>=8/16), q01/RVQ healthy, "
+            "quality selection rejects collapse only; normalized RVQ distribution "
+            "metrics are tracked separately for deployability, "
             f"hard_stop=(quality={args.stage2_quality_retention_patience}, "
             f"rvq={args.stage2_rvq_retention_patience}) validation checks"
         )
@@ -3467,6 +3542,11 @@ def main() -> None:
         print(f"Boundary loss radius: {args.boundary_loss_radius} samples")
     print(f"Codebook size: {codebook_size}")
     print(f"RVQ quantizers: {num_quantizers}")
+    print("Codec latent dimension: 64")
+    print("RVQ lookup dimension: 16")
+    print("RVQ distance: cosine (unit-normalized lookup)")
+    print("RVQ gradient estimator: standard STE (rotation trick disabled)")
+    print("RVQ INT8 storage: 32 KiB codebooks + 2 KiB projections")
     print("RVQ quantize dropout: False")
     print("RVQ dead-code threshold: 2")
     print(f"RVQ codebook synchronization: {world_size > 1}")
@@ -3509,9 +3589,9 @@ def main() -> None:
             f"{args.test_context_ms:.1f} ms previous context discarded from output"
         )
 
-    # Fixed 3.2 kbps RVQ profile:
+    # Fixed RVQ-v2 3.2 kbps profile:
     # 16000 / 320 = 50 frames/s
-    # log2(16) = 4 bits/token; 16 quantizers = 3.2 kbps
+    # log2(256) = 8 bits/token; 8 quantizers = 3.2 kbps
     soundstream = build_model(
         args.stage,
         sample_rate=sample_rate,
@@ -3527,6 +3607,8 @@ def main() -> None:
         stream_consistency_loss_warmup_steps=args.stream_consistency_loss_warmup_steps,
         codebook_size=codebook_size,
         num_quantizers=num_quantizers,
+        rq_lookup_dim=16,
+        rq_use_cosine_sim=True,
         si_sdr_loss_weight=si_sdr_loss_weight,
         click_loss_weight=click_loss_weight,
         jump_loss_weight=jump_loss_weight,
@@ -3581,6 +3663,9 @@ def main() -> None:
             else 0.1
         ),
         sync_codebook=(world_size > 1),
+        rq_codebook_balance_loss_weight=args.rvq_codebook_balance_loss_weight,
+        rq_codebook_balance_target_perplexity=args.rvq_codebook_balance_target_perplexity,
+        rq_codebook_balance_temperature=args.rvq_codebook_balance_temperature,
         bypass_rvq=args.bypass_rvq_during_training,
     )
 
@@ -3651,7 +3736,8 @@ def main() -> None:
                     not args.stage2_targeted_refine and
                     args.stage2_unfreeze_encoder_rvq_step >= 0
                 ) or
-                args.stage == "stream_finetune"
+                args.stage == "stream_finetune" or
+                rvq_joint_adapt
             )
             else None
         ),
@@ -4060,9 +4146,15 @@ def main() -> None:
         quality_retention_patience=args.stage2_quality_retention_patience,
         quality_retention_rvq_patience=args.stage2_rvq_retention_patience,
         stage1_rvq_retention_patience=args.stage1_rvq_retention_patience,
-        freeze_codebook_after_step=stage_defaults.get("freeze_codebook_after_step"),
+        freeze_codebook_after_step=(
+            15_000 if rvq_joint_adapt
+            else stage_defaults.get("freeze_codebook_after_step")
+        ),
         freeze_codebook_before_step=None,
         freeze_encoder_before_step=(
+            2_000
+            if rvq_joint_adapt
+            else
             num_train_steps + 1
             if (
                 args.stage == "stream_finetune_long" or
@@ -4080,6 +4172,9 @@ def main() -> None:
             if args.stage == "gan_pretrain"
             else None
         ),
+        freeze_encoder_after_step=(15_000 if rvq_joint_adapt else None),
+        rvq_warm_in_steps=args.rvq_warm_in_steps,
+        decoder_lr_after_step=((15_000, 1e-6) if rvq_joint_adapt else None),
         freeze_decoder_before_step=(
             num_train_steps if stage25_rvq_midband_refine else None
         ),
@@ -4087,7 +4182,8 @@ def main() -> None:
             args.stage in ("stream_finetune", "stream_finetune_long") or
             (
                 args.stage2_targeted_refine and
-                not stage25_rvq_midband_refine
+                not stage25_rvq_midband_refine and
+                not rvq_joint_adapt
             ) or
             (
                 args.stage == "gan_pretrain" and

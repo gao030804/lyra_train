@@ -7,6 +7,7 @@ set -euo pipefail
 #   A2 Encoder -> Decoder GAN refinement (RVQ bypassed)
 #   optional A2.5 persistent-state alignment before RVQ calibration
 #   B1 Encoder -> RVQ EMA calibration (Encoder/Decoder weights frozen)
+#   B1.5 non-GAN STE adaptation (Decoder + Encoder tail + RVQ EMA schedule)
 #   B2 Encoder -> frozen RVQ -> Decoder GAN adaptation (Encoder/RVQ frozen)
 #   final persistent-state Decoder fine-tune (Encoder/RVQ frozen, no GAN)
 
@@ -27,7 +28,8 @@ BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS="${BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS
 BYPASS_FORMANT_REFINE_STEPS="${BYPASS_FORMANT_REFINE_STEPS:-20000}"
 BYPASS_STAGE2_STEPS="${BYPASS_STAGE2_STEPS:-150000}"
 RVQ_CALIBRATION_STEPS="${RVQ_CALIBRATION_STEPS:-5000}"
-RVQ_STAGE2_STEPS="${RVQ_STAGE2_STEPS:-150000}"
+RVQ_JOINT_ADAPT_STEPS="${RVQ_JOINT_ADAPT_STEPS:-20000}"
+RVQ_STAGE2_STEPS="${RVQ_STAGE2_STEPS:-50000}"
 ENABLE_PRE_RVQ_STATE_FT="${ENABLE_PRE_RVQ_STATE_FT:-0}"
 PRE_RVQ_STATE_STEPS="${PRE_RVQ_STATE_STEPS:-20000}"
 FINAL_STATE_STEPS="${FINAL_STATE_STEPS:-10000}"
@@ -42,11 +44,12 @@ if (( BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS > BYPASS_STAGE1_STEPS )); then
   BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS="$BYPASS_STAGE1_STEPS"
 fi
 
-BASE="lowrank-dscnn-b234-relu-convtranspose-fp-64d-16q16-${RUN_TAG}"
+BASE="lowrank-dscnn-b234-relu-convtranspose-fp-64d-8q256-l16-${RUN_TAG}"
 BYPASS_S1_DIR="$PWD/results/bypass-recon-$BASE"
 BYPASS_FORMANT_DIR="$PWD/results/bypass-formant-refine-$BASE"
 BYPASS_S2_DIR="$PWD/results/bypass-gan-$BASE"
 RVQ_S1_DIR="$PWD/results/rvq-calibration-$BASE"
+RVQ_B15_DIR="$PWD/results/rvq-joint-adapt-$BASE"
 RVQ_S2_DIR="$PWD/results/rvq-gan-$BASE"
 PRE_RVQ_STATE_DIR="$PWD/results/state-pre-rvq-$BASE"
 FINAL_STATE_DIR="$PWD/results/state-final-rvq-$BASE"
@@ -61,6 +64,14 @@ fi
 # length would silently leave B2's offline checkpoint as the final artifact.
 if (( FINAL_STATE_STEPS <= 0 )); then
   echo "ERROR: FINAL_STATE_STEPS must be positive; post-RVQ state alignment is mandatory." >&2
+  exit 2
+fi
+if (( RVQ_JOINT_ADAPT_STEPS < 15000 )); then
+  echo "ERROR: RVQ_JOINT_ADAPT_STEPS must be at least 15000 for all B1.5 phases." >&2
+  exit 2
+fi
+if (( RVQ_STAGE2_STEPS <= 0 )); then
+  echo "ERROR: RVQ_STAGE2_STEPS must be positive." >&2
   exit 2
 fi
 
@@ -122,7 +133,7 @@ else
   fi
 fi
 
-CHECK_DIRS=("$RVQ_S1_DIR" "$RVQ_S2_DIR" "$FINAL_STATE_DIR")
+CHECK_DIRS=("$RVQ_S1_DIR" "$RVQ_B15_DIR" "$RVQ_S2_DIR" "$FINAL_STATE_DIR")
 if [[ "$START_PHASE" == "bypass_stage1" || \
       "$START_PHASE" == "bypass_formant_refine" ]]; then
   CHECK_DIRS=("$BYPASS_FORMANT_DIR" "$BYPASS_S2_DIR" "${CHECK_DIRS[@]}")
@@ -318,12 +329,35 @@ RVQ_S1_CKPT="$RVQ_S1_DIR/latest.pt"
 test -f "$RVQ_S1_CKPT" || { echo "ERROR: missing $RVQ_S1_CKPT" >&2; exit 2; }
 echo "B1 checkpoint=$RVQ_S1_CKPT"
 
-# B2: standard Stage-2 policy freezes Encoder and RVQ for the whole phase;
+# B1.5: non-adversarial quantization adaptation.  The first 2k steps train
+# Decoder only while alpha ramps z -> z_q over 3k steps.  From 2k to 15k only
+# Encoder Block4/final latent conv joins Decoder while RVQ EMA follows the
+# changing latent distribution.  At 15k Encoder and RVQ refreeze.
+run_stage "B1.5 joint STE quantization adaptation" 29518 \
+  "$PWD/logs/rvq-joint-adapt-$BASE.log" 0 \
+  --stage gan_pretrain --results-dir "$RVQ_B15_DIR" \
+  --init-checkpoint "$RVQ_S1_CKPT" --num-train-steps "$RVQ_JOINT_ADAPT_STEPS" \
+  --rvq-joint-adapt --rvq-warm-in-steps 3000 \
+  --rvq-codebook-balance-loss-weight 0.01 \
+  --rvq-codebook-balance-target-perplexity 64 \
+  --rvq-codebook-balance-temperature 0.1 \
+  --no-bypass-rvq-during-training "${RECON_LOSSES[@]}" "${COMMON[@]}" --no-resume
+RVQ_B15_CKPT="$(pick_best "$RVQ_B15_DIR" 2>/dev/null || true)"
+if [[ -z "$RVQ_B15_CKPT" && -f "$RVQ_B15_DIR/latest.pt" ]]; then
+  RVQ_B15_CKPT="$RVQ_B15_DIR/latest.pt"
+fi
+test -f "$RVQ_B15_CKPT" || { echo "ERROR: B1.5 produced no checkpoint" >&2; exit 2; }
+echo "B1.5 checkpoint=$RVQ_B15_CKPT"
+
+# B2: Encoder and RVQ are frozen for the whole shortened GAN phase;
 # Decoder adapts to quantization error while GAN discriminators are trained.
 run_stage "B2 RVQ GAN decoder adaptation" 29514 "$PWD/logs/rvq-gan-$BASE.log" 0 \
   --stage gan_pretrain --results-dir "$RVQ_S2_DIR" \
-  --init-checkpoint "$RVQ_S1_CKPT" --num-train-steps "$RVQ_STAGE2_STEPS" \
-  --no-bypass-rvq-during-training "${GAN_LOSSES[@]}" "${COMMON[@]}" --no-resume
+  --init-checkpoint "$RVQ_B15_CKPT" --num-train-steps "$RVQ_STAGE2_STEPS" \
+  --no-bypass-rvq-during-training "${GAN_LOSSES[@]}" \
+  --stage2-encoder-unfreeze-step -1 --early-stopping-min-steps 10000 \
+  --early-stopping-patience 20 --stage2-quality-hard-stop \
+  "${COMMON[@]}" --no-resume
 RVQ_S2_CKPT="$(pick_best "$RVQ_S2_DIR")"
 echo "B2 checkpoint=$RVQ_S2_CKPT"
 
@@ -343,7 +377,7 @@ run_stage "Final post-RVQ stateful Decoder fine-tune" 29517 \
 FINAL_STATE_CKPT="$(pick_best "$FINAL_STATE_DIR")"
 echo "Final stateful checkpoint=$FINAL_STATE_CKPT"
 
-echo "===== five-phase training complete ====="
+echo "===== deployment training pipeline complete ====="
 echo "bypass Stage-1: $BYPASS_S1_DIR"
 echo "bypass formant refine: $BYPASS_FORMANT_DIR"
 echo "bypass Stage-2: $BYPASS_S2_DIR"
@@ -351,5 +385,6 @@ if [[ "$ENABLE_PRE_RVQ_STATE_FT" == "1" ]]; then
   echo "pre-RVQ stateful fine-tune: $PRE_RVQ_STATE_DIR"
 fi
 echo "RVQ calibration: $RVQ_S1_DIR"
+echo "RVQ joint adaptation: $RVQ_B15_DIR"
 echo "RVQ Stage-2: $RVQ_S2_DIR"
 echo "Final stateful fine-tune: $FINAL_STATE_DIR"

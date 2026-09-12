@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import math
 import copy
 import pickle
 import random
@@ -433,6 +434,9 @@ class SoundStreamTrainer(nn.Module):
         freeze_codebook_before_step: int | None = None,
         freeze_codebook_during_training: bool = False,
         freeze_encoder_before_step: int | None = None,
+        freeze_encoder_after_step: int | None = None,
+        rvq_warm_in_steps: int = 0,
+        decoder_lr_after_step: tuple[int, float] | None = None,
         freeze_decoder_before_step: int | None = None,
         log_losses_every: int = 1,
         results_folder: str = './results',
@@ -721,6 +725,10 @@ class SoundStreamTrainer(nn.Module):
             "learning_rate": lr,
             "encoder_learning_rate": encoder_lr,
             "encoder_trainable_from_block": encoder_trainable_from_block,
+            "freeze_encoder_before_step": freeze_encoder_before_step,
+            "freeze_encoder_after_step": freeze_encoder_after_step,
+            "rvq_warm_in_steps": rvq_warm_in_steps,
+            "decoder_lr_after_step": decoder_lr_after_step,
             "rq_excluded_from_generator_optimizer": exclude_rq_from_generator_optimizer,
             "encoder_excluded_from_generator_optimizer": (
                 exclude_encoder_from_generator_optimizer
@@ -743,6 +751,9 @@ class SoundStreamTrainer(nn.Module):
         self.encoder_excluded_from_generator_optimizer = bool(
             exclude_encoder_from_generator_optimizer
         )
+        self.rq_excluded_from_generator_optimizer = bool(
+            exclude_rq_from_generator_optimizer
+        )
         self._stage2_latent_reference_encoder = None
         self.first_decoder_block_excluded_from_generator_optimizer = bool(
             exclude_first_decoder_block_from_generator_optimizer
@@ -751,11 +762,21 @@ class SoundStreamTrainer(nn.Module):
         # optimizers
 
         generator_parameters = list(soundstream.non_discr_parameters())
-        rq_parameter_ids = {id(parameter) for parameter in soundstream.rq.parameters()}
+        rq_modules = [
+            soundstream.rq,
+            soundstream.rq_input_projection,
+            soundstream.rq_output_projection,
+        ]
+        rq_parameter_ids = {
+            id(parameter)
+            for module in rq_modules
+            for parameter in module.parameters()
+        }
         if exclude_rq_from_generator_optimizer:
             # Keep the quantizer a differentiable path for Encoder inputs while
             # preventing parameter-gradient accumulation and optimizer updates.
-            soundstream.rq.requires_grad_(False)
+            for module in rq_modules:
+                module.requires_grad_(False)
             generator_parameters = [
                 parameter for parameter in generator_parameters
                 if id(parameter) not in rq_parameter_ids
@@ -1367,11 +1388,16 @@ class SoundStreamTrainer(nn.Module):
         assert not exists(freeze_codebook_after_step) or freeze_codebook_after_step >= 0
         assert not exists(freeze_codebook_before_step) or freeze_codebook_before_step >= 0
         assert not exists(freeze_encoder_before_step) or freeze_encoder_before_step >= 0
+        assert not exists(freeze_encoder_after_step) or freeze_encoder_after_step >= 0
+        assert rvq_warm_in_steps >= 0
         assert not exists(freeze_decoder_before_step) or freeze_decoder_before_step >= 0
         self.freeze_codebook_after_step = freeze_codebook_after_step
         self.freeze_codebook_before_step = freeze_codebook_before_step
         self.freeze_codebook_during_training = freeze_codebook_during_training
         self.freeze_encoder_before_step = freeze_encoder_before_step
+        self.freeze_encoder_after_step = freeze_encoder_after_step
+        self.rvq_warm_in_steps = int(rvq_warm_in_steps)
+        self.decoder_lr_after_step = decoder_lr_after_step
         self.freeze_decoder_before_step = freeze_decoder_before_step
 
         assert apply_grad_penalty_every >= 0
@@ -1747,6 +1773,11 @@ class SoundStreamTrainer(nn.Module):
             active_codes = int((quantizer_counts > 0).sum().detach().cpu())
             dead_codes = codebook_size - active_codes
             normalized_perplexity = perplexity / max(1, codebook_size)
+            normalized_entropy = (
+                entropy / math.log(codebook_size)
+                if codebook_size > 1 and quantizer_counts.sum() > 0
+                else quantizer_counts.new_tensor(0.)
+            )
             top_probabilities = probabilities.sort(descending=True).values
 
             active_ratios.append(active_ratio)
@@ -1754,8 +1785,9 @@ class SoundStreamTrainer(nn.Module):
             active_ratio_value = float(active_ratio.detach().cpu())
             perplexity_value = float(perplexity.detach().cpu())
             collapsed_quantizers += int(
-                active_ratio_value < 0.10 or
-                perplexity_value < max(2., 0.25 * codebook_size)
+                active_ratio_value < 0.05 or
+                float(normalized_perplexity.detach().cpu()) < 0.02 or
+                float(top_probabilities[:1].sum().detach().cpu()) > 0.90
             )
             prefix = f'codebook_q{quantizer_index:02d}'
             metrics[f'{prefix}_active_codes'] = active_codes
@@ -1767,6 +1799,9 @@ class SoundStreamTrainer(nn.Module):
             )
             metrics[f'{prefix}_normalized_perplexity'] = float(
                 normalized_perplexity.detach().cpu()
+            )
+            metrics[f'{prefix}_normalized_entropy'] = float(
+                normalized_entropy.detach().cpu()
             )
             metrics[f'{prefix}_dead_codes'] = dead_codes
             metrics[f'{prefix}_top1_prob'] = float(
@@ -3357,41 +3392,11 @@ class SoundStreamTrainer(nn.Module):
         ):
             reasons.append('click')
         bypass_rvq = metrics.get('bypass_rvq', 0.) >= 0.5
-        if not bypass_rvq:
-            if (
-                metrics.get('codebook_q00_active_ratio', 0.) <
-                self.quality_retention_q00_min_active_ratio or
-                metrics.get('codebook_q00_perplexity', 0.) <
-                self.quality_retention_q00_min_perplexity
-            ):
-                reasons.append('q00')
-        baseline_q00_active = baseline.get('codebook_q00_active_ratio')
-        if (
-            exists(self.quality_retention_max_q00_active_ratio_drop) and
-            exists(baseline_q00_active) and
-            metrics.get('codebook_q00_active_ratio', 0.) < (
-                baseline_q00_active -
-                self.quality_retention_max_q00_active_ratio_drop -
-                tolerance
-            )
-        ):
-            reasons.append('q00_active_drop')
-        baseline_q00_perplexity = baseline.get('codebook_q00_perplexity')
-        if (
-            exists(
-                self.quality_retention_max_q00_perplexity_fraction_drop
-            ) and
-            exists(baseline_q00_perplexity) and
-            metrics.get('codebook_q00_perplexity', 0.) < (
-                baseline_q00_perplexity *
-                (
-                    1. -
-                    self.quality_retention_max_q00_perplexity_fraction_drop
-                )
-                - tolerance
-            )
-        ):
-            reasons.append('q00_perplexity_drop')
+        if not bypass_rvq and metrics.get('q00_validation_eligible', 0.) < 0.5:
+            reasons.append('q00')
+        # Absolute/relative usage changes remain diagnostics for deployability;
+        # they no longer veto a perceptually better quality checkpoint unless
+        # the quantizer satisfies the explicit collapse definition above.
         if not bypass_rvq and metrics.get('q01_validation_eligible', 0.) < 0.5:
             reasons.append('q01')
         return reasons
@@ -3514,17 +3519,13 @@ class SoundStreamTrainer(nn.Module):
             averaged_metrics['aligned_si_sdr'] >= -5.
         )
         codebook_size = max(1., averaged_metrics.get('codebook_size', 1.))
-        reconstruction_min_perplexity = 0.50 * codebook_size
+        # Quality selection only rejects actual collapse. A separate normalized
+        # deployability diagnostic below tracks distribution quality without
+        # making a fixed PPL >= 0.5*K the sole codec-quality gate.
         q00_eligible = (
-            averaged_metrics.get('codebook_q00_active_ratio', 0.) >= (
-                self.quality_retention_q00_min_active_ratio
-                if self.best_checkpoint_metric == 'gan_pretrain' else 0.30
-            ) and
-            averaged_metrics.get('codebook_q00_perplexity', 0.) >= (
-                self.quality_retention_q00_min_perplexity
-                if self.best_checkpoint_metric == 'gan_pretrain'
-                else reconstruction_min_perplexity
-            )
+            averaged_metrics.get('codebook_q00_active_ratio', 0.) >= 0.05 and
+            averaged_metrics.get('codebook_q00_normalized_perplexity', 0.) >= 0.02 and
+            averaged_metrics.get('codebook_q00_top1_prob', 1.) <= 0.90
         )
         averaged_metrics['q00_retention_warning'] = float(
             self.best_checkpoint_metric == 'gan_pretrain' and (
@@ -3535,17 +3536,23 @@ class SoundStreamTrainer(nn.Module):
             )
         )
         q01_eligible = (
-            averaged_metrics.get('codebook_q01_active_ratio', 0.) >= 0.30 and
-            averaged_metrics.get('codebook_q01_perplexity', 0.) >= (
-                reconstruction_min_perplexity
-            )
+            averaged_metrics.get('codebook_q01_active_ratio', 0.) >= 0.05 and
+            averaged_metrics.get('codebook_q01_normalized_perplexity', 0.) >= 0.02 and
+            averaged_metrics.get('codebook_q01_top1_prob', 1.) <= 0.90
         )
         rvq_eligible = (
-            averaged_metrics.get('active_code_ratio', 0.) >= 0.25 and
-            averaged_metrics.get('codebook_perplexity', 0.) >= (
-                reconstruction_min_perplexity
-            ) and
-            averaged_metrics.get('codebook_collapsed_quantizers', 0) <= 2
+            averaged_metrics.get('codebook_collapsed_quantizers', 0) == 0
+        )
+        deployable_levels = []
+        for quantizer_index in range(int(getattr(model, 'num_quantizers', 0))):
+            prefix = f'codebook_q{quantizer_index:02d}'
+            deployable_levels.append(
+                averaged_metrics.get(f'{prefix}_active_ratio', 0.) >= 0.25 and
+                averaged_metrics.get(f'{prefix}_normalized_perplexity', 0.) >= 0.10 and
+                averaged_metrics.get(f'{prefix}_top1_prob', 1.) <= 0.75
+            )
+        averaged_metrics['rvq_deployable_distribution_eligible'] = float(
+            bool(deployable_levels) and all(deployable_levels)
         )
         bypass_rvq = bool(getattr(model, 'bypass_rvq', False))
         if bypass_rvq:
@@ -4025,16 +4032,17 @@ class SoundStreamTrainer(nn.Module):
                 1.,
                 max(
                     0.,
-                    (steps - self.gan_start_step + 1) / self.gan_ramp_steps
+                    (steps - self.gan_start_step) / self.gan_ramp_steps
                 )
             )
 
         adversarial_max = self.gan_adversarial_max
         feature_max = self.gan_feature_max
-        if (
+        in_phase3 = (
             exists(self.stage2_phase3_start_step) and
             steps >= self.stage2_phase3_start_step
-        ):
+        )
+        if in_phase3:
             adversarial_max = default(
                 self.stage2_phase3_gan_adversarial_max,
                 adversarial_max,
@@ -4043,6 +4051,9 @@ class SoundStreamTrainer(nn.Module):
                 self.stage2_phase3_gan_feature_max,
                 feature_max,
             )
+            # Phase-3 weights are absolute retention-phase targets.  The
+            # preceding ramp belongs to phase 2 and must not attenuate them.
+            progress = 1.
 
         model.adversarial_loss_weight = adversarial_max * progress
         model.feature_loss_weight = feature_max * progress
@@ -4310,12 +4321,40 @@ class SoundStreamTrainer(nn.Module):
     def cap_generator_lr_for_retention(self, steps):
         """Linearly release the early Stage-2 generator learning rate.
 
-        The generator is normally frozen through ``generator_freeze_steps``.
-        Once released, this moves from ``generator_hold_lr`` to the configured
-        base LR by ``generator_hold_steps`` instead of introducing an abrupt
-        decoder update at the handoff boundary.
+        Before an explicit phase begins, a legacy hold window can ramp from
+        ``generator_hold_lr`` to the base LR. Explicit phase-2/phase-3 learning
+        rates take precedence exactly at their configured boundaries.
         """
         current_lr = self.optim.optimizer.param_groups[0]['lr']
+        phase_lr = None
+        if (
+            exists(self.stage2_phase3_start_step) and
+            steps >= self.stage2_phase3_start_step
+        ):
+            phase_lr = self.stage2_phase3_generator_lr
+        elif (
+            exists(self.stage2_phase2_start_step) and
+            steps >= self.stage2_phase2_start_step
+        ):
+            phase_lr = self.stage2_phase2_generator_lr
+
+        # An explicit phase boundary is authoritative. In particular, the
+        # phase-2 LR must take effect exactly when the frozen generator is
+        # released, even if a longer legacy hold window was configured.
+        if exists(phase_lr):
+            reference_lr = max(self.generator_hold_base_lrs[0], 1e-20)
+            target_lrs = [
+                phase_lr * (base_lr / reference_lr)
+                for base_lr in self.generator_hold_base_lrs
+            ]
+            for group, target_lr in zip(
+                self.optim.optimizer.param_groups,
+                target_lrs,
+            ):
+                group['lr'] = target_lr
+            self.optim.sync_warmup_lrs_from_optimizer()
+            return target_lrs[0]
+
         if (
             exists(self.generator_hold_lr) and
             self.generator_hold_steps > 0 and
@@ -4349,32 +4388,6 @@ class SoundStreamTrainer(nn.Module):
                 group['lr'] = base_lr
             self.optim.sync_warmup_lrs_from_optimizer()
             return self.generator_hold_base_lrs[0]
-
-        phase_lr = None
-        if (
-            exists(self.stage2_phase3_start_step) and
-            steps >= self.stage2_phase3_start_step
-        ):
-            phase_lr = self.stage2_phase3_generator_lr
-        elif (
-            exists(self.stage2_phase2_start_step) and
-            steps >= self.stage2_phase2_start_step
-        ):
-            phase_lr = self.stage2_phase2_generator_lr
-
-        if exists(phase_lr):
-            reference_lr = max(self.generator_hold_base_lrs[0], 1e-20)
-            target_lrs = [
-                phase_lr * (base_lr / reference_lr)
-                for base_lr in self.generator_hold_base_lrs
-            ]
-            for group, target_lr in zip(
-                self.optim.optimizer.param_groups,
-                target_lrs,
-            ):
-                group['lr'] = target_lr
-            self.optim.sync_warmup_lrs_from_optimizer()
-            return target_lrs[0]
 
         return current_lr
 
@@ -4947,6 +4960,7 @@ class SoundStreamTrainer(nn.Module):
             return self.rvq_calibration_step()
 
         device = self.device
+        model = self.unwrapped_soundstream
 
         steps = int(self.steps.item())
         log_losses = self.log_losses_every > 0 and not (steps % self.log_losses_every)
@@ -4973,9 +4987,33 @@ class SoundStreamTrainer(nn.Module):
             (exists(self.freeze_codebook_after_step) and steps >= self.freeze_codebook_after_step)
         )
         freeze_encoder = (
-            exists(self.freeze_encoder_before_step) and
-            steps < self.freeze_encoder_before_step
+            (exists(self.freeze_encoder_before_step) and steps < self.freeze_encoder_before_step) or
+            (exists(self.freeze_encoder_after_step) and steps >= self.freeze_encoder_after_step)
         )
+        # Lookup projections are part of the RVQ transform. Keep them aligned
+        # with the RVQ freeze policy instead of accidentally training them as
+        # ordinary Decoder parameters during B2.
+        train_rvq_projections = (
+            not freeze_codebook and
+            not self.rq_excluded_from_generator_optimizer
+        )
+        model.rq_input_projection.requires_grad_(train_rvq_projections)
+        model.rq_output_projection.requires_grad_(train_rvq_projections)
+        rvq_warm_in_alpha = (
+            min(1., float(steps) / float(self.rvq_warm_in_steps))
+            if self.rvq_warm_in_steps > 0 else 1.
+        )
+        rvq_ema_decay = None
+        if self.rvq_warm_in_steps > 0 and hasattr(model, 'set_rvq_ema_decay'):
+            rvq_ema_decay = 0.95 if steps < 5000 else (0.98 if steps < 15000 else 0.99)
+            model.set_rvq_ema_decay(rvq_ema_decay)
+        if exists(self.decoder_lr_after_step):
+            lr_step, decoder_lr = self.decoder_lr_after_step
+            if steps >= lr_step:
+                for group in self.optim.optimizer.param_groups:
+                    if group.get('group_name') == 'decoder':
+                        group['lr'] = decoder_lr
+                self.optim.sync_warmup_lrs_from_optimizer()
         freeze_decoder = (
             exists(self.freeze_decoder_before_step) and
             steps < self.freeze_decoder_before_step
@@ -5033,7 +5071,8 @@ class SoundStreamTrainer(nn.Module):
                 loss, loss_breakdown = self.soundstream(
                     wave,
                     return_loss_breakdown = True,
-                    freeze_codebook = freeze_codebook
+                    freeze_codebook = freeze_codebook,
+                    rvq_warm_in_alpha = rvq_warm_in_alpha
                 )
                 (
                     recon_loss,
@@ -5083,6 +5122,11 @@ class SoundStreamTrainer(nn.Module):
                     else loss.new_zeros(())
                 )
                 formant_peak_loss = loss_breakdown[-1]
+                codebook_balance_loss = (
+                    loss_breakdown[-2]
+                    if len(loss_breakdown) >= 20
+                    else loss.new_zeros(())
+                )
 
                 if not torch.isfinite(loss).all():
                     raise RuntimeError(
@@ -5231,6 +5275,7 @@ class SoundStreamTrainer(nn.Module):
                 weighted_gan_loss = weighted_gan_loss.item() / self.grad_accum_every,
                 weighted_reconstruction_loss = weighted_reconstruction_loss.item() / self.grad_accum_every,
                 all_commitment_loss = all_commitment_loss.item() / self.grad_accum_every,
+                codebook_balance_loss = codebook_balance_loss.item() / self.grad_accum_every,
                 si_sdr_loss = si_sdr_loss.item() / self.grad_accum_every,
                 correlation_loss = correlation_loss.item() / self.grad_accum_every,
                 click_loss = click_loss.item() / self.grad_accum_every,
@@ -5264,6 +5309,15 @@ class SoundStreamTrainer(nn.Module):
                     f'g_branch_{name.replace(".", "p")}': (
                         value.detach().item() / self.grad_accum_every
                     )
+                })
+            balance_metrics = getattr(runtime_model, '_last_rvq_balance_metrics', {})
+            if balance_metrics:
+                soft_ppl = balance_metrics['soft_perplexity']
+                top1 = balance_metrics['top1_probability']
+                accum_log(logs, {
+                    'rvq_soft_perplexity_mean': soft_ppl.mean().item() / self.grad_accum_every,
+                    'rvq_soft_perplexity_min': soft_ppl.min().item() / self.grad_accum_every,
+                    'rvq_soft_top1_max': top1.max().item() / self.grad_accum_every,
                 })
 
         if exists(self.max_grad_norm) and not generator_frozen:
@@ -5351,7 +5405,18 @@ class SoundStreamTrainer(nn.Module):
             f"encoder_frozen={int(freeze_encoder)} | "
             f"decoder_frozen={int(freeze_decoder)} | "
             f"commit={logs['all_commitment_loss']:.6f}"
+            f" | rvq_warm_in={rvq_warm_in_alpha:.4f}"
+            f" | code_balance={logs['codebook_balance_loss']:.6f}"
+            f"(w={getattr(model, 'rq_codebook_balance_loss_weight', 0.):.4g})"
         )
+        if rvq_ema_decay is not None:
+            losses_str += f" | rvq_ema_decay={rvq_ema_decay:.3f}"
+        if 'rvq_soft_perplexity_mean' in logs:
+            losses_str += (
+                f" | rvq_soft_ppl={logs['rvq_soft_perplexity_mean']:.2f}"
+                f"/min{logs['rvq_soft_perplexity_min']:.2f}"
+                f" | rvq_soft_top1_max={logs['rvq_soft_top1_max']:.3f}"
+            )
 
         if hasattr(model, 'get_decoder_block_residual_scales'):
             block_scales = ','.join(

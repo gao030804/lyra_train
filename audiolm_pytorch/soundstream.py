@@ -939,6 +939,7 @@ class SoundStream(Module):
         strides = (2, 4, 5, 8),
         channel_mults = (2, 4, 8, 16),
         codebook_dim = 512,
+        rq_lookup_dim: int | None = None,
         codebook_size: int | None = None,
         finite_scalar_quantizer_levels: list[int] | None = None,
         rq_num_quantizers = 8,
@@ -949,6 +950,10 @@ class SoundStream(Module):
         rq_groups = 1,
         rq_stochastic_sample_codes = False,
         rq_rotation_trick = False,
+        rq_use_cosine_sim = False,
+        rq_codebook_balance_loss_weight = 0.,
+        rq_codebook_balance_target_perplexity = 8.,
+        rq_codebook_balance_temperature = 1.,
         rq_threshold_ema_dead_code = 2,
         rq_kwargs: dict = {},
         bypass_rvq = False,
@@ -1192,6 +1197,28 @@ class SoundStream(Module):
         self.num_quantizers = rq_num_quantizers
 
         self.codebook_dim = codebook_dim
+        self.rq_lookup_dim = int(default(rq_lookup_dim, codebook_dim))
+        if self.rq_lookup_dim <= 0:
+            raise ValueError('rq_lookup_dim must be positive')
+        self.rq_use_cosine_sim = bool(rq_use_cosine_sim)
+        # Preserve the 64-D codec representation while performing RVQ lookup
+        # in a smaller hardware-friendly space. nn.Linear on [B, T, C] is
+        # exactly a bias-free 1x1 Conv1d after a channel/time transpose.
+        self.rq_input_projection = (
+            nn.Identity()
+            if self.rq_lookup_dim == codebook_dim
+            else nn.Linear(codebook_dim, self.rq_lookup_dim, bias = False)
+        )
+        self.rq_output_projection = (
+            nn.Identity()
+            if self.rq_lookup_dim == codebook_dim
+            else nn.Linear(self.rq_lookup_dim, codebook_dim, bias = False)
+        )
+        self.rq_codebook_balance_loss_weight = float(rq_codebook_balance_loss_weight)
+        self.rq_codebook_balance_target_perplexity = float(rq_codebook_balance_target_perplexity)
+        self.rq_codebook_balance_temperature = float(rq_codebook_balance_temperature)
+        self.rq_warm_in_alpha = 1.
+        self._last_rvq_balance_metrics = {}
 
         self.rq_groups = rq_groups
         # Training-time codec mode.  This is intentionally part of the saved
@@ -1237,7 +1264,7 @@ class SoundStream(Module):
         else:
             assert exists(codebook_size) and not exists(finite_scalar_quantizer_levels), 'if use_finite_scalar_quantizer is set to False, `codebook_size` must be set (and not `finite_scalar_quantizer_levels`)'
             self.rq = GroupedResidualVQ(
-                dim = codebook_dim,
+                dim = self.rq_lookup_dim,
                 num_quantizers = rq_num_quantizers,
                 codebook_size = codebook_size,
                 groups = rq_groups,
@@ -1250,6 +1277,7 @@ class SoundStream(Module):
                 quantize_dropout_cutoff_index = quantize_dropout_cutoff_index,
                 stochastic_sample_codes = rq_stochastic_sample_codes,
                 rotation_trick = rq_rotation_trick,
+                use_cosine_sim = rq_use_cosine_sim,
                 **rq_kwargs
             )
 
@@ -3069,13 +3097,16 @@ class SoundStream(Module):
         if quantized_indices.ndim == 3:
             quantized_indices = rearrange(quantized_indices, 'b n (g q) -> g b n q', g = self.rq_groups)
 
-        x = self.rq.get_output_from_indices(quantized_indices)
+        x = self.rq_output_projection(
+            self.rq.get_output_from_indices(quantized_indices)
+        )
 
         return self.decode(x)
 
     def decode(self, x, quantize = False):
         if quantize:
-            x, *_ = self.rq(x)
+            x, *_ = self.rq(self.rq_input_projection(x))
+            x = self.rq_output_projection(x)
 
         if exists(self.decoder_attn):
             x = self.decoder_attn(x)
@@ -3166,7 +3197,7 @@ class SoundStream(Module):
         retained_state = {
             key: value
             for key, value in state_dict.items()
-            if not key.startswith('rq.') and (
+            if not self.is_rvq_state_key(key) and (
                 include_discriminators or
                 not self.is_discriminator_state_key(key)
             )
@@ -3175,7 +3206,7 @@ class SoundStream(Module):
         unexpected = list(incompatible.unexpected_keys)
         illegal_missing = [
             key for key in incompatible.missing_keys
-            if not key.startswith('rq.') and not (
+            if not self.is_rvq_state_key(key) and not (
                 not include_discriminators and
                 self.is_discriminator_state_key(key)
             )
@@ -3187,6 +3218,27 @@ class SoundStream(Module):
             )
         return tuple(incompatible.missing_keys)
 
+    @staticmethod
+    def is_rvq_state_key(key):
+        return key.startswith((
+            'rq.',
+            'rq_input_projection.',
+            'rq_output_projection.',
+        ))
+
+    def set_rvq_ema_decay(self, decay):
+        """Update every residual codebook EMA decay without touching weights."""
+        decay = float(decay)
+        if not 0. <= decay <= 1.:
+            raise ValueError(f'RVQ EMA decay must be in [0, 1], got {decay}')
+        rvqs = getattr(self.rq, 'rvqs', ())
+        for rvq in rvqs:
+            for layer in getattr(rvq, 'layers', ()):
+                codebook = getattr(layer, '_codebook', None)
+                if codebook is not None and hasattr(codebook, 'decay'):
+                    codebook.decay = decay
+        self.rq_ema_decay_runtime = decay
+
     def non_discr_parameters(self):
         return [
             *self.encoder.parameters(),
@@ -3195,6 +3247,8 @@ class SoundStream(Module):
             *(self.decoder_attn.parameters() if exists(self.decoder_attn) else []),
             *self.encoder_film.parameters(),
             *self.decoder_film.parameters(),
+            *self.rq_input_projection.parameters(),
+            *self.rq_output_projection.parameters(),
             *self.rq.parameters()
         ]
 
@@ -3273,6 +3327,56 @@ class SoundStream(Module):
 
         return recon_x
 
+    def rvq_codebook_balance_loss(self, encoded, indices):
+        """Entropy-floor loss from differentiable per-stage soft assignments."""
+        if self.rq_codebook_balance_loss_weight <= 0.:
+            self._last_rvq_balance_metrics = {}
+            return encoded.new_zeros(())
+        if self.rq_groups != 1 or self.use_lookup_free_quantizer or self.use_finite_scalar_quantizer:
+            raise RuntimeError('codebook balance loss requires standard groups=1 RVQ')
+
+        residual_vq = self.rq.rvqs[0]
+        stage_indices = indices[0]
+        residual = encoded.float()
+        losses, entropies, perplexities, top1_probabilities = [], [], [], []
+        target_entropy = math.log(min(
+            self.rq_codebook_balance_target_perplexity,
+            float(self.codebook_size),
+        ))
+        temperature = max(self.rq_codebook_balance_temperature, 1e-4)
+        for stage, layer in enumerate(residual_vq.layers):
+            embed = layer._codebook.embed
+            if embed.ndim == 3:
+                embed = embed[0]
+            embed = embed.detach().float()
+            if self.rq_use_cosine_sim:
+                logits = torch.einsum(
+                    'bnd,kd->bnk',
+                    F.normalize(residual, dim=-1),
+                    F.normalize(embed, dim=-1),
+                )
+            else:
+                distances = (
+                    residual.square().sum(dim=-1, keepdim=True) -
+                    2. * torch.einsum('bnd,kd->bnk', residual, embed) +
+                    embed.square().sum(dim=-1)
+                )
+                logits = -distances
+            mean_probability = (logits / temperature).softmax(dim=-1).mean(dim=(0, 1))
+            entropy = -(mean_probability * mean_probability.clamp_min(1e-8).log()).sum()
+            losses.append(F.relu(entropy.new_tensor(target_entropy) - entropy))
+            entropies.append(entropy.detach())
+            perplexities.append(entropy.detach().exp())
+            top1_probabilities.append(mean_probability.detach().max())
+            selected = F.embedding(stage_indices[..., stage].clamp_min(0), embed)
+            residual = residual - selected
+        self._last_rvq_balance_metrics = {
+            'entropy': torch.stack(entropies),
+            'soft_perplexity': torch.stack(perplexities),
+            'top1_probability': torch.stack(top1_probabilities),
+        }
+        return torch.stack(losses).mean()
+
     def forward(
         self,
         x,
@@ -3291,7 +3395,8 @@ class SoundStream(Module):
         stft_grad_penalty_gamma = 5e-3,
         curtail_from_left = False,
         num_quantizers = None,
-        freeze_codebook = False
+        freeze_codebook = False,
+        rvq_warm_in_alpha = 1.
     ):
         assert not (exists(is_denoising) and not exists(target))
         assert not (exists(num_quantizers) and self.training), 'num_quantizers is an inference-only option'
@@ -3316,6 +3421,7 @@ class SoundStream(Module):
             denoise_input = torch.tensor([is_denoising, not is_denoising], dtype = x.dtype, device = self.device) # [1, 0] for denoise, [0, 1] for not denoising
             x = self.encoder_film(x, denoise_input)
 
+        continuous_x = x
         if self.bypass_rvq:
             indices = torch.full(
                 (self.rq_groups, x.shape[0], x.shape[1], self.num_quantizers),
@@ -3330,17 +3436,33 @@ class SoundStream(Module):
                 if not self.use_lookup_free_quantizer
                 else {}
             )
-            x, indices, commit_loss = self.rq(x, **rq_kwargs)
+            lookup_x = self.rq_input_projection(x)
+            x, indices, commit_loss = self.rq(lookup_x, **rq_kwargs)
+            x = self.rq_output_projection(x)
         else:
             # finite scalar quantizer does not have any aux loss
 
-            x, indices = self.rq(x)
+            lookup_x = self.rq_input_projection(x)
+            x, indices = self.rq(lookup_x)
+            x = self.rq_output_projection(x)
             commit_loss = self.zero
+
+        if not self.bypass_rvq:
+            alpha = float(max(0., min(1., rvq_warm_in_alpha)))
+            x = continuous_x + alpha * (x - continuous_x)
+            self.rq_warm_in_alpha = alpha
+            codebook_balance_loss = self.rvq_codebook_balance_loss(
+                self.rq_input_projection(continuous_x), indices
+            )
+        else:
+            codebook_balance_loss = self.zero
 
         if exists(num_quantizers) and not self.bypass_rvq:
             assert 0 < num_quantizers <= self.num_quantizers
             indices = indices[..., :num_quantizers]
-            x = self.rq.get_output_from_indices(indices)
+            x = self.rq_output_projection(
+                self.rq.get_output_from_indices(indices)
+            )
 
         if return_codes_only:
             return indices
@@ -3559,7 +3681,8 @@ class SoundStream(Module):
             frame_phase_loss * self.frame_phase_loss_weight +
             adversarial_loss * self.adversarial_loss_weight +
             feature_loss * self.feature_loss_weight +
-            all_commitment_loss * self.commitment_loss_weight
+            all_commitment_loss * self.commitment_loss_weight +
+            codebook_balance_loss * self.rq_codebook_balance_loss_weight
         )
 
         if return_loss_breakdown:
@@ -3582,6 +3705,7 @@ class SoundStream(Module):
                 frame_phase_loss,
                 upper_highband_loss,
                 active_spectral_detail_loss,
+                codebook_balance_loss,
                 formant_peak_loss
             )
 
@@ -3844,15 +3968,21 @@ class FrameStreamingSoundStream(SoundStream):
                 if not self.use_lookup_free_quantizer
                 else {}
             )
-            x, indices, commit_loss = self.rq(x, **rq_kwargs)
+            x, indices, commit_loss = self.rq(
+                self.rq_input_projection(x), **rq_kwargs
+            )
+            x = self.rq_output_projection(x)
         else:
-            x, indices = self.rq(x)
+            x, indices = self.rq(self.rq_input_projection(x))
+            x = self.rq_output_projection(x)
             commit_loss = self.zero
 
         if exists(num_quantizers) and not self.bypass_rvq:
             assert 0 < num_quantizers <= self.num_quantizers
             indices = indices[..., :num_quantizers]
-            x = self.rq.get_output_from_indices(indices)
+            x = self.rq_output_projection(
+                self.rq.get_output_from_indices(indices)
+            )
 
         return x, indices, commit_loss, next_state
 
@@ -3894,7 +4024,9 @@ class FrameStreamingSoundStream(SoundStream):
         if indices.ndim == 3:
             indices = rearrange(indices, 'b n (g q) -> g b n q', g = self.rq_groups)
 
-        quantized = self.rq.get_output_from_indices(indices)
+        quantized = self.rq_output_projection(
+            self.rq.get_output_from_indices(indices)
+        )
         return self.decode_frame(quantized, state = state, is_denoising = is_denoising)
 
     def _codec_frame(
@@ -3970,18 +4102,24 @@ class FrameStreamingSoundStream(SoundStream):
                 else {}
             )
             all_quantized, all_indices, all_commit_loss = self.rq(
-                all_latents,
+                self.rq_input_projection(all_latents),
                 **rq_kwargs
             )
+            all_quantized = self.rq_output_projection(all_quantized)
             all_commit_loss = all_commit_loss.sum()
         else:
-            all_quantized, all_indices = self.rq(all_latents)
+            all_quantized, all_indices = self.rq(
+                self.rq_input_projection(all_latents)
+            )
+            all_quantized = self.rq_output_projection(all_quantized)
             all_commit_loss = self.zero
 
         if exists(num_quantizers) and not self.bypass_rvq:
             assert 0 < num_quantizers <= self.num_quantizers
             all_indices = all_indices[..., :num_quantizers]
-            all_quantized = self.rq.get_output_from_indices(all_indices)
+            all_quantized = self.rq_output_projection(
+                self.rq.get_output_from_indices(all_indices)
+            )
 
         recons = []
         decoder_state = None

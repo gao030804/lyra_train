@@ -25,6 +25,7 @@ def test_bypass_rvq_is_saved_runtime_mode_and_emits_sentinel_indices():
         codebook_size=16,
         rq_num_quantizers=2,
         discr_multi_scales=(1,),
+        generator_waveform_discr_loss_weights=(1.,),
         pad_mode="constant",
         bypass_rvq=True,
         rq_rotation_trick=False,
@@ -119,8 +120,9 @@ def test_formant_train_and_eval_masks_are_reported_separately():
     assert "('f2', 1000., 2500." in source
     assert "0.12, -9.0, 0.16, -6.0" in source
     assert "0.16, -15.0, 0.22, -12.0" in source
-    assert "f'{name}_valid_trainmask'" in source
-    assert "f'{name}_valid_evalmask'" in source
+    assert "f'{name}_valid_{mask_name}'" in source
+    assert "('trainmask', train_confidence)" in source
+    assert "('evalmask', eval_confidence)" in source
 
 
 def test_loss_gradient_diagnostic_default(monkeypatch):
@@ -199,6 +201,31 @@ def test_stateful_stages_have_distinct_pre_and_post_rvq_roles():
     )
     assert '--num-train-steps "$FINAL_STATE_STEPS"' in launcher
     assert '--no-bypass-rvq-during-training' in launcher
+
+
+def test_pipeline_inserts_joint_rvq_adaptation_and_shortens_b2():
+    launcher = (ROOT / "run_bypass_rvq_stage1_stage2.sh").read_text(
+        encoding="utf-8"
+    )
+    assert 'RVQ_JOINT_ADAPT_STEPS="${RVQ_JOINT_ADAPT_STEPS:-20000}"' in launcher
+    assert 'RVQ_STAGE2_STEPS="${RVQ_STAGE2_STEPS:-50000}"' in launcher
+    assert 'B1.5 joint STE quantization adaptation' in launcher
+    assert '--rvq-warm-in-steps 3000' in launcher
+    assert '--rvq-codebook-balance-loss-weight 0.01' in launcher
+    assert '--rvq-codebook-balance-target-perplexity 64' in launcher
+    assert '--stage2-encoder-unfreeze-step -1' in launcher
+    assert '--early-stopping-patience 20 --stage2-quality-hard-stop' in launcher
+    assert launcher.index('B1 checkpoint=') < launcher.index(
+        'B1.5 joint STE quantization adaptation'
+    ) < launcher.index('B2 RVQ GAN decoder adaptation')
+
+    source = (ROOT / "train_soundstream.py").read_text(encoding="utf-8")
+    assert 'freeze_encoder_after_step=(15_000 if rvq_joint_adapt else None)' in source
+    model_source = (ROOT / "audiolm_pytorch" / "soundstream.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'def rvq_codebook_balance_loss(self, encoded, indices):' in model_source
+    assert 'x = continuous_x + alpha * (x - continuous_x)' in model_source
 
 
 def test_pipeline_can_start_from_bypass_formant_refine_checkpoint():
@@ -353,9 +380,11 @@ class GeneratorOnlyModel:
     encoder_low_rank_pointwise_ranks = (
         (0, 0), (8, 16), (16, 32), (32, 64)
     )
-    num_quantizers = 16
-    codebook_size = 16
+    num_quantizers = 8
+    codebook_size = 256
     codebook_dim = 64
+    rq_lookup_dim = 16
+    rq_use_cosine_sim = True
     loaded_without_rvq = False
 
     def load_generator_state_dict(self, state_dict):
@@ -386,28 +415,32 @@ def matching_config(**overrides):
         "encoder_low_rank_pointwise_ranks": (
             (0, 0), (8, 16), (16, 32), (32, 64)
         ),
-        "rq_num_quantizers": 16,
-        "codebook_size": 16,
+        "rq_num_quantizers": 8,
+        "codebook_size": 256,
         "codebook_dim": 64,
+        "rq_lookup_dim": 16,
+        "rq_use_cosine_sim": True,
     }
     config.update(overrides)
     return config
 
 
-def test_current_rvq_profile_is_16_by_16_by_64_and_3p2kbps():
+def test_current_rvq_profile_is_8_by_256_by_16_lookup_and_3p2kbps():
     config = matching_config()
     frame_rate = 16000 / 320
-    bits_per_index = 4
+    bits_per_index = 8
 
-    assert config["rq_num_quantizers"] == 16
-    assert config["codebook_size"] == 16
+    assert config["rq_num_quantizers"] == 8
+    assert config["codebook_size"] == 256
     assert config["codebook_dim"] == 64
+    assert config["rq_lookup_dim"] == 16
+    assert config["rq_use_cosine_sim"] is True
     assert frame_rate * config["rq_num_quantizers"] * bits_per_index == 3200
     assert (
-        config["rq_num_quantizers"]
-        * config["codebook_size"]
-        * config["codebook_dim"]
-        == 16384
+        config["rq_num_quantizers"] * config["codebook_size"]
+        * config["rq_lookup_dim"] + 2 * config["codebook_dim"]
+        * config["rq_lookup_dim"]
+        == 34816
     )
 
 
@@ -443,7 +476,12 @@ def test_generator_checkpoint_rejects_old_rvq_shape(tmp_path):
     checkpoint = tmp_path / "rvq-8x256.pt"
     save_generator_checkpoint(
         checkpoint,
-        matching_config(rq_num_quantizers=8, codebook_size=256),
+        matching_config(
+            rq_num_quantizers=16,
+            codebook_size=16,
+            rq_lookup_dim=64,
+            rq_use_cosine_sim=False,
+        ),
     )
 
     with pytest.raises(ValueError, match="RVQ topology mismatch"):
