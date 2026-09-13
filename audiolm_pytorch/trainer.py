@@ -384,6 +384,7 @@ class SoundStreamTrainer(nn.Module):
         clean_gate: bool = True,
         clean_gate_min_aligned_si_sdr: float = 0.,
         clean_gate_min_aligned_corr: float = 0.65,
+        clean_gate_max_negative_fraction: float = 0.01,
         clean_gate_min_rms_ratio: float = 0.4,
         clean_gate_max_rms_ratio: float = 2.5,
         clean_gate_max_recon_peak: float = 1.2,
@@ -606,6 +607,9 @@ class SoundStreamTrainer(nn.Module):
         self.clean_gate = clean_gate
         self.clean_gate_min_aligned_si_sdr = clean_gate_min_aligned_si_sdr
         self.clean_gate_min_aligned_corr = clean_gate_min_aligned_corr
+        self.clean_gate_max_negative_fraction = float(clean_gate_max_negative_fraction)
+        if not 0. <= self.clean_gate_max_negative_fraction <= 1.:
+            raise ValueError('clean_gate_max_negative_fraction must be in [0, 1]')
         self.clean_gate_min_rms_ratio = clean_gate_min_rms_ratio
         self.clean_gate_max_rms_ratio = clean_gate_max_rms_ratio
         self.clean_gate_max_recon_peak = clean_gate_max_recon_peak
@@ -1982,9 +1986,84 @@ class SoundStreamTrainer(nn.Module):
         metric_wave = wave[..., context_samples:] if context_samples else wave
         metric_recon = recon[..., context_samples:] if context_samples else recon
         metrics = self.reconstruction_metrics(model, metric_wave, metric_recon)
+        if not (
+            bool(getattr(model, 'bypass_rvq', False)) or
+            bool(getattr(model, 'rq_projection_only', False))
+        ):
+            # Isolate the audible damage introduced by discrete nearest-neighbour
+            # lookup from the already-trained 64->lookup->64 projection path.
+            projection_only_before = bool(model.rq_projection_only)
+            try:
+                model.rq_projection_only = True
+                with torch.inference_mode():
+                    projection_recon = model(wave, return_recons_only = True)
+                projection_metric_recon = (
+                    projection_recon[..., context_samples:]
+                    if context_samples else projection_recon
+                )
+                projection_metrics = self.reconstruction_metrics(
+                    model, metric_wave, projection_metric_recon
+                )
+                metrics['projection_only_aligned_si_sdr'] = projection_metrics['aligned_si_sdr']
+                metrics['quantized_aligned_si_sdr'] = metrics['aligned_si_sdr']
+                metrics['quantization_gap_db'] = (
+                    metrics['aligned_si_sdr'] - projection_metrics['aligned_si_sdr']
+                )
+            finally:
+                model.rq_projection_only = projection_only_before
+            metrics.update(self.rvq_geometry_metrics(model, wave, indices))
         metrics['evaluation_context_samples'] = float(context_samples)
         metrics['commitment_loss'] = float(commitment_loss.sum().detach().cpu())
         return metrics, self.codebook_counts(model, indices)
+
+    @torch.no_grad()
+    def rvq_geometry_metrics(self, model, wave, indices):
+        """Measure sequential RVQ residual decay; utilization alone is insufficient."""
+        if bool(getattr(model, 'bypass_rvq', False)) or bool(getattr(model, 'rq_projection_only', False)):
+            return {}
+
+        encoder_input, _ = model.process_input(wave)
+        latent = rearrange(model.encoder(encoder_input), 'b c n -> b n c')
+        if exists(model.encoder_attn):
+            latent = model.encoder_attn(latent)
+        lookup = model.rq_input_projection(latent).float()
+        residual = lookup
+        base_energy = lookup.square().mean().clamp_min(1e-12)
+        stage_indices = indices
+        if stage_indices.ndim == 4 and stage_indices.shape[0] == 1:
+            stage_indices = stage_indices[0]
+        layers = model.rq.rvqs[0].layers
+        output = {}
+        for stage, layer in enumerate(layers):
+            if stage >= stage_indices.shape[-1]:
+                break
+            embed = layer._codebook.embed.detach().float()
+            if embed.ndim == 3:
+                embed = embed[0]
+            selected = F.embedding(stage_indices[..., stage].long(), embed)
+            before = residual.square().mean().clamp_min(1e-12)
+            residual = residual - selected
+            after = residual.square().mean()
+            output[f'rvq_residual_energy_ratio_q{stage:02d}'] = float((before / base_energy).cpu())
+            output[f'rvq_stage_nmse_q{stage:02d}'] = float((after / before).cpu())
+            output[f'rvq_residual_rms_q{stage:02d}'] = float(before.sqrt().cpu())
+            output[f'rvq_selected_code_rms_q{stage:02d}'] = float(selected.square().mean().sqrt().cpu())
+            output[f'rvq_codebook_norm_q{stage:02d}'] = float(embed.norm(dim = -1).mean().cpu())
+
+        quantized_lookup = lookup - residual
+        reconstructed = model.rq_output_projection(quantized_lookup).float()
+        output['rvq_latent_nmse_lookup'] = float((residual.square().mean() / base_energy).cpu())
+        output['rvq_latent_cosine_lookup'] = float(F.cosine_similarity(
+            lookup, quantized_lookup, dim = -1, eps = 1e-8
+        ).mean().cpu())
+        output['rvq_latent_nmse_64d'] = float((
+            F.mse_loss(reconstructed, latent.float()) /
+            latent.float().square().mean().clamp_min(1e-12)
+        ).cpu())
+        output['rvq_latent_cosine_64d'] = float(F.cosine_similarity(
+            reconstructed, latent.float(), dim = -1, eps = 1e-8
+        ).mean().cpu())
+        return output
 
     def evaluate_dataloader_score(self, dataloader, model = None, max_batches = None):
         if not exists(dataloader):
@@ -3182,7 +3261,7 @@ class SoundStreamTrainer(nn.Module):
 
         return (
             metrics.get('aligned_si_sdr', float('-inf')) >= self.clean_gate_min_aligned_si_sdr and
-            metrics.get('alignment_negative_fraction', 0.) <= 0.01 and
+            metrics.get('alignment_negative_fraction', 0.) <= self.clean_gate_max_negative_fraction and
             metrics.get('aligned_correlation', float('-inf')) >= self.clean_gate_min_aligned_corr and
             self.clean_gate_min_rms_ratio <= metrics.get('rms_ratio', float('inf')) <= self.clean_gate_max_rms_ratio and
             metrics.get('recon_peak', float('inf')) <= self.clean_gate_max_recon_peak and
@@ -3200,7 +3279,7 @@ class SoundStreamTrainer(nn.Module):
 
         if metrics.get('aligned_si_sdr', float('-inf')) < self.clean_gate_min_aligned_si_sdr:
             reasons.append('aligned_si_sdr')
-        if metrics.get('alignment_negative_fraction', 0.) > 0.01:
+        if metrics.get('alignment_negative_fraction', 0.) > self.clean_gate_max_negative_fraction:
             reasons.append('negative_polarity')
 
         if metrics.get('aligned_correlation', float('-inf')) < self.clean_gate_min_aligned_corr:
@@ -5344,6 +5423,9 @@ class SoundStreamTrainer(nn.Module):
                     if len(loss_breakdown) >= 20
                     else loss.new_zeros(())
                 )
+                rvq_joint_losses = getattr(
+                    runtime_model, '_last_rvq_joint_losses', {}
+                )
 
                 if not torch.isfinite(loss).all():
                     raise RuntimeError(
@@ -5493,6 +5575,12 @@ class SoundStreamTrainer(nn.Module):
                 weighted_reconstruction_loss = weighted_reconstruction_loss.item() / self.grad_accum_every,
                 all_commitment_loss = all_commitment_loss.item() / self.grad_accum_every,
                 codebook_balance_loss = codebook_balance_loss.item() / self.grad_accum_every,
+                rvq_quantization_error_loss = float(
+                    rvq_joint_losses.get('quantization_error', 0.)
+                ) / self.grad_accum_every,
+                rvq_continuous_teacher_loss = float(
+                    rvq_joint_losses.get('continuous_teacher', 0.)
+                ) / self.grad_accum_every,
                 si_sdr_loss = si_sdr_loss.item() / self.grad_accum_every,
                 correlation_loss = correlation_loss.item() / self.grad_accum_every,
                 click_loss = click_loss.item() / self.grad_accum_every,
@@ -5625,6 +5713,10 @@ class SoundStreamTrainer(nn.Module):
             f" | rvq_warm_in={rvq_warm_in_alpha:.4f}"
             f" | code_balance={logs['codebook_balance_loss']:.6f}"
             f"(w={getattr(model, 'rq_codebook_balance_loss_weight', 0.):.4g})"
+            f" | quant_error={logs.get('rvq_quantization_error_loss', 0.):.6f}"
+            f"(w={getattr(model, 'rq_quantization_error_loss_weight', 0.):.4g})"
+            f" | continuous_teacher={logs.get('rvq_continuous_teacher_loss', 0.):.6f}"
+            f"(w={getattr(model, 'rq_continuous_teacher_loss_weight', 0.):.4g})"
         )
         if 'projection_latent_mse' in logs:
             losses_str += (
@@ -5637,6 +5729,12 @@ class SoundStreamTrainer(nn.Module):
                 f" | projection_fidelity={logs['projection_fidelity_loss']:.6f}"
                 f" | projection_nmse={logs['projection_normalized_mse']:.6f}"
                 f" | projection_cos_loss={logs['projection_cosine_loss']:.6f}"
+            )
+        rvq_stage_errors = getattr(model, '_last_rvq_quantization_stages', {})
+        if rvq_stage_errors:
+            losses_str += " | quant_error_stages=" + ",".join(
+                f"{name}:{float(value):.4f}"
+                for name, value in rvq_stage_errors.items()
             )
         if rvq_ema_decay is not None:
             losses_str += f" | rvq_ema_decay={rvq_ema_decay:.3f}"

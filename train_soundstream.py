@@ -552,8 +552,17 @@ def parse_args() -> argparse.Namespace:
         "--rq-lookup-dim",
         type=int,
         choices=(16, 24, 32),
-        default=16,
+        default=32,
         help="RVQ lookup/PCA dimension; bitrate is unchanged, storage scales with this value.",
+    )
+    parser.add_argument(
+        "--rq-distance",
+        choices=("cosine", "euclidean"),
+        default="cosine",
+        help=(
+            "RVQ nearest-neighbour geometry. Euclidean remains hardware-friendly "
+            "through 2*dot(x,c)-||c||^2; use identical seeds/Q0 settings for A/B tests."
+        ),
     )
     parser.add_argument(
         "--rvq-projection-min-evr",
@@ -586,6 +595,10 @@ def parse_args() -> argparse.Namespace:
                         help="Soft-assignment perplexity floor for each RVQ level.")
     parser.add_argument("--rvq-codebook-balance-temperature", type=float, default=1.,
                         help="Squared-distance soft-assignment temperature.")
+    parser.add_argument("--rvq-quantization-error-loss-weight", type=float, default=0.,
+                        help="Weight for normalized sequential RVQ residual error.")
+    parser.add_argument("--rvq-continuous-teacher-loss-weight", type=float, default=0.,
+                        help="Weight for stop-gradient Q0 waveform/STFT distillation.")
     parser.add_argument(
         "--formant-peak-loss-weight",
         type=float,
@@ -1008,6 +1021,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "For gan_pretrain, reject best-checkpoint updates that regress beyond "
             "the initialized stage-1 baseline. Hard stopping is controlled separately."
+        ),
+    )
+    parser.add_argument(
+        "--clean-gate-max-negative-fraction",
+        type=float,
+        default=0.01,
+        help=(
+            "Maximum validation batches with polarity inversion for checkpoint "
+            "eligibility. Use 0.05 for exploratory B1.5/B2 selection; deployment stays 0.01."
         ),
     )
     parser.add_argument(
@@ -2008,6 +2030,8 @@ def build_model(
     rq_codebook_balance_loss_weight: float = 0.,
     rq_codebook_balance_target_perplexity: float = 8.,
     rq_codebook_balance_temperature: float = 1.,
+    rq_quantization_error_loss_weight: float = 0.,
+    rq_continuous_teacher_loss_weight: float = 0.,
     bypass_rvq: bool = False,
     rq_projection_only: bool = False,
 ) -> SoundStream:
@@ -2050,6 +2074,8 @@ def build_model(
         rq_codebook_balance_loss_weight=rq_codebook_balance_loss_weight,
         rq_codebook_balance_target_perplexity=rq_codebook_balance_target_perplexity,
         rq_codebook_balance_temperature=rq_codebook_balance_temperature,
+        rq_quantization_error_loss_weight=rq_quantization_error_loss_weight,
+        rq_continuous_teacher_loss_weight=rq_continuous_teacher_loss_weight,
         use_lookup_free_quantizer=False,
         use_finite_scalar_quantizer=False,
         use_local_attn=False,
@@ -2416,6 +2442,10 @@ def main() -> None:
         raise ValueError("--rvq-codebook-balance-target-perplexity must be in [1, 256].")
     if args.rvq_codebook_balance_temperature <= 0.:
         raise ValueError("--rvq-codebook-balance-temperature must be positive.")
+    if args.rvq_quantization_error_loss_weight < 0.:
+        raise ValueError("--rvq-quantization-error-loss-weight cannot be negative.")
+    if args.rvq_continuous_teacher_loss_weight < 0.:
+        raise ValueError("--rvq-continuous-teacher-loss-weight cannot be negative.")
     if args.rvq_joint_adapt:
         if args.stage != "gan_pretrain":
             raise ValueError("--rvq-joint-adapt requires --stage gan_pretrain.")
@@ -2721,6 +2751,8 @@ def main() -> None:
         raise ValueError("--transient-loss-warmup-steps cannot be negative.")
     if not -1. <= args.clean_gate_min_aligned_corr <= 1.:
         raise ValueError("--clean-gate-min-aligned-corr must be between -1 and 1.")
+    if not 0. <= args.clean_gate_max_negative_fraction <= 1.:
+        raise ValueError("--clean-gate-max-negative-fraction must be between 0 and 1.")
     if args.clean_gate_min_rms_ratio <= 0:
         raise ValueError("--clean-gate-min-rms-ratio must be positive.")
     if args.clean_gate_max_rms_ratio < args.clean_gate_min_rms_ratio:
@@ -3438,6 +3470,7 @@ def main() -> None:
         f"enabled={not args.disable_clean_gate}, "
         f"aligned_si_sdr>={args.clean_gate_min_aligned_si_sdr}, "
         f"aligned_corr>={args.clean_gate_min_aligned_corr}, "
+        f"negative_fraction<={args.clean_gate_max_negative_fraction}, "
         f"rms_ratio=[{args.clean_gate_min_rms_ratio}, {args.clean_gate_max_rms_ratio}], "
         f"peak<={args.clean_gate_max_recon_peak}, "
         f"clip<={args.clean_gate_max_recon_clip_fraction}, "
@@ -3615,7 +3648,7 @@ def main() -> None:
     print(f"RVQ quantizers: {num_quantizers}")
     print("Codec latent dimension: 64")
     print(f"RVQ lookup dimension: {rq_lookup_dim}")
-    print("RVQ distance: cosine (unit-normalized lookup)")
+    print(f"RVQ distance: {args.rq_distance}")
     print("RVQ gradient estimator: standard STE (rotation trick disabled)")
     if args.rvq_projection_only:
         print(
@@ -3691,7 +3724,7 @@ def main() -> None:
         codebook_size=codebook_size,
         num_quantizers=num_quantizers,
         rq_lookup_dim=rq_lookup_dim,
-        rq_use_cosine_sim=True,
+        rq_use_cosine_sim=(args.rq_distance == "cosine"),
         rq_projection_only=args.rvq_projection_only,
         si_sdr_loss_weight=si_sdr_loss_weight,
         click_loss_weight=click_loss_weight,
@@ -3750,6 +3783,8 @@ def main() -> None:
         rq_codebook_balance_loss_weight=args.rvq_codebook_balance_loss_weight,
         rq_codebook_balance_target_perplexity=args.rvq_codebook_balance_target_perplexity,
         rq_codebook_balance_temperature=args.rvq_codebook_balance_temperature,
+        rq_quantization_error_loss_weight=args.rvq_quantization_error_loss_weight,
+        rq_continuous_teacher_loss_weight=args.rvq_continuous_teacher_loss_weight,
         bypass_rvq=args.bypass_rvq_during_training,
     )
 
@@ -3841,8 +3876,8 @@ def main() -> None:
         # below is what enables EMA/dead-code state updates.
         exclude_rq_from_generator_optimizer=(
             args.bypass_rvq_during_training or
-            args.stage2_targeted_refine or
-            args.stage == "gan_pretrain" or
+            (args.stage2_targeted_refine and not rvq_joint_adapt) or
+            (args.stage == "gan_pretrain" and not rvq_joint_adapt) or
             args.stage in ("stream_finetune", "stream_finetune_long")
         ),
         exclude_encoder_from_generator_optimizer=(
@@ -4122,6 +4157,7 @@ def main() -> None:
         clean_gate=not args.disable_clean_gate,
         clean_gate_min_aligned_si_sdr=args.clean_gate_min_aligned_si_sdr,
         clean_gate_min_aligned_corr=args.clean_gate_min_aligned_corr,
+        clean_gate_max_negative_fraction=args.clean_gate_max_negative_fraction,
         clean_gate_min_rms_ratio=args.clean_gate_min_rms_ratio,
         clean_gate_max_rms_ratio=args.clean_gate_max_rms_ratio,
         clean_gate_max_recon_peak=args.clean_gate_max_recon_peak,
@@ -4721,6 +4757,26 @@ def main() -> None:
                 f"q01_ok={int(validation_metrics['q01_validation_eligible'] >= 0.5)}, "
                 f"rvq_ok={int(validation_metrics['rvq_validation_eligible'] >= 0.5)}"
             )
+            if "quantization_gap_db" in validation_metrics:
+                residual_ratios = ", ".join(
+                    f"q{index:02d}={validation_metrics[key]:.4f}"
+                    for index in range(num_quantizers)
+                    for key in (f"rvq_residual_energy_ratio_q{index:02d}",)
+                    if key in validation_metrics
+                )
+                print(
+                    "RVQ fidelity diagnostics: "
+                    f"projection_aligned_si_sdr="
+                    f"{validation_metrics['projection_only_aligned_si_sdr']:.3f} dB, "
+                    f"quantized_aligned_si_sdr="
+                    f"{validation_metrics['quantized_aligned_si_sdr']:.3f} dB, "
+                    f"quantization_gap={validation_metrics['quantization_gap_db']:+.3f} dB, "
+                    f"lookup_nmse={validation_metrics.get('rvq_latent_nmse_lookup', float('nan')):.4f}, "
+                    f"lookup_cos={validation_metrics.get('rvq_latent_cosine_lookup', float('nan')):.4f}, "
+                    f"latent64_nmse={validation_metrics.get('rvq_latent_nmse_64d', float('nan')):.4f}, "
+                    f"latent64_cos={validation_metrics.get('rvq_latent_cosine_64d', float('nan')):.4f}; "
+                    f"residual_energy={residual_ratios}"
+                )
             print(f"Fixed validation report saved to: {validation_report_file}")
         trainer.accelerator.wait_for_everyone()
         return

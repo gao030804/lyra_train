@@ -25,6 +25,7 @@ AUDIO_DIR="${AUDIO_DIR:-$PWD/data/librispeech/LibriSpeech/train-clean-100}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
 SEED="${SEED:-42}"
 RVQ_LOOKUP_DIM="${RVQ_LOOKUP_DIM:-32}"
+RVQ_DISTANCE="${RVQ_DISTANCE:-cosine}"
 BYPASS_STAGE1_STEPS="${BYPASS_STAGE1_STEPS:-150000}"
 BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS="${BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS:-60000}"
 BYPASS_FORMANT_REFINE_STEPS="${BYPASS_FORMANT_REFINE_STEPS:-20000}"
@@ -35,8 +36,11 @@ RVQ_PROJECTION_MIN_EVR="${RVQ_PROJECTION_MIN_EVR:-0.90}"
 RVQ_PROJECTION_MIN_ALIGNED_SI_SDR="${RVQ_PROJECTION_MIN_ALIGNED_SI_SDR:-7.3}"
 RVQ_PROJECTION_LATENT_MSE_WEIGHT="${RVQ_PROJECTION_LATENT_MSE_WEIGHT:-0.25}"
 RVQ_PROJECTION_LATENT_COSINE_WEIGHT="${RVQ_PROJECTION_LATENT_COSINE_WEIGHT:-0.10}"
-RVQ_CALIBRATION_STEPS="${RVQ_CALIBRATION_STEPS:-5000}"
-RVQ_JOINT_ADAPT_STEPS="${RVQ_JOINT_ADAPT_STEPS:-20000}"
+RVQ_CALIBRATION_STEPS="${RVQ_CALIBRATION_STEPS:-1000}"
+RVQ_B1_MIN_ALIGNED_SI_SDR="${RVQ_B1_MIN_ALIGNED_SI_SDR:-3.0}"
+RVQ_B1_MIN_QUANTIZATION_GAP_DB="${RVQ_B1_MIN_QUANTIZATION_GAP_DB:--2.0}"
+RVQ_B15_MIN_ALIGNED_SI_SDR="${RVQ_B15_MIN_ALIGNED_SI_SDR:-3.0}"
+RVQ_JOINT_ADAPT_STEPS="${RVQ_JOINT_ADAPT_STEPS:-30000}"
 RVQ_STAGE2_STEPS="${RVQ_STAGE2_STEPS:-50000}"
 ENABLE_PRE_RVQ_STATE_FT="${ENABLE_PRE_RVQ_STATE_FT:-0}"
 PRE_RVQ_STATE_STEPS="${PRE_RVQ_STATE_STEPS:-20000}"
@@ -52,12 +56,16 @@ case "$RVQ_LOOKUP_DIM" in
   16|24|32) ;;
   *) echo "ERROR: RVQ_LOOKUP_DIM must be 16, 24, or 32." >&2; exit 2 ;;
 esac
+case "$RVQ_DISTANCE" in
+  cosine|euclidean) ;;
+  *) echo "ERROR: RVQ_DISTANCE must be cosine or euclidean." >&2; exit 2 ;;
+esac
 
 if (( BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS > BYPASS_STAGE1_STEPS )); then
   BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS="$BYPASS_STAGE1_STEPS"
 fi
 
-BASE="lowrank-dscnn-b234-relu-convtranspose-fp-64d-8q256-l${RVQ_LOOKUP_DIM}-${RUN_TAG}"
+BASE="lowrank-dscnn-b234-relu-convtranspose-fp-64d-8q256-l${RVQ_LOOKUP_DIM}-${RVQ_DISTANCE}-${RUN_TAG}"
 BYPASS_S1_DIR="$PWD/results/bypass-recon-$BASE"
 BYPASS_FORMANT_DIR="$PWD/results/bypass-formant-refine-$BASE"
 BYPASS_S2_DIR="$PWD/results/bypass-gan-$BASE"
@@ -204,6 +212,7 @@ pick_best() {
 COMMON=(
   --audio-dir "$AUDIO_DIR" --batch-size 4 --grad-accum-every 1
   --rq-lookup-dim "$RVQ_LOOKUP_DIM"
+  --rq-distance "$RVQ_DISTANCE"
   --segment-seconds 4 --dl-num-workers 6 --seed "$SEED"
   --decoder-upsample-mode convtranspose --no-decoder-split-first-upsample
   --save-model-every 5000 --test-eval-batches 100
@@ -377,16 +386,76 @@ run_stage "B1.5 joint STE quantization adaptation" 29518 \
   --stage gan_pretrain --results-dir "$RVQ_B15_DIR" \
   --init-checkpoint "$RVQ_S1_CKPT" --num-train-steps "$RVQ_JOINT_ADAPT_STEPS" \
   --rvq-joint-adapt --rvq-warm-in-steps 10000 \
-  --rvq-codebook-balance-loss-weight 0.01 \
+  --rvq-codebook-balance-loss-weight 0.002 \
   --rvq-codebook-balance-target-perplexity 64 \
   --rvq-codebook-balance-temperature 0.1 \
+  --rvq-quantization-error-loss-weight 0.05 \
+  --rvq-continuous-teacher-loss-weight 0.10 \
+  --clean-gate-min-aligned-si-sdr "$RVQ_B15_MIN_ALIGNED_SI_SDR" \
+  --clean-gate-max-negative-fraction 0.05 \
   --no-bypass-rvq-during-training "${RECON_LOSSES[@]}" "${COMMON[@]}" --no-resume
 RVQ_B15_CKPT="$(pick_best "$RVQ_B15_DIR" 2>/dev/null || true)"
-if [[ -z "$RVQ_B15_CKPT" && -f "$RVQ_B15_DIR/latest.pt" ]]; then
-  RVQ_B15_CKPT="$RVQ_B15_DIR/latest.pt"
-fi
-test -f "$RVQ_B15_CKPT" || { echo "ERROR: B1.5 produced no checkpoint" >&2; exit 2; }
+test -f "$RVQ_B15_CKPT" || {
+  echo "ERROR: B1.5 produced no validation-selected eligible checkpoint; latest.pt is resume-only." >&2
+  exit 2
+}
 echo "B1.5 checkpoint=$RVQ_B15_CKPT"
+
+# The fidelity gate belongs after joint representation learning, not after the
+# short B1 codebook bootstrap. GAN must not be used to hide RVQ distortion.
+B15_VALIDATION_REPORT="$RVQ_B15_DIR/b15_fixed_validation.tsv"
+run_stage "B1.5 fixed quantization-fidelity validation" 29520 \
+  "$PWD/logs/rvq-joint-adapt-validation-$BASE.log" 0 \
+  --stage gan_pretrain --results-dir "$RVQ_B15_DIR" \
+  --validation-only --validation-checkpoint "$RVQ_B15_CKPT" \
+  --validation-report-file "$B15_VALIDATION_REPORT" \
+  --no-bypass-rvq-during-training "${COMMON[@]}" --no-resume
+python - \
+  "$B15_VALIDATION_REPORT" \
+  "$RVQ_B1_MIN_ALIGNED_SI_SDR" \
+  "$RVQ_B1_MIN_QUANTIZATION_GAP_DB" <<'PY'
+import sys
+from pathlib import Path
+
+report = Path(sys.argv[1])
+minimum_si_sdr = float(sys.argv[2])
+minimum_gap = float(sys.argv[3])
+metrics = {}
+with report.open("r", encoding="utf-8") as handle:
+    header = handle.readline().rstrip("\n").split("\t")
+    if header != ["metric", "value"]:
+        raise SystemExit(f"RVQ handoff FAILED: unexpected report header {header}")
+    for line in handle:
+        name, value = line.rstrip("\n").split("\t", 1)
+        metrics[name] = float(value)
+
+required = (
+    "aligned_si_sdr",
+    "projection_only_aligned_si_sdr",
+    "quantization_gap_db",
+)
+missing = [name for name in required if name not in metrics]
+if missing:
+    raise SystemExit("RVQ handoff FAILED: missing metrics: " + ", ".join(missing))
+
+aligned = metrics["aligned_si_sdr"]
+projection = metrics["projection_only_aligned_si_sdr"]
+gap = metrics["quantization_gap_db"]
+print(
+    "RVQ handoff: "
+    f"projection_aligned_si_sdr={projection:.3f} dB, "
+    f"quantized_aligned_si_sdr={aligned:.3f} dB, "
+    f"gap={gap:+.3f} dB"
+)
+failures = []
+if aligned < minimum_si_sdr:
+    failures.append(f"aligned_si_sdr {aligned:.3f} < {minimum_si_sdr:.3f}")
+if gap < minimum_gap:
+    failures.append(f"quantization_gap_db {gap:.3f} < {minimum_gap:.3f}")
+if failures:
+    raise SystemExit("RVQ handoff FAILED: " + "; ".join(failures))
+print("RVQ handoff PASSED")
+PY
 
 # B2: Encoder and RVQ are frozen for the whole shortened GAN phase;
 # Decoder adapts to quantization error while GAN discriminators are trained.
@@ -396,6 +465,7 @@ run_stage "B2 RVQ GAN decoder adaptation" 29514 "$PWD/logs/rvq-gan-$BASE.log" 0 
   --no-bypass-rvq-during-training "${GAN_LOSSES[@]}" \
   --stage2-encoder-unfreeze-step -1 --early-stopping-min-steps 10000 \
   --early-stopping-patience 20 --stage2-quality-hard-stop \
+  --clean-gate-max-negative-fraction 0.05 \
   "${COMMON[@]}" --no-resume
 RVQ_S2_CKPT="$(pick_best "$RVQ_S2_DIR")"
 echo "B2 checkpoint=$RVQ_S2_CKPT"
