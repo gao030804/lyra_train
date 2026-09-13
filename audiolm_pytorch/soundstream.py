@@ -3384,33 +3384,55 @@ class SoundStream(Module):
         }
         return torch.stack(losses).mean()
 
-    def rvq_quantization_error_loss(self, encoded, indices):
-        """Directly penalize normalized error at every residual VQ level."""
+    def rvq_quantization_error_loss(self, encoded, quantized, indices):
+        """Final and progressive RVQ reconstruction error without dropout assumptions."""
         if self.rq_quantization_error_loss_weight <= 0.:
             self._last_rvq_quantization_stages = {}
             return encoded.new_zeros(())
         if self.rq_groups != 1 or self.use_lookup_free_quantizer or self.use_finite_scalar_quantizer:
             raise RuntimeError('quantization-error loss requires standard groups=1 RVQ')
 
-        residual = encoded.float()
+        encoded_f = encoded.float()
+        base_energy = encoded_f.square().mean().clamp_min(1e-8)
+        final_error = F.mse_loss(encoded_f, quantized.detach().float()) / base_energy
+        stage_weights = encoded_f.new_tensor(
+            (1., 0.7, 0.5, 0.35, 0.25, 0.18, 0.12, 0.08)
+        )
+        # ResidualVQ.get_output_from_indices intentionally rejects truncated
+        # indices when quantize_dropout is disabled.  Progressive supervision
+        # is still valid in that configuration, so reconstruct each prefix by
+        # accumulating the exact selected embeddings from every RVQ layer.
+        # This mirrors residual quantization itself and does not alter nearest-
+        # neighbour selection, STE, EMA updates, or cosine/Euclidean lookup.
+        residual_vq = self.rq.rvqs[0]
         stage_indices = indices[0]
-        losses, diagnostics = [], {}
-        for stage, layer in enumerate(self.rq.rvqs[0].layers):
+        if stage_indices.shape[-1] != len(residual_vq.layers):
+            raise RuntimeError(
+                'RVQ quantization-error loss received an unexpected number of stages: '
+                f'{stage_indices.shape[-1]} indices for {len(residual_vq.layers)} layers'
+            )
+
+        intermediate, diagnostics = encoded_f.new_zeros(()), {}
+        stage_quantized = torch.zeros_like(encoded_f)
+        used_weights = []
+        for stage, layer in enumerate(residual_vq.layers):
             embed = layer._codebook.embed
             if embed.ndim == 3:
                 embed = embed[0]
-            embed = embed.detach().float()
-            code_indices = stage_indices[..., stage]
-            valid = code_indices >= 0
-            selected = F.embedding(code_indices.clamp_min(0), embed)
-            selected = selected * valid.unsqueeze(-1)
-            before = residual.square().mean().clamp_min(1e-8)
-            residual = residual - selected
-            normalized_error = residual.square().mean() / before
-            losses.append(normalized_error)
-            diagnostics[f'q{stage:02d}'] = normalized_error.detach()
+            selected = F.embedding(
+                stage_indices[..., stage].clamp_min(0),
+                embed.detach(),
+            ).float()
+            stage_quantized = stage_quantized + selected
+            stage_error = F.mse_loss(encoded_f, stage_quantized) / base_energy
+            weight = stage_weights[min(stage, stage_weights.numel() - 1)]
+            intermediate = intermediate + weight * stage_error
+            used_weights.append(weight)
+            diagnostics[f'q{stage:02d}'] = stage_error.detach()
         self._last_rvq_quantization_stages = diagnostics
-        return torch.stack(losses).mean()
+        intermediate = intermediate / torch.stack(used_weights).sum().clamp_min(1e-8)
+        self._last_rvq_final_nmse = final_error.detach()
+        return final_error + 0.25 * intermediate
 
     def forward(
         self,
@@ -3457,7 +3479,6 @@ class SoundStream(Module):
             x = self.encoder_film(x, denoise_input)
 
         continuous_x = x
-        teacher_latent = None
         quantization_error_loss = self.zero
         if self.rq_projection_only:
             x = self.rq_output_projection(self.rq_input_projection(x))
@@ -3485,7 +3506,7 @@ class SoundStream(Module):
             lookup_x = self.rq_input_projection(x)
             x, indices, commit_loss = self.rq(lookup_x, **rq_kwargs)
             quantization_error_loss = self.rvq_quantization_error_loss(
-                lookup_x, indices
+                lookup_x, x, indices
             )
             x = self.rq_output_projection(x)
         else:
@@ -3498,24 +3519,16 @@ class SoundStream(Module):
 
         if not self.bypass_rvq and not self.rq_projection_only:
             alpha = float(max(0., min(1., rvq_warm_in_alpha)))
-            x = continuous_x + alpha * (x - continuous_x)
+            projected_continuous_x = self.rq_output_projection(
+                self.rq_input_projection(continuous_x)
+            )
+            x = projected_continuous_x + alpha * (x - projected_continuous_x)
             self.rq_warm_in_alpha = alpha
             codebook_balance_loss = self.rvq_codebook_balance_loss(
                 self.rq_input_projection(continuous_x), indices
             )
         else:
             codebook_balance_loss = self.zero
-
-        if (
-            self.rq_continuous_teacher_loss_weight > 0. and
-            not self.bypass_rvq and
-            not self.rq_projection_only
-        ):
-            # The Q0 continuous path is a stop-gradient teacher. The student
-            # still traverses the real discrete RVQ path above.
-            teacher_latent = self.rq_output_projection(
-                self.rq_input_projection(continuous_x)
-            ).detach()
 
         if exists(num_quantizers) and not self.bypass_rvq and not self.rq_projection_only:
             assert 0 < num_quantizers <= self.num_quantizers
@@ -3541,40 +3554,9 @@ class SoundStream(Module):
 
         recon_x = self.decoder(x)
 
-        continuous_teacher_loss = self.zero
-        if teacher_latent is not None:
-            with torch.no_grad():
-                teacher_x = teacher_latent
-                if exists(self.decoder_attn):
-                    teacher_x = self.decoder_attn(teacher_x)
-                teacher_x = rearrange(teacher_x, 'b n c -> b c n')
-                teacher_recon = self.decoder(teacher_x)
-            student_teacher, teacher_recon = canonicalize_waveform_pair(
-                recon_x, teacher_recon.detach()
-            )
-            teacher_wave = F.l1_loss(student_teacher, teacher_recon)
-            teacher_spectral = student_teacher.new_zeros(())
-            for n_fft in (512, 1024):
-                hop_length = n_fft // 4
-                window = torch.hann_window(
-                    n_fft, device=student_teacher.device, dtype=student_teacher.dtype
-                )
-                student_spec = torch.stft(
-                    student_teacher.flatten(0, 1), n_fft,
-                    hop_length=hop_length, window=window, return_complex=True
-                ).abs().clamp_min(1e-5)
-                teacher_spec = torch.stft(
-                    teacher_recon.flatten(0, 1), n_fft,
-                    hop_length=hop_length, window=window, return_complex=True
-                ).abs().clamp_min(1e-5)
-                teacher_spectral = teacher_spectral + F.l1_loss(
-                    student_spec.log(), teacher_spec.log()
-                )
-            continuous_teacher_loss = teacher_wave + 0.5 * teacher_spectral
-
         self._last_rvq_joint_losses = {
             'quantization_error': quantization_error_loss.detach(),
-            'continuous_teacher': continuous_teacher_loss.detach(),
+            'continuous_teacher': self.zero,
             **{
                 f'quantization_error_{name}': value
                 for name, value in getattr(
@@ -3597,6 +3579,11 @@ class SoundStream(Module):
             recon_x = recon_x[..., context_samples:]
             if exists(target):
                 target = target[..., context_samples:]
+
+        # Reused by the trainer's immutable Q0 teacher loss. Keeping the
+        # student tensor from this exact forward avoids a second RVQ call and
+        # therefore avoids duplicate EMA codebook updates.
+        self._last_student_recon_for_teacher = recon_x
 
         if return_discr_loss:
             real, fake = orig_x.detach(), recon_x.detach()
@@ -3786,7 +3773,7 @@ class SoundStream(Module):
             all_commitment_loss * self.commitment_loss_weight +
             codebook_balance_loss * self.rq_codebook_balance_loss_weight +
             quantization_error_loss * self.rq_quantization_error_loss_weight +
-            continuous_teacher_loss * self.rq_continuous_teacher_loss_weight
+            self.zero * self.rq_continuous_teacher_loss_weight
         )
 
         if return_loss_breakdown:

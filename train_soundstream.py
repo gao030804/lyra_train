@@ -558,7 +558,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rq-distance",
         choices=("cosine", "euclidean"),
-        default="cosine",
+        default="euclidean",
         help=(
             "RVQ nearest-neighbour geometry. Euclidean remains hardware-friendly "
             "through 2*dot(x,c)-||c||^2; use identical seeds/Q0 settings for A/B tests."
@@ -4281,7 +4281,7 @@ def main() -> None:
         quality_retention_rvq_patience=args.stage2_rvq_retention_patience,
         stage1_rvq_retention_patience=args.stage1_rvq_retention_patience,
         freeze_codebook_after_step=(
-            15_000 if rvq_joint_adapt
+            None if rvq_joint_adapt
             else stage_defaults.get("freeze_codebook_after_step")
         ),
         freeze_codebook_before_step=None,
@@ -4308,9 +4308,9 @@ def main() -> None:
             if args.stage == "gan_pretrain"
             else None
         ),
-        freeze_encoder_after_step=(15_000 if rvq_joint_adapt else None),
+        freeze_encoder_after_step=None,
         rvq_warm_in_steps=args.rvq_warm_in_steps,
-        decoder_lr_after_step=((15_000, 1e-6) if rvq_joint_adapt else None),
+        decoder_lr_after_step=None,
         freeze_decoder_before_step=(
             num_train_steps
             if (args.rvq_projection_only or stage25_rvq_midband_refine)
@@ -4570,6 +4570,12 @@ def main() -> None:
             if trainer.use_ema:
                 trainer.copy_online_to_ema()
                 print("Synchronized EMA from initialized online weights.")
+            if rvq_joint_adapt:
+                trainer.capture_rvq_q0_teacher()
+                print(
+                    "Captured immutable Q0 Encoder/Projection/Decoder teacher "
+                    "for RVQ joint adaptation."
+                )
             if args.stage == "gan_pretrain" and not args.stage2_targeted_refine:
                 trainer.capture_stage2_latent_reference()
                 print(

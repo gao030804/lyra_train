@@ -265,14 +265,16 @@ def test_pipeline_inserts_joint_rvq_adaptation_and_shortens_b2():
     launcher = (ROOT / "run_bypass_rvq_stage1_stage2.sh").read_text(
         encoding="utf-8"
     )
+    assert 'RVQ_DISTANCE="${RVQ_DISTANCE:-euclidean}"' in launcher
+    assert '--rq-distance "$RVQ_DISTANCE"' in launcher
     assert 'RVQ_CALIBRATION_STEPS="${RVQ_CALIBRATION_STEPS:-1000}"' in launcher
     assert 'RVQ_JOINT_ADAPT_STEPS="${RVQ_JOINT_ADAPT_STEPS:-30000}"' in launcher
     assert 'RVQ_STAGE2_STEPS="${RVQ_STAGE2_STEPS:-50000}"' in launcher
     assert 'B1.5 joint STE quantization adaptation' in launcher
-    assert '--rvq-warm-in-steps 10000' in launcher
+    assert '--rvq-warm-in-steps 20000' in launcher
     assert '--rvq-codebook-balance-loss-weight 0.002' in launcher
-    assert '--rvq-quantization-error-loss-weight 0.05' in launcher
-    assert '--rvq-continuous-teacher-loss-weight 0.10' in launcher
+    assert '--rvq-quantization-error-loss-weight 0.10' in launcher
+    assert '--rvq-continuous-teacher-loss-weight 0.20' in launcher
     assert '--rvq-codebook-balance-target-perplexity 64' in launcher
     assert '--stage2-encoder-unfreeze-step -1' in launcher
     assert '--early-stopping-patience 20 --stage2-quality-hard-stop' in launcher
@@ -281,14 +283,18 @@ def test_pipeline_inserts_joint_rvq_adaptation_and_shortens_b2():
     ) < launcher.index('B2 RVQ GAN decoder adaptation')
 
     source = (ROOT / "train_soundstream.py").read_text(encoding="utf-8")
-    assert 'freeze_encoder_after_step=(15_000 if rvq_joint_adapt else None)' in source
+    assert 'freeze_encoder_after_step=None' in source
     model_source = (ROOT / "audiolm_pytorch" / "soundstream.py").read_text(
         encoding="utf-8"
     )
     assert 'def rvq_codebook_balance_loss(self, encoded, indices):' in model_source
     assert 'def rvq_quantization_error_loss(self, encoded, indices):' in model_source
-    assert 'x = continuous_x + alpha * (x - continuous_x)' in model_source
-    assert 'teacher_latent = self.rq_output_projection' in model_source
+    assert 'x = projected_continuous_x + alpha * (x - projected_continuous_x)' in model_source
+    trainer_source = (ROOT / "audiolm_pytorch" / "trainer.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'def capture_rvq_q0_teacher(self):' in trainer_source
+    assert "object.__setattr__(self, '_rvq_q0_teacher', teacher)" in trainer_source
 
 
 def test_pipeline_can_start_from_bypass_formant_refine_checkpoint():

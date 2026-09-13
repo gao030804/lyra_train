@@ -770,6 +770,7 @@ class SoundStreamTrainer(nn.Module):
             exclude_rq_from_generator_optimizer
         )
         self._stage2_latent_reference_encoder = None
+        object.__setattr__(self, '_rvq_q0_teacher', None)
         self.first_decoder_block_excluded_from_generator_optimizer = bool(
             exclude_first_decoder_block_from_generator_optimizer
         )
@@ -2029,28 +2030,46 @@ class SoundStreamTrainer(nn.Module):
         lookup = model.rq_input_projection(latent).float()
         residual = lookup
         base_energy = lookup.square().mean().clamp_min(1e-12)
-        stage_indices = indices
-        if stage_indices.ndim == 4 and stage_indices.shape[0] == 1:
-            stage_indices = stage_indices[0]
-        layers = model.rq.rvqs[0].layers
+        grouped_indices = rearrange(
+            indices, 'b n (g q) -> g b n q', g=model.rq_groups
+        )
+        if model.rq_groups != 1:
+            raise RuntimeError('RVQ geometry metrics require groups=1')
+        residual_vq = model.rq.rvqs[0]
+        stage_indices = grouped_indices[0]
+        if stage_indices.shape[-1] != len(residual_vq.layers):
+            raise RuntimeError(
+                'RVQ geometry metrics received an unexpected number of stages: '
+                f'{stage_indices.shape[-1]} indices for {len(residual_vq.layers)} layers'
+            )
+
+        # Do not call ResidualVQ.get_output_from_indices with a truncated
+        # prefix: vector-quantize-pytorch rejects that operation whenever
+        # quantize_dropout is disabled.  Accumulating each selected embedding
+        # is the exact residual-VQ prefix reconstruction and keeps this
+        # read-only diagnostic independent of the dropout training policy.
+        stage_quantized = torch.zeros_like(lookup)
         output = {}
-        for stage, layer in enumerate(layers):
-            if stage >= stage_indices.shape[-1]:
-                break
-            embed = layer._codebook.embed.detach().float()
-            if embed.ndim == 3:
-                embed = embed[0]
-            selected = F.embedding(stage_indices[..., stage].long(), embed)
+        for stage, layer in enumerate(residual_vq.layers):
             before = residual.square().mean().clamp_min(1e-12)
-            residual = residual - selected
+            codebook = layer._codebook.embed.detach().float()
+            if codebook.ndim == 3:
+                codebook = codebook[0]
+            selected = F.embedding(
+                stage_indices[..., stage].clamp_min(0), codebook
+            )
+            stage_quantized = stage_quantized + selected
+            residual = lookup - stage_quantized
             after = residual.square().mean()
             output[f'rvq_residual_energy_ratio_q{stage:02d}'] = float((before / base_energy).cpu())
             output[f'rvq_stage_nmse_q{stage:02d}'] = float((after / before).cpu())
             output[f'rvq_residual_rms_q{stage:02d}'] = float(before.sqrt().cpu())
             output[f'rvq_selected_code_rms_q{stage:02d}'] = float(selected.square().mean().sqrt().cpu())
-            output[f'rvq_codebook_norm_q{stage:02d}'] = float(embed.norm(dim = -1).mean().cpu())
+            output[f'rvq_codebook_norm_q{stage:02d}'] = float(
+                codebook.norm(dim=-1).mean().cpu()
+            )
 
-        quantized_lookup = lookup - residual
+        quantized_lookup = stage_quantized
         reconstructed = model.rq_output_projection(quantized_lookup).float()
         output['rvq_latent_nmse_lookup'] = float((residual.square().mean() / base_energy).cpu())
         output['rvq_latent_cosine_lookup'] = float(F.cosine_similarity(
@@ -4914,6 +4933,72 @@ class SoundStreamTrainer(nn.Module):
         object.__setattr__(self, '_stage2_latent_reference_encoder', reference)
 
     @torch.no_grad()
+    def capture_rvq_q0_teacher(self):
+        """Freeze the loaded Q0 continuous codec as an immutable distillation teacher."""
+        model = self.unwrapped_soundstream
+        names = (
+            'encoder', 'encoder_attn', 'rq_input_projection',
+            'rq_output_projection', 'decoder_attn', 'decoder'
+        )
+        teacher = {}
+        for name in names:
+            module = getattr(model, name, None)
+            if not isinstance(module, nn.Module):
+                teacher[name] = None
+                continue
+            frozen = copy.deepcopy(module).to(self.device)
+            frozen.requires_grad_(False)
+            frozen.eval()
+            teacher[name] = frozen
+        object.__setattr__(self, '_rvq_q0_teacher', teacher)
+
+    @torch.no_grad()
+    def rvq_q0_teacher_reconstruction(self, wave):
+        teacher = self._rvq_q0_teacher
+        if teacher is None:
+            raise RuntimeError('RVQ joint adaptation requires a captured frozen Q0 teacher')
+        model = self.unwrapped_soundstream
+        encoded, _ = model.process_input(wave)
+        latent = rearrange(teacher['encoder'](encoded), 'b c n -> b n c')
+        if teacher['encoder_attn'] is not None:
+            latent = teacher['encoder_attn'](latent)
+        latent = teacher['rq_output_projection'](
+            teacher['rq_input_projection'](latent)
+        )
+        if teacher['decoder_attn'] is not None:
+            latent = teacher['decoder_attn'](latent)
+        return teacher['decoder'](rearrange(latent, 'b n c -> b c n'))
+
+    def rvq_frozen_teacher_loss(self, wave, student_recon):
+        if self._rvq_q0_teacher is None:
+            return student_recon.new_zeros(())
+        teacher_recon = self.rvq_q0_teacher_reconstruction(wave)
+        context_samples = int(getattr(self.unwrapped_soundstream, 'training_context_samples', 0))
+        if context_samples:
+            teacher_recon = teacher_recon[..., context_samples:]
+        student_recon, teacher_recon = canonicalize_waveform_pair(
+            student_recon, teacher_recon.detach()
+        )
+        teacher_wave = F.l1_loss(student_recon, teacher_recon)
+        teacher_spectral = student_recon.new_zeros(())
+        for n_fft in (512, 1024):
+            window = torch.hann_window(
+                n_fft, device=student_recon.device, dtype=student_recon.dtype
+            )
+            student_spec = torch.stft(
+                student_recon.flatten(0, 1), n_fft,
+                hop_length=n_fft // 4, window=window, return_complex=True
+            ).abs().clamp_min(1e-5)
+            teacher_spec = torch.stft(
+                teacher_recon.flatten(0, 1), n_fft,
+                hop_length=n_fft // 4, window=window, return_complex=True
+            ).abs().clamp_min(1e-5)
+            teacher_spectral = teacher_spectral + F.l1_loss(
+                student_spec.log(), teacher_spec.log()
+            )
+        return teacher_wave + 0.5 * teacher_spectral
+
+    @torch.no_grad()
     def stage2_latent_drift_metrics(self, wave):
         reference = self._stage2_latent_reference_encoder
         if reference is None:
@@ -5370,6 +5455,22 @@ class SoundStreamTrainer(nn.Module):
                         logs['projection_cosine_loss'] = float(
                             projection_cosine_loss.detach().cpu()
                         )
+                teacher_weight = float(getattr(
+                    runtime_model, 'rq_continuous_teacher_loss_weight', 0.
+                ))
+                if teacher_weight > 0.:
+                    student_recon = getattr(
+                        runtime_model, '_last_student_recon_for_teacher', None
+                    )
+                    if student_recon is None:
+                        raise RuntimeError('student reconstruction was not cached for Q0 teacher loss')
+                    continuous_teacher_loss = self.rvq_frozen_teacher_loss(
+                        wave, student_recon
+                    )
+                    loss = loss + continuous_teacher_loss * teacher_weight
+                    runtime_model._last_rvq_joint_losses[
+                        'continuous_teacher'
+                    ] = continuous_teacher_loss.detach()
                 (
                     recon_loss,
                     multi_spectral_recon_loss,
@@ -6510,6 +6611,27 @@ class SoundStreamTrainer(nn.Module):
                 f"{steps}: codebook online "
                 f"{self.format_codebook_diagnostics(online_score)}"
             )
+            if 'quantization_gap_db' in online_score:
+                def rvq_values(prefix):
+                    return '[' + ','.join(
+                        f"{online_score.get(f'{prefix}_q{index:02d}', float('nan')):.4f}"
+                        for index in range(self.unwrapped_soundstream.num_quantizers)
+                    ) + ']'
+                self.print(
+                    f"{steps}: RVQ-GEO "
+                    f"proj_si_sdr={online_score['projection_only_aligned_si_sdr']:.3f}, "
+                    f"quant_si_sdr={online_score['quantized_aligned_si_sdr']:.3f}, "
+                    f"gap_db={online_score['quantization_gap_db']:+.3f}, "
+                    f"lookup_nmse={online_score.get('rvq_latent_nmse_lookup', float('nan')):.4f}, "
+                    f"lookup_cos={online_score.get('rvq_latent_cosine_lookup', float('nan')):.4f}, "
+                    f"nmse64={online_score.get('rvq_latent_nmse_64d', float('nan')):.4f}, "
+                    f"cos64={online_score.get('rvq_latent_cosine_64d', float('nan')):.4f}, "
+                    f"R={rvq_values('rvq_residual_energy_ratio')}, "
+                    f"stage_nmse={rvq_values('rvq_stage_nmse')}, "
+                    f"res_rms={rvq_values('rvq_residual_rms')}, "
+                    f"code_rms={rvq_values('rvq_selected_code_rms')}, "
+                    f"code_norm={rvq_values('rvq_codebook_norm')}"
+                )
             if self.use_ema:
                 self.print(
                     f"{steps}: codebook ema "

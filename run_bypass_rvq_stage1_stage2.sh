@@ -25,7 +25,7 @@ AUDIO_DIR="${AUDIO_DIR:-$PWD/data/librispeech/LibriSpeech/train-clean-100}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
 SEED="${SEED:-42}"
 RVQ_LOOKUP_DIM="${RVQ_LOOKUP_DIM:-32}"
-RVQ_DISTANCE="${RVQ_DISTANCE:-cosine}"
+RVQ_DISTANCE="${RVQ_DISTANCE:-euclidean}"
 BYPASS_STAGE1_STEPS="${BYPASS_STAGE1_STEPS:-150000}"
 BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS="${BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS:-60000}"
 BYPASS_FORMANT_REFINE_STEPS="${BYPASS_FORMANT_REFINE_STEPS:-20000}"
@@ -39,6 +39,7 @@ RVQ_PROJECTION_LATENT_COSINE_WEIGHT="${RVQ_PROJECTION_LATENT_COSINE_WEIGHT:-0.10
 RVQ_CALIBRATION_STEPS="${RVQ_CALIBRATION_STEPS:-1000}"
 RVQ_B1_MIN_ALIGNED_SI_SDR="${RVQ_B1_MIN_ALIGNED_SI_SDR:-3.0}"
 RVQ_B1_MIN_QUANTIZATION_GAP_DB="${RVQ_B1_MIN_QUANTIZATION_GAP_DB:--2.0}"
+RVQ_B15_MAX_LOOKUP_NMSE="${RVQ_B15_MAX_LOOKUP_NMSE:-0.10}"
 RVQ_B15_MIN_ALIGNED_SI_SDR="${RVQ_B15_MIN_ALIGNED_SI_SDR:-3.0}"
 RVQ_JOINT_ADAPT_STEPS="${RVQ_JOINT_ADAPT_STEPS:-30000}"
 RVQ_STAGE2_STEPS="${RVQ_STAGE2_STEPS:-50000}"
@@ -377,20 +378,20 @@ RVQ_S1_CKPT="$RVQ_S1_DIR/latest.pt"
 test -f "$RVQ_S1_CKPT" || { echo "ERROR: missing $RVQ_S1_CKPT" >&2; exit 2; }
 echo "B1 checkpoint=$RVQ_S1_CKPT"
 
-# B1.5: non-adversarial quantization adaptation.  The first 2k steps train
-# Decoder only while alpha ramps z -> z_q over 10k steps. From 2k to 15k only
-# Encoder Block4/final latent conv joins Decoder while RVQ EMA follows the
-# changing latent distribution.  At 15k Encoder and RVQ refreeze.
+# B1.5: non-adversarial joint representation learning. Alpha transitions from
+# the Q0 projection path to the real quantized path over 20k steps. Encoder
+# tail, projections, RVQ EMA and Decoder remain adaptive for the whole stage;
+# the post-stage geometry gate decides whether B2 may freeze them.
 run_stage "B1.5 joint STE quantization adaptation" 29518 \
   "$PWD/logs/rvq-joint-adapt-$BASE.log" 0 \
   --stage gan_pretrain --results-dir "$RVQ_B15_DIR" \
   --init-checkpoint "$RVQ_S1_CKPT" --num-train-steps "$RVQ_JOINT_ADAPT_STEPS" \
-  --rvq-joint-adapt --rvq-warm-in-steps 10000 \
+  --rvq-joint-adapt --rvq-warm-in-steps 20000 \
   --rvq-codebook-balance-loss-weight 0.002 \
   --rvq-codebook-balance-target-perplexity 64 \
   --rvq-codebook-balance-temperature 0.1 \
-  --rvq-quantization-error-loss-weight 0.05 \
-  --rvq-continuous-teacher-loss-weight 0.10 \
+  --rvq-quantization-error-loss-weight 0.10 \
+  --rvq-continuous-teacher-loss-weight 0.20 \
   --clean-gate-min-aligned-si-sdr "$RVQ_B15_MIN_ALIGNED_SI_SDR" \
   --clean-gate-max-negative-fraction 0.05 \
   --no-bypass-rvq-during-training "${RECON_LOSSES[@]}" "${COMMON[@]}" --no-resume
@@ -413,13 +414,15 @@ run_stage "B1.5 fixed quantization-fidelity validation" 29520 \
 python - \
   "$B15_VALIDATION_REPORT" \
   "$RVQ_B1_MIN_ALIGNED_SI_SDR" \
-  "$RVQ_B1_MIN_QUANTIZATION_GAP_DB" <<'PY'
+  "$RVQ_B1_MIN_QUANTIZATION_GAP_DB" \
+  "$RVQ_B15_MAX_LOOKUP_NMSE" <<'PY'
 import sys
 from pathlib import Path
 
 report = Path(sys.argv[1])
 minimum_si_sdr = float(sys.argv[2])
 minimum_gap = float(sys.argv[3])
+maximum_lookup_nmse = float(sys.argv[4])
 metrics = {}
 with report.open("r", encoding="utf-8") as handle:
     header = handle.readline().rstrip("\n").split("\t")
@@ -433,6 +436,7 @@ required = (
     "aligned_si_sdr",
     "projection_only_aligned_si_sdr",
     "quantization_gap_db",
+    "rvq_latent_nmse_lookup",
 )
 missing = [name for name in required if name not in metrics]
 if missing:
@@ -441,17 +445,20 @@ if missing:
 aligned = metrics["aligned_si_sdr"]
 projection = metrics["projection_only_aligned_si_sdr"]
 gap = metrics["quantization_gap_db"]
+lookup_nmse = metrics["rvq_latent_nmse_lookup"]
 print(
     "RVQ handoff: "
     f"projection_aligned_si_sdr={projection:.3f} dB, "
     f"quantized_aligned_si_sdr={aligned:.3f} dB, "
-    f"gap={gap:+.3f} dB"
+    f"gap={gap:+.3f} dB, lookup_nmse={lookup_nmse:.4f}"
 )
 failures = []
 if aligned < minimum_si_sdr:
     failures.append(f"aligned_si_sdr {aligned:.3f} < {minimum_si_sdr:.3f}")
 if gap < minimum_gap:
     failures.append(f"quantization_gap_db {gap:.3f} < {minimum_gap:.3f}")
+if lookup_nmse > maximum_lookup_nmse:
+    failures.append(f"lookup_nmse {lookup_nmse:.4f} > {maximum_lookup_nmse:.4f}")
 if failures:
     raise SystemExit("RVQ handoff FAILED: " + "; ".join(failures))
 print("RVQ handoff PASSED")
