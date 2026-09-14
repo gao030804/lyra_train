@@ -434,6 +434,7 @@ class SoundStreamTrainer(nn.Module):
         rvq_calibration_only: bool = False,
         rvq_projection_only: bool = False,
         rvq_projection_pca_batches: int = 0,
+        rvq_calibration_kmeans_batches: int = 0,
         rvq_projection_min_evr: float = 0.90,
         rvq_projection_latent_mse_weight: float = 0.,
         rvq_projection_latent_cosine_weight: float = 0.,
@@ -441,6 +442,11 @@ class SoundStreamTrainer(nn.Module):
         rvq_projection_tie_loss_weight: float = 0.,
         rvq_projection_freeze_input_steps: int = 0,
         rvq_joint_latent64_teacher_loss_weight: float = 0.10,
+        projection_lr: float | None = None,
+        rvq_joint_decoder_only_steps: int = 10000,
+        rvq_joint_rvq_adapt_end_steps: int = 20000,
+        rvq_joint_projection_adapt_end_steps: int = 25000,
+        rvq_joint_recenter_end_steps: int = 26000,
         freeze_codebook_after_step: int | None = None,
         freeze_codebook_before_step: int | None = None,
         freeze_codebook_during_training: bool = False,
@@ -744,6 +750,7 @@ class SoundStreamTrainer(nn.Module):
             "rvq_warm_in_steps": rvq_warm_in_steps,
             "rvq_projection_only": rvq_projection_only,
             "rvq_projection_pca_batches": rvq_projection_pca_batches,
+            "rvq_calibration_kmeans_batches": rvq_calibration_kmeans_batches,
             "rvq_projection_min_evr": rvq_projection_min_evr,
             "rvq_projection_latent_mse_weight": rvq_projection_latent_mse_weight,
             "rvq_projection_latent_cosine_weight": rvq_projection_latent_cosine_weight,
@@ -751,6 +758,11 @@ class SoundStreamTrainer(nn.Module):
             "rvq_projection_tie_loss_weight": rvq_projection_tie_loss_weight,
             "rvq_projection_freeze_input_steps": rvq_projection_freeze_input_steps,
             "rvq_joint_latent64_teacher_loss_weight": rvq_joint_latent64_teacher_loss_weight,
+            "projection_learning_rate": projection_lr,
+            "rvq_joint_decoder_only_steps": rvq_joint_decoder_only_steps,
+            "rvq_joint_rvq_adapt_end_steps": rvq_joint_rvq_adapt_end_steps,
+            "rvq_joint_projection_adapt_end_steps": rvq_joint_projection_adapt_end_steps,
+            "rvq_joint_recenter_end_steps": rvq_joint_recenter_end_steps,
             "decoder_lr_after_step": decoder_lr_after_step,
             "rq_excluded_from_generator_optimizer": exclude_rq_from_generator_optimizer,
             "encoder_excluded_from_generator_optimizer": (
@@ -796,6 +808,17 @@ class SoundStreamTrainer(nn.Module):
             for module in rq_modules
             for parameter in module.parameters()
         }
+        quantizer_parameter_ids = {
+            id(parameter) for parameter in soundstream.rq.parameters()
+        }
+        projection_parameter_ids = {
+            id(parameter)
+            for module in (
+                soundstream.rq_input_projection,
+                soundstream.rq_output_projection,
+            )
+            for parameter in module.parameters()
+        }
         if exclude_rq_from_generator_optimizer:
             # Keep the quantizer a differentiable path for Encoder inputs while
             # preventing parameter-gradient accumulation and optimizer updates.
@@ -804,6 +827,14 @@ class SoundStreamTrainer(nn.Module):
             generator_parameters = [
                 parameter for parameter in generator_parameters
                 if id(parameter) not in rq_parameter_ids
+            ]
+        elif exists(projection_lr):
+            # B1.5 codebooks are EMA-managed.  Keep Win/Wout in explicit
+            # optimizer groups, but never let Adam update codebook tensors.
+            soundstream.rq.requires_grad_(False)
+            generator_parameters = [
+                parameter for parameter in generator_parameters
+                if id(parameter) not in quantizer_parameter_ids
             ]
         if rvq_projection_only:
             projection_parameters = [
@@ -898,28 +929,49 @@ class SoundStreamTrainer(nn.Module):
                 if id(parameter) not in first_decoder_parameter_ids
             ]
 
-        if exists(encoder_lr):
-            if encoder_lr <= 0.:
+        if exists(encoder_lr) or exists(projection_lr):
+            if exists(encoder_lr) and encoder_lr <= 0.:
                 raise ValueError('encoder_lr must be positive when specified')
 
             encoder_parameters = [
                 parameter for parameter in generator_parameters
                 if id(parameter) in encoder_parameter_ids
             ]
+            projection_parameters = [
+                parameter for parameter in generator_parameters
+                if id(parameter) in projection_parameter_ids
+            ]
             decoder_parameters = [
                 parameter for parameter in generator_parameters
-                if id(parameter) not in encoder_parameter_ids
-            ]
-            if not encoder_parameters or not decoder_parameters:
-                raise RuntimeError(
-                    'separate Encoder/Decoder optimizer groups require both parameter sets'
+                if (
+                    id(parameter) not in encoder_parameter_ids and
+                    id(parameter) not in projection_parameter_ids
                 )
+            ]
+            if exists(encoder_lr) and not encoder_parameters:
+                raise RuntimeError(
+                    'separate Encoder optimizer group has no parameters'
+                )
+            if exists(projection_lr) and not projection_parameters:
+                raise RuntimeError(
+                    'separate projection optimizer group has no parameters'
+                )
+            if not decoder_parameters and not rvq_projection_only:
+                raise RuntimeError('separate optimizer groups have no Decoder parameters')
 
             generator_parameter_groups = []
-            for group_name, parameters, group_lr in (
-                ('decoder', decoder_parameters, lr),
-                ('encoder', encoder_parameters, encoder_lr),
-            ):
+            named_parameter_groups = [('decoder', decoder_parameters, lr)]
+            if projection_parameters:
+                named_parameter_groups.append((
+                    'projection',
+                    projection_parameters,
+                    projection_lr if exists(projection_lr) else lr,
+                ))
+            if encoder_parameters:
+                named_parameter_groups.append(('encoder', encoder_parameters, encoder_lr))
+            for group_name, parameters, group_lr in named_parameter_groups:
+                if not parameters:
+                    continue
                 wd_parameters, no_wd_parameters = separate_weight_decayable_params(parameters)
                 if wd_parameters:
                     generator_parameter_groups.append(dict(
@@ -1422,6 +1474,8 @@ class SoundStreamTrainer(nn.Module):
         self.rvq_calibration_only = bool(rvq_calibration_only)
         self.rvq_projection_only = bool(rvq_projection_only)
         self.rvq_projection_pca_batches = int(rvq_projection_pca_batches)
+        self.rvq_calibration_kmeans_batches = int(rvq_calibration_kmeans_batches)
+        self.rvq_calibration_kmeans_initialized = False
         self.rvq_projection_pca_initialized = False
         self.rvq_projection_min_evr = float(rvq_projection_min_evr)
         self.rvq_projection_latent_mse_weight = float(rvq_projection_latent_mse_weight)
@@ -1435,6 +1489,8 @@ class SoundStreamTrainer(nn.Module):
         self.best_rvq_projection_aligned_si_sdr = float('-inf')
         if self.rvq_projection_pca_batches < 0:
             raise ValueError('rvq_projection_pca_batches must be non-negative')
+        if self.rvq_calibration_kmeans_batches < 0:
+            raise ValueError('rvq_calibration_kmeans_batches must be non-negative')
         if not 0. <= self.rvq_projection_min_evr <= 1.:
             raise ValueError('rvq_projection_min_evr must be in [0, 1]')
         if self.rvq_projection_latent_mse_weight < 0.:
@@ -1449,6 +1505,23 @@ class SoundStreamTrainer(nn.Module):
             raise ValueError('rvq_projection_freeze_input_steps must be non-negative')
         if self.rvq_joint_latent64_teacher_loss_weight < 0.:
             raise ValueError('rvq_joint_latent64_teacher_loss_weight must be non-negative')
+        if exists(projection_lr) and projection_lr <= 0.:
+            raise ValueError('projection_lr must be positive when specified')
+        self.projection_lr = projection_lr
+        self.rvq_joint_decoder_only_steps = int(rvq_joint_decoder_only_steps)
+        self.rvq_joint_rvq_adapt_end_steps = int(rvq_joint_rvq_adapt_end_steps)
+        self.rvq_joint_projection_adapt_end_steps = int(rvq_joint_projection_adapt_end_steps)
+        self.rvq_joint_recenter_end_steps = int(rvq_joint_recenter_end_steps)
+        rvq_joint_boundaries = (
+            self.rvq_joint_decoder_only_steps,
+            self.rvq_joint_rvq_adapt_end_steps,
+            self.rvq_joint_projection_adapt_end_steps,
+            self.rvq_joint_recenter_end_steps,
+        )
+        if any(step < 0 for step in rvq_joint_boundaries):
+            raise ValueError('RVQ joint phase boundaries must be non-negative')
+        if tuple(sorted(rvq_joint_boundaries)) != rvq_joint_boundaries:
+            raise ValueError('RVQ joint phase boundaries must be monotonic')
         assert not exists(freeze_codebook_after_step) or freeze_codebook_after_step >= 0
         assert not exists(freeze_codebook_before_step) or freeze_codebook_before_step >= 0
         assert not exists(freeze_encoder_before_step) or freeze_encoder_before_step >= 0
@@ -5318,6 +5391,91 @@ class SoundStreamTrainer(nn.Module):
             )
 
     @torch.no_grad()
+    def initialize_rvq_codebooks_from_residual_kmeans(self):
+        """Initialize every B1 codebook sequentially from a large latent pool.
+
+        ResidualVQ performs K-means one level at a time on the residual left by
+        earlier levels.  Feeding a multi-batch pool here avoids letting the
+        first ordinary training mini-batch define all codebooks.
+        """
+        if (
+            not self.rvq_calibration_only or
+            self.rvq_calibration_kmeans_initialized or
+            self.rvq_calibration_kmeans_batches <= 0
+        ):
+            return
+
+        model = self.unwrapped_soundstream
+        if (
+            model.rq_groups != 1 or
+            model.use_lookup_free_quantizer or
+            model.use_finite_scalar_quantizer
+        ):
+            raise RuntimeError(
+                'sequential residual K-means requires standard groups=1 RVQ'
+            )
+
+        encoder_modules = [model.encoder]
+        if exists(model.encoder_attn):
+            encoder_modules.append(model.encoder_attn)
+        previous_modes = [module.training for module in encoder_modules]
+        for module in encoder_modules:
+            module.eval()
+
+        projected_batches = []
+        for _ in range(self.rvq_calibration_kmeans_batches):
+            wave, = next(self.dl_iter)
+            wave = wave.to(self.device)
+            encoder_input, _ = model.process_input(wave)
+            latent = rearrange(model.encoder(encoder_input), 'b c n -> b n c')
+            if exists(model.encoder_attn):
+                latent = model.encoder_attn(latent)
+            projected_batches.append(model.rq_input_projection(latent).detach())
+
+        for module, was_training in zip(encoder_modules, previous_modes):
+            module.train(was_training)
+
+        projected = torch.cat(projected_batches, dim=1)
+        residual_vq = model.rq.rvqs[0]
+        for layer in residual_vq.layers:
+            codebook = layer._codebook
+            initted = getattr(codebook, 'initted', None)
+            if torch.is_tensor(initted):
+                initted.fill_(False)
+
+        model.rq.train()
+        model.rq(projected, freeze_codebook=False)
+        uninitted = [
+            index
+            for index, layer in enumerate(residual_vq.layers)
+            if torch.is_tensor(layer._codebook.initted) and
+            not bool(layer._codebook.initted.all().item())
+        ]
+        if uninitted:
+            raise RuntimeError(
+                f'residual K-means failed to initialize RVQ levels {uninitted}'
+            )
+
+        local_frames = torch.tensor(
+            projected.shape[0] * projected.shape[1],
+            device=self.device,
+            dtype=torch.long,
+        )
+        total_frames = int(self.accelerator.reduce(
+            local_frames, reduction='sum'
+        ).item())
+        self.rvq_calibration_kmeans_initialized = True
+        self.accelerator.wait_for_everyone()
+        if self.is_main:
+            self.save(str(self.results_folder / 'residual_kmeans_initialized.pt'))
+            self.print(
+                'B1 sequential residual K-means initialized: '
+                f'batches={self.rvq_calibration_kmeans_batches}, '
+                f'global_frames={total_frames}, levels={len(residual_vq.layers)}'
+            )
+        self.accelerator.wait_for_everyone()
+
+    @torch.no_grad()
     def rvq_projection_latent_metrics(self, wave):
         if not self.rvq_projection_only:
             return {}
@@ -5399,26 +5557,50 @@ class SoundStreamTrainer(nn.Module):
         stage2_recon_transition_progress = self.update_stage2_reconstruction_transition(steps)
         transient_loss_progress = self.update_transient_loss_weights(steps)
         rvq_joint_curriculum = self._rvq_q0_teacher is not None
-        freeze_codebook = (
-            self.freeze_codebook_during_training or
-            (rvq_joint_curriculum and steps < 5000) or
-            (exists(self.freeze_codebook_before_step) and steps < self.freeze_codebook_before_step) or
-            (exists(self.freeze_codebook_after_step) and steps >= self.freeze_codebook_after_step)
-        )
-        freeze_encoder = (
-            (rvq_joint_curriculum and steps < 12000) or
-            (exists(self.freeze_encoder_before_step) and steps < self.freeze_encoder_before_step) or
-            (exists(self.freeze_encoder_after_step) and steps >= self.freeze_encoder_after_step)
-        )
-        # Lookup projections are part of the RVQ transform. Keep them aligned
-        # with the RVQ freeze policy instead of accidentally training them as
-        # ordinary Decoder parameters during B2.
-        train_rvq_projections = (
-            self.rvq_projection_only or (
-                not freeze_codebook and
-                not self.rq_excluded_from_generator_optimizer
+        rvq_joint_phase = 'disabled'
+        if rvq_joint_curriculum:
+            # Coordinate descent avoids moving Encoder, projections and the
+            # residual codebooks at the same time.  Wout is the immutable Q0
+            # coordinate system; only Win receives the short projection pass.
+            freeze_encoder = True
+            if steps < self.rvq_joint_decoder_only_steps:
+                rvq_joint_phase = 'decoder_only'
+                freeze_codebook = True
+                train_input_projection = False
+            elif steps < self.rvq_joint_rvq_adapt_end_steps:
+                rvq_joint_phase = 'rvq_ema'
+                freeze_codebook = False
+                train_input_projection = False
+            elif steps < self.rvq_joint_projection_adapt_end_steps:
+                rvq_joint_phase = 'win_decoder'
+                freeze_codebook = True
+                train_input_projection = True
+            elif steps < self.rvq_joint_recenter_end_steps:
+                rvq_joint_phase = 'rvq_recenter'
+                freeze_codebook = False
+                train_input_projection = False
+            else:
+                rvq_joint_phase = 'decoder_consolidate'
+                freeze_codebook = True
+                train_input_projection = False
+            train_output_projection = False
+        else:
+            freeze_codebook = (
+                self.freeze_codebook_during_training or
+                (exists(self.freeze_codebook_before_step) and steps < self.freeze_codebook_before_step) or
+                (exists(self.freeze_codebook_after_step) and steps >= self.freeze_codebook_after_step)
             )
-        )
+            freeze_encoder = (
+                (exists(self.freeze_encoder_before_step) and steps < self.freeze_encoder_before_step) or
+                (exists(self.freeze_encoder_after_step) and steps >= self.freeze_encoder_after_step)
+            )
+            train_input_projection = (
+                self.rvq_projection_only or (
+                    not freeze_codebook and
+                    not self.rq_excluded_from_generator_optimizer
+                )
+            )
+            train_output_projection = train_input_projection
         q0_input_projection_frozen = (
             self.rvq_projection_only and
             steps < self.rvq_projection_freeze_input_steps
@@ -5427,8 +5609,8 @@ class SoundStreamTrainer(nn.Module):
         # phase.  Toggling requires_grad after DDP wrapping can be interpreted
         # as an unused parameter; its accumulated gradient is cleared before
         # the optimizer step below instead.
-        model.rq_input_projection.requires_grad_(train_rvq_projections)
-        model.rq_output_projection.requires_grad_(train_rvq_projections)
+        model.rq_input_projection.requires_grad_(train_input_projection)
+        model.rq_output_projection.requires_grad_(train_output_projection)
         rvq_warm_in_alpha = (
             min(1., float(steps) / float(self.rvq_warm_in_steps))
             if self.rvq_warm_in_steps > 0 else 1.
@@ -5868,6 +6050,11 @@ class SoundStreamTrainer(nn.Module):
         )
         logs['lr_g'] = generator_lr
         logs['lr_g_encoder'] = encoder_generator_lr
+        logs['lr_g_projection'] = next((
+            group['lr']
+            for group in self.optim.optimizer.param_groups
+            if group.get('group_name') == 'projection'
+        ), 0.)
         logs['lr_d_stft'] = stft_discriminator_lr
         for index, lr in enumerate(waveform_discriminator_lrs.values()):
             logs[f'lr_d_wave_{index}'] = lr
@@ -5930,8 +6117,9 @@ class SoundStreamTrainer(nn.Module):
             f"(w={self.rvq_joint_latent64_teacher_loss_weight if self._rvq_q0_teacher is not None else 0.:.4g})"
             f" | projection_orth={float(getattr(model, '_last_rvq_joint_losses', {}).get('projection_orth', 0.)):.6f}"
             f" | projection_tie={float(getattr(model, '_last_rvq_joint_losses', {}).get('projection_tie', 0.)):.6f}"
-            f" | projection_frozen={int(not train_rvq_projections)}"
-            f" | projection_in_frozen={int(q0_input_projection_frozen)}"
+            f" | rvq_joint_phase={rvq_joint_phase}"
+            f" | projection_in_frozen={int(not train_input_projection or q0_input_projection_frozen)}"
+            f" | projection_out_frozen={int(not train_output_projection)}"
             f" | rvq_ema_updates={int(not freeze_codebook)}"
         )
         if 'projection_latent_mse' in logs:
@@ -6022,6 +6210,7 @@ class SoundStreamTrainer(nn.Module):
             f"lr_g_update={generator_update_lr:.3e} | "
             f"lr_g_next={generator_lr:.3e} | "
             f"lr_g_encoder_next={encoder_generator_lr:.3e} | "
+            f"lr_g_projection_next={logs['lr_g_projection']:.3e} | "
             f"lr_d_stft_update={discriminator_update_lr:.3e} | "
             f"lr_d_stft_next={stft_discriminator_lr:.3e} | "
             f"lr_d_wave_next={waveform_discriminator_lr:.3e}"
@@ -7392,6 +7581,7 @@ class SoundStreamTrainer(nn.Module):
     def train(self, log_fn = noop):
 
         self.initialize_rvq_projections_from_pca()
+        self.initialize_rvq_codebooks_from_residual_kmeans()
 
         while self.steps < self.num_train_steps and not self.early_stopping_triggered:
             logs = self.train_step()

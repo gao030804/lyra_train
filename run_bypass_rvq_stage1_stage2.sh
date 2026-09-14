@@ -8,7 +8,7 @@ set -euo pipefail
 #   optional A2.5 persistent-state alignment before RVQ calibration
 #   Q0 PCA initialization + projection-only reconstruction pretraining
 #   B1 Encoder -> RVQ EMA calibration (Encoder/Decoder weights frozen)
-#   B1.5 non-GAN STE adaptation (Decoder + Encoder tail + RVQ EMA schedule)
+#   B1.5 non-GAN coordinate adaptation (Decoder / RVQ EMA / Win schedule)
 #   B2 Encoder -> frozen RVQ -> Decoder GAN adaptation (Encoder/RVQ frozen)
 #   final persistent-state Decoder fine-tune (Encoder/RVQ frozen, no GAN)
 
@@ -43,11 +43,18 @@ RVQ_PROJECTION_FREEZE_INPUT_STEPS="${RVQ_PROJECTION_FREEZE_INPUT_STEPS:-3000}"
 RVQ_PROJECTION_EARLY_STOPPING_MIN_STEPS="${RVQ_PROJECTION_EARLY_STOPPING_MIN_STEPS:-3000}"
 RVQ_PROJECTION_EARLY_STOPPING_PATIENCE="${RVQ_PROJECTION_EARLY_STOPPING_PATIENCE:-10}"
 RVQ_CALIBRATION_STEPS="${RVQ_CALIBRATION_STEPS:-500}"
+RVQ_CALIBRATION_KMEANS_BATCHES="${RVQ_CALIBRATION_KMEANS_BATCHES:-50}"
 RVQ_B1_MIN_ALIGNED_SI_SDR="${RVQ_B1_MIN_ALIGNED_SI_SDR:-3.0}"
 RVQ_B1_MIN_QUANTIZATION_GAP_DB="${RVQ_B1_MIN_QUANTIZATION_GAP_DB:--2.0}"
-RVQ_B15_MAX_LOOKUP_NMSE="${RVQ_B15_MAX_LOOKUP_NMSE:-0.10}"
+RVQ_B15_MAX_LOOKUP_NMSE="${RVQ_B15_MAX_LOOKUP_NMSE:-0.07}"
+RVQ_B15_MAX_LATENT64_NMSE="${RVQ_B15_MAX_LATENT64_NMSE:-0.10}"
 RVQ_B15_MIN_ALIGNED_SI_SDR="${RVQ_B15_MIN_ALIGNED_SI_SDR:-1.8}"
 RVQ_JOINT_ADAPT_STEPS="${RVQ_JOINT_ADAPT_STEPS:-30000}"
+RVQ_B15_PROJECTION_LR="${RVQ_B15_PROJECTION_LR:-2e-7}"
+RVQ_B15_DECODER_ONLY_STEPS="${RVQ_B15_DECODER_ONLY_STEPS:-10000}"
+RVQ_B15_RVQ_ADAPT_END_STEPS="${RVQ_B15_RVQ_ADAPT_END_STEPS:-20000}"
+RVQ_B15_PROJECTION_ADAPT_END_STEPS="${RVQ_B15_PROJECTION_ADAPT_END_STEPS:-25000}"
+RVQ_B15_RECENTER_END_STEPS="${RVQ_B15_RECENTER_END_STEPS:-26000}"
 RVQ_STAGE2_STEPS="${RVQ_STAGE2_STEPS:-50000}"
 ENABLE_PRE_RVQ_STATE_FT="${ENABLE_PRE_RVQ_STATE_FT:-0}"
 PRE_RVQ_STATE_STEPS="${PRE_RVQ_STATE_STEPS:-20000}"
@@ -95,8 +102,8 @@ if (( FINAL_STATE_STEPS <= 0 )); then
   echo "ERROR: FINAL_STATE_STEPS must be positive; post-RVQ state alignment is mandatory." >&2
   exit 2
 fi
-if (( RVQ_JOINT_ADAPT_STEPS < 15000 )); then
-  echo "ERROR: RVQ_JOINT_ADAPT_STEPS must be at least 15000 for all B1.5 phases." >&2
+if (( RVQ_JOINT_ADAPT_STEPS < RVQ_B15_RECENTER_END_STEPS )); then
+  echo "ERROR: RVQ_JOINT_ADAPT_STEPS must reach RVQ_B15_RECENTER_END_STEPS." >&2
   exit 2
 fi
 if (( RVQ_STAGE2_STEPS <= 0 )); then
@@ -383,27 +390,33 @@ if [[ -z "$RVQ_PROJECTION_CKPT" ]]; then
 fi
 echo "Q0 projection checkpoint=$RVQ_PROJECTION_CKPT"
 
-# B1: no Decoder call and no optimizer/backward step.  Only RVQ EMA and
-# dead-code replacement state changes; Encoder/Decoder tensors remain bitwise fixed.
+# B1: initialize every level by sequential residual K-means from a large
+# projected-latent pool, then run the short EMA/dead-code bootstrap. There is
+# no Decoder call, backward pass, or optimizer update in this stage.
 run_stage "B1 RVQ calibration with codec frozen" 29513 "$PWD/logs/rvq-calibration-$BASE.log" 0 \
   --stage recon_pretrain --results-dir "$RVQ_S1_DIR" \
   --init-checkpoint "$RVQ_PROJECTION_CKPT" --num-train-steps "$RVQ_CALIBRATION_STEPS" \
-  --rvq-calibration-only --early-stopping-min-steps 0 \
+  --rvq-calibration-only \
+  --rvq-calibration-kmeans-batches "$RVQ_CALIBRATION_KMEANS_BATCHES" \
+  --early-stopping-min-steps 0 \
   --no-bypass-rvq-during-training "${COMMON[@]}" --no-resume
 RVQ_S1_CKPT="$RVQ_S1_DIR/latest.pt"
 test -f "$RVQ_S1_CKPT" || { echo "ERROR: missing $RVQ_S1_CKPT" >&2; exit 2; }
 echo "B1 checkpoint=$RVQ_S1_CKPT"
 
-# B1.5: non-adversarial joint representation learning. Alpha transitions from
-# the Q0 projection path to the real quantized path over 20k steps. Encoder
-# tail, projections, RVQ EMA and Decoder remain adaptive for the whole stage;
-# the post-stage geometry gate decides whether B2 may freeze them.
+# B1.5: coordinate descent. Keep Encoder and Wout immutable; adapt Decoder,
+# then RVQ EMA, then Win+Decoder, followed by a short RVQ recenter pass.
 run_stage "B1.5 joint STE quantization adaptation" 29518 \
   "$PWD/logs/rvq-joint-adapt-$BASE.log" 0 \
   --stage gan_pretrain --results-dir "$RVQ_B15_DIR" \
   --init-checkpoint "$RVQ_S1_CKPT" --num-train-steps "$RVQ_JOINT_ADAPT_STEPS" \
   "${RECON_LOSSES[@]}" "${COMMON[@]}" \
   --rvq-joint-adapt --rvq-warm-in-steps 5000 \
+  --rvq-joint-projection-lr "$RVQ_B15_PROJECTION_LR" \
+  --rvq-joint-decoder-only-steps "$RVQ_B15_DECODER_ONLY_STEPS" \
+  --rvq-joint-rvq-adapt-end-steps "$RVQ_B15_RVQ_ADAPT_END_STEPS" \
+  --rvq-joint-projection-adapt-end-steps "$RVQ_B15_PROJECTION_ADAPT_END_STEPS" \
+  --rvq-joint-recenter-end-steps "$RVQ_B15_RECENTER_END_STEPS" \
   --rvq-codebook-balance-loss-weight 0.002 \
   --rvq-codebook-balance-target-perplexity 64 \
   --rvq-codebook-balance-temperature 0.1 \
@@ -422,7 +435,6 @@ run_stage "B1.5 joint STE quantization adaptation" 29518 \
   --upper-highband-loss-weight 0 \
   --spectral-envelope-loss-weight 0 \
   --formant-peak-loss-weight 0 \
-  --stage2-encoder-lr 1e-7 --stage2-encoder-trainable-from-block 3 \
   --clean-gate-min-aligned-si-sdr "$RVQ_B15_MIN_ALIGNED_SI_SDR" \
   --clean-gate-max-negative-fraction 0.05 \
   --no-bypass-rvq-during-training --no-resume
@@ -446,7 +458,8 @@ python - \
   "$B15_VALIDATION_REPORT" \
   "$RVQ_B1_MIN_ALIGNED_SI_SDR" \
   "$RVQ_B1_MIN_QUANTIZATION_GAP_DB" \
-  "$RVQ_B15_MAX_LOOKUP_NMSE" <<'PY'
+  "$RVQ_B15_MAX_LOOKUP_NMSE" \
+  "$RVQ_B15_MAX_LATENT64_NMSE" <<'PY'
 import sys
 from pathlib import Path
 
@@ -454,6 +467,7 @@ report = Path(sys.argv[1])
 minimum_si_sdr = float(sys.argv[2])
 minimum_gap = float(sys.argv[3])
 maximum_lookup_nmse = float(sys.argv[4])
+maximum_latent64_nmse = float(sys.argv[5])
 metrics = {}
 with report.open("r", encoding="utf-8") as handle:
     header = handle.readline().rstrip("\n").split("\t")
@@ -468,6 +482,7 @@ required = (
     "projection_only_aligned_si_sdr",
     "quantization_gap_db",
     "rvq_latent_nmse_lookup",
+    "rvq_latent_nmse_64d",
 )
 missing = [name for name in required if name not in metrics]
 if missing:
@@ -477,11 +492,13 @@ aligned = metrics["aligned_si_sdr"]
 projection = metrics["projection_only_aligned_si_sdr"]
 gap = metrics["quantization_gap_db"]
 lookup_nmse = metrics["rvq_latent_nmse_lookup"]
+latent64_nmse = metrics["rvq_latent_nmse_64d"]
 print(
     "RVQ handoff: "
     f"projection_aligned_si_sdr={projection:.3f} dB, "
     f"quantized_aligned_si_sdr={aligned:.3f} dB, "
-    f"gap={gap:+.3f} dB, lookup_nmse={lookup_nmse:.4f}"
+    f"gap={gap:+.3f} dB, lookup_nmse={lookup_nmse:.4f}, "
+    f"latent64_nmse={latent64_nmse:.4f}"
 )
 failures = []
 if aligned < minimum_si_sdr:
@@ -490,6 +507,10 @@ if gap < minimum_gap:
     failures.append(f"quantization_gap_db {gap:.3f} < {minimum_gap:.3f}")
 if lookup_nmse > maximum_lookup_nmse:
     failures.append(f"lookup_nmse {lookup_nmse:.4f} > {maximum_lookup_nmse:.4f}")
+if latent64_nmse > maximum_latent64_nmse:
+    failures.append(
+        f"latent64_nmse {latent64_nmse:.4f} > {maximum_latent64_nmse:.4f}"
+    )
 if failures:
     raise SystemExit("RVQ handoff FAILED: " + "; ".join(failures))
 print("RVQ handoff PASSED")

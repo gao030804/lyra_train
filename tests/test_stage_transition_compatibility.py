@@ -274,6 +274,8 @@ def test_pipeline_inserts_joint_rvq_adaptation_and_shortens_b2():
     assert 'RVQ_DISTANCE="${RVQ_DISTANCE:-euclidean}"' in launcher
     assert '--rq-distance "$RVQ_DISTANCE"' in launcher
     assert 'RVQ_CALIBRATION_STEPS="${RVQ_CALIBRATION_STEPS:-500}"' in launcher
+    assert 'RVQ_CALIBRATION_KMEANS_BATCHES="${RVQ_CALIBRATION_KMEANS_BATCHES:-50}"' in launcher
+    assert '--rvq-calibration-kmeans-batches "$RVQ_CALIBRATION_KMEANS_BATCHES"' in launcher
     assert 'RVQ_JOINT_ADAPT_STEPS="${RVQ_JOINT_ADAPT_STEPS:-30000}"' in launcher
     assert 'RVQ_STAGE2_STEPS="${RVQ_STAGE2_STEPS:-50000}"' in launcher
     assert 'B1.5 joint STE quantization adaptation' in launcher
@@ -284,7 +286,13 @@ def test_pipeline_inserts_joint_rvq_adaptation_and_shortens_b2():
     assert '--rvq-joint-latent64-teacher-loss-weight 0.50' in launcher
     assert '--rvq-projection-orth-loss-weight 0.05' in launcher
     assert '--rvq-projection-tie-loss-weight 0.05' in launcher
-    assert '--stage2-encoder-lr 1e-7' in launcher
+    assert '--rvq-joint-projection-lr "$RVQ_B15_PROJECTION_LR"' in launcher
+    assert '--rvq-joint-decoder-only-steps "$RVQ_B15_DECODER_ONLY_STEPS"' in launcher
+    assert '--rvq-joint-rvq-adapt-end-steps "$RVQ_B15_RVQ_ADAPT_END_STEPS"' in launcher
+    assert '--rvq-joint-projection-adapt-end-steps "$RVQ_B15_PROJECTION_ADAPT_END_STEPS"' in launcher
+    assert '--rvq-joint-recenter-end-steps "$RVQ_B15_RECENTER_END_STEPS"' in launcher
+    assert 'RVQ_B15_MAX_LOOKUP_NMSE="${RVQ_B15_MAX_LOOKUP_NMSE:-0.07}"' in launcher
+    assert 'RVQ_B15_MAX_LATENT64_NMSE="${RVQ_B15_MAX_LATENT64_NMSE:-0.10}"' in launcher
     assert '--rvq-codebook-balance-target-perplexity 64' in launcher
     assert '--stage2-encoder-unfreeze-step -1' in launcher
     assert '--early-stopping-patience 20 --stage2-quality-hard-stop' in launcher
@@ -305,6 +313,21 @@ def test_pipeline_inserts_joint_rvq_adaptation_and_shortens_b2():
     )
     assert 'def capture_rvq_q0_teacher(self):' in trainer_source
     assert "object.__setattr__(self, '_rvq_q0_teacher', teacher)" in trainer_source
+    assert 'def initialize_rvq_codebooks_from_residual_kmeans(self):' in trainer_source
+    assert "rvq_joint_phase = 'decoder_only'" in trainer_source
+    assert "rvq_joint_phase = 'rvq_ema'" in trainer_source
+    assert "rvq_joint_phase = 'win_decoder'" in trainer_source
+    assert "rvq_joint_phase = 'rvq_recenter'" in trainer_source
+    assert 'train_output_projection = False' in trainer_source
+
+
+def test_b15_loss_weights_are_applied_to_the_model_not_only_printed():
+    source = (ROOT / "train_soundstream.py").read_text(encoding="utf-8")
+
+    assert 'recon_loss_weight_override=waveform_recon_loss_weight' in source
+    assert 'multi_spectral_recon_loss_weight_override=(' in source
+    assert 'B1.5 waveform loss weight did not reach SoundStream' in source
+    assert 'B1.5 Mel loss weight did not reach SoundStream' in source
 
 
 def test_pipeline_can_start_from_bypass_formant_refine_checkpoint():

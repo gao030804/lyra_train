@@ -549,6 +549,16 @@ def parse_args() -> argparse.Namespace:
         help="Distributed batches used to estimate latent PCA before projection training.",
     )
     parser.add_argument(
+        "--rvq-calibration-kmeans-batches",
+        type=int,
+        default=0,
+        help=(
+            "B1 batches used for one distributed sequential residual K-means "
+            "initialization before the short EMA bootstrap; zero keeps the "
+            "package's ordinary first-batch initialization."
+        ),
+    )
+    parser.add_argument(
         "--rq-lookup-dim",
         type=int,
         choices=(16, 24, 32),
@@ -606,6 +616,16 @@ def parse_args() -> argparse.Namespace:
         default=0.10,
         help="B1.5 normalized 64-D latent teacher-loss weight.",
     )
+    parser.add_argument(
+        "--rvq-joint-projection-lr",
+        type=float,
+        default=None,
+        help="Optional B1.5 optimizer LR for projection parameters only.",
+    )
+    parser.add_argument("--rvq-joint-decoder-only-steps", type=int, default=10000)
+    parser.add_argument("--rvq-joint-rvq-adapt-end-steps", type=int, default=20000)
+    parser.add_argument("--rvq-joint-projection-adapt-end-steps", type=int, default=25000)
+    parser.add_argument("--rvq-joint-recenter-end-steps", type=int, default=26000)
     parser.add_argument(
         "--rvq-joint-adapt",
         action="store_true",
@@ -2058,6 +2078,8 @@ def build_model(
     rq_continuous_teacher_loss_weight: float = 0.,
     bypass_rvq: bool = False,
     rq_projection_only: bool = False,
+    recon_loss_weight_override: float | None = None,
+    multi_spectral_recon_loss_weight_override: float | None = None,
 ) -> SoundStream:
     if sync_codebook is None:
         sync_codebook = int(os.environ.get("WORLD_SIZE", "1")) > 1
@@ -2080,6 +2102,13 @@ def build_model(
         recon_loss_weight = 10. if stage == "overfit" else 1.
         multi_spectral_recon_loss_weight = 0.7
         correlation_loss_weight = 0.
+
+    if recon_loss_weight_override is not None:
+        recon_loss_weight = float(recon_loss_weight_override)
+    if multi_spectral_recon_loss_weight_override is not None:
+        multi_spectral_recon_loss_weight = float(
+            multi_spectral_recon_loss_weight_override
+        )
 
     model_kwargs = dict(
         channels=16,
@@ -2443,6 +2472,8 @@ def main() -> None:
             raise ValueError("--rvq-projection-only requires a bypass --init-checkpoint")
     if args.rvq_projection_pca_batches < 0:
         raise ValueError("--rvq-projection-pca-batches cannot be negative")
+    if args.rvq_calibration_kmeans_batches < 0:
+        raise ValueError("--rvq-calibration-kmeans-batches cannot be negative")
     if not 0. <= args.rvq_projection_min_evr <= 1.:
         raise ValueError("--rvq-projection-min-evr must be in [0, 1]")
     if args.rvq_projection_latent_mse_weight < 0.:
@@ -2457,6 +2488,18 @@ def main() -> None:
         raise ValueError("--rvq-projection-freeze-input-steps cannot be negative")
     if args.rvq_joint_latent64_teacher_loss_weight < 0.:
         raise ValueError("--rvq-joint-latent64-teacher-loss-weight cannot be negative")
+    if args.rvq_joint_projection_lr is not None and args.rvq_joint_projection_lr <= 0.:
+        raise ValueError("--rvq-joint-projection-lr must be positive")
+    rvq_joint_boundaries = (
+        args.rvq_joint_decoder_only_steps,
+        args.rvq_joint_rvq_adapt_end_steps,
+        args.rvq_joint_projection_adapt_end_steps,
+        args.rvq_joint_recenter_end_steps,
+    )
+    if any(step < 0 for step in rvq_joint_boundaries):
+        raise ValueError("RVQ joint phase boundaries cannot be negative")
+    if tuple(sorted(rvq_joint_boundaries)) != rvq_joint_boundaries:
+        raise ValueError("RVQ joint phase boundaries must be monotonic")
     if (
         args.reinitialize_rvq_from_bypass_checkpoint and
         not (args.rvq_calibration_only or args.rvq_projection_only)
@@ -2486,8 +2529,14 @@ def main() -> None:
             raise ValueError("--rvq-joint-adapt requires --stage gan_pretrain.")
         if args.bypass_rvq_during_training or args.rvq_calibration_only:
             raise ValueError("--rvq-joint-adapt requires RVQ in the training path.")
-        if (args.num_train_steps or stage_defaults["steps"]) < 15_000:
-            raise ValueError("--rvq-joint-adapt requires at least 15000 training steps.")
+        if (
+            (args.num_train_steps or stage_defaults["steps"]) <
+            args.rvq_joint_recenter_end_steps
+        ):
+            raise ValueError(
+                "--rvq-joint-adapt training steps must reach the end of the "
+                "configured RVQ recenter phase."
+            )
     if args.gan_feature_max is not None:
         if args.gan_feature_max < 0:
             raise ValueError("--gan-feature-max cannot be negative.")
@@ -3824,7 +3873,23 @@ def main() -> None:
         rq_quantization_error_loss_weight=args.rvq_quantization_error_loss_weight,
         rq_continuous_teacher_loss_weight=args.rvq_continuous_teacher_loss_weight,
         bypass_rvq=args.bypass_rvq_during_training,
+        recon_loss_weight_override=waveform_recon_loss_weight,
+        multi_spectral_recon_loss_weight_override=(
+            multi_spectral_recon_loss_weight
+        ),
     )
+    if rvq_joint_adapt:
+        if soundstream.recon_loss_weight != 7.5:
+            raise RuntimeError(
+                "B1.5 waveform loss weight did not reach SoundStream: "
+                f"expected 7.5, got {soundstream.recon_loss_weight}"
+            )
+        if soundstream.multi_spectral_recon_loss_weight != 1.0:
+            raise RuntimeError(
+                "B1.5 Mel loss weight did not reach SoundStream: "
+                "expected 1.0, got "
+                f"{soundstream.multi_spectral_recon_loss_weight}"
+            )
 
     warmup_steps = (
         100
@@ -3875,6 +3940,10 @@ def main() -> None:
         rvq_calibration_only=args.rvq_calibration_only,
         rvq_projection_only=args.rvq_projection_only,
         rvq_projection_pca_batches=args.rvq_projection_pca_batches,
+        rvq_calibration_kmeans_batches=(
+            args.rvq_calibration_kmeans_batches
+            if args.rvq_calibration_only else 0
+        ),
         rvq_projection_min_evr=args.rvq_projection_min_evr,
         rvq_projection_latent_mse_weight=(
             args.rvq_projection_latent_mse_weight
@@ -3894,9 +3963,18 @@ def main() -> None:
             args.rvq_joint_latent64_teacher_loss_weight
             if rvq_joint_adapt else 0.
         ),
+        projection_lr=(
+            args.rvq_joint_projection_lr if rvq_joint_adapt else None
+        ),
+        rvq_joint_decoder_only_steps=args.rvq_joint_decoder_only_steps,
+        rvq_joint_rvq_adapt_end_steps=args.rvq_joint_rvq_adapt_end_steps,
+        rvq_joint_projection_adapt_end_steps=(
+            args.rvq_joint_projection_adapt_end_steps
+        ),
+        rvq_joint_recenter_end_steps=args.rvq_joint_recenter_end_steps,
         lr=stage_defaults["lr"],
         encoder_lr=(
-            args.stage2_encoder_lr
+            None
             if rvq_joint_adapt
             else args.stage2_encoder_lr
             if (
@@ -3916,8 +3994,7 @@ def main() -> None:
                     not args.stage2_targeted_refine and
                     args.stage2_unfreeze_encoder_rvq_step >= 0
                 ) or
-                args.stage == "stream_finetune" or
-                rvq_joint_adapt
+                args.stage == "stream_finetune"
             )
             else None
         ),
@@ -3932,6 +4009,7 @@ def main() -> None:
         ),
         exclude_encoder_from_generator_optimizer=(
             args.rvq_projection_only or
+            rvq_joint_adapt or
             stage25_decoder_only_refine or
             args.stage == "stream_finetune_long" or
             (
@@ -4334,12 +4412,10 @@ def main() -> None:
             None if rvq_joint_adapt
             else stage_defaults.get("freeze_codebook_after_step")
         ),
-        freeze_codebook_before_step=(10_000 if rvq_joint_adapt else None),
+        freeze_codebook_before_step=None,
         freeze_encoder_before_step=(
             num_train_steps + 1
-            if args.rvq_projection_only
-            else 20_000
-            if rvq_joint_adapt
+            if (args.rvq_projection_only or rvq_joint_adapt)
             else
             num_train_steps + 1
             if (
