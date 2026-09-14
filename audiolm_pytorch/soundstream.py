@@ -3530,6 +3530,10 @@ class SoundStream(Module):
         else:
             codebook_balance_loss = self.zero
 
+        # Cache this exact warm-mixed 64-D Decoder input so B1.5 latent
+        # distillation does not invoke RVQ a second time and update EMA twice.
+        self._last_student_latent64_for_teacher = x
+
         if exists(num_quantizers) and not self.bypass_rvq and not self.rq_projection_only:
             assert 0 < num_quantizers <= self.num_quantizers
             indices = indices[..., :num_quantizers]

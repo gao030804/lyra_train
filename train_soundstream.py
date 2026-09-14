@@ -2250,7 +2250,7 @@ def main() -> None:
                     else args.stage25_decoder_lr
                 ),
                 encoder_lr=(
-                    1e-6
+                    5e-7
                     if rvq_joint_adapt
                     else
                     2e-8
@@ -2264,10 +2264,11 @@ def main() -> None:
                 gan_adversarial_max=0.,
                 gan_feature_max=0.,
                 noise_floor_loss_weight=0.03,
-                spectral_envelope_loss_weight=0.05,
-                voiced_highband_loss_weight=0.06,
-                voiced_hf_retention_loss_weight=0.02,
+                spectral_envelope_loss_weight=(0. if rvq_joint_adapt else 0.05),
+                voiced_highband_loss_weight=(0. if rvq_joint_adapt else 0.06),
+                voiced_hf_retention_loss_weight=(0. if rvq_joint_adapt else 0.02),
                 active_spectral_detail_loss_weight=(
+                    0. if rvq_joint_adapt else
                     0.03 if stage25_rvq_midband_refine else 0.02
                 ),
                 active_spectral_detail_loss_start_steps=0,
@@ -2287,7 +2288,9 @@ def main() -> None:
                 frame_phase_loss_warmup_steps=(
                     500 if stage25_joint_recon_refine else 0
                 ),
-                si_sdr_loss_weight=0.05,
+                si_sdr_loss_weight=(0.07 if rvq_joint_adapt else 0.05),
+                si_sdr_loss_start_steps=(0 if rvq_joint_adapt else 15_000),
+                si_sdr_loss_warmup_steps=(2500 if rvq_joint_adapt else 15_000),
             )
         else:
             stage_defaults.update(
@@ -3130,12 +3133,14 @@ def main() -> None:
         else stage_defaults.get("frame_phase_loss_warmup_steps", 0)
     )
     waveform_recon_loss_weight = (
-        10.0 if args.stage in ("overfit", "recon_pretrain")
+        7.5 if rvq_joint_adapt
+        else 10.0 if args.stage in ("overfit", "recon_pretrain")
         else 5.0 if args.stage in ("spectral_refine", "gan_pretrain")
         else 1.0
     )
     multi_spectral_recon_loss_weight = (
-        1.1 if args.stage == "recon_pretrain"
+        1.0 if rvq_joint_adapt
+        else 1.1 if args.stage == "recon_pretrain"
         else 0.8 if args.stage == "spectral_refine"
         else 0.7
     )
@@ -3189,9 +3194,9 @@ def main() -> None:
     )
     if rvq_joint_adapt:
         print(
-            "B1.5 joint RVQ adaptation: Decoder LR=5e-6; Encoder Block4/final "
-            "LR=1e-6 from step 2k to 15k; RVQ EMA follows until 15k; "
-            "quantization warm-in and entropy-floor balance are enabled; GAN disabled."
+            "B1.5 curriculum: 0-5k Decoder-only; 5-12k Projection/RVQ EMA; "
+            ">=12k Encoder Block4/final at LR=5e-7. Warm-in ends at 5k; "
+            "SI-SDR starts immediately; GAN and HF-detail losses are disabled."
         )
     elif stage25_decoder_only_refine:
         print(
@@ -4284,11 +4289,11 @@ def main() -> None:
             None if rvq_joint_adapt
             else stage_defaults.get("freeze_codebook_after_step")
         ),
-        freeze_codebook_before_step=None,
+        freeze_codebook_before_step=(5_000 if rvq_joint_adapt else None),
         freeze_encoder_before_step=(
             num_train_steps + 1
             if args.rvq_projection_only
-            else 2_000
+            else 12_000
             if rvq_joint_adapt
             else
             num_train_steps + 1

@@ -2071,6 +2071,15 @@ class SoundStreamTrainer(nn.Module):
 
         quantized_lookup = stage_quantized
         reconstructed = model.rq_output_projection(quantized_lookup).float()
+        win = model.rq_input_projection.weight.detach().float()
+        wout = model.rq_output_projection.weight.detach().float()
+        singular = torch.linalg.svdvals(wout)
+        output['rvq_projection_wout_sigma_max'] = float(singular.max().cpu())
+        output['rvq_projection_wout_sigma_min'] = float(singular.min().cpu())
+        output['rvq_projection_wout_condition'] = float(
+            (singular.max() / singular.min().clamp_min(1e-8)).cpu()
+        )
+        output['rvq_projection_tie_mse'] = float(F.mse_loss(wout, win.T).cpu())
         output['rvq_latent_nmse_lookup'] = float((residual.square().mean() / base_energy).cpu())
         output['rvq_latent_cosine_lookup'] = float(F.cosine_similarity(
             lookup, quantized_lookup, dim = -1, eps = 1e-8
@@ -4969,6 +4978,29 @@ class SoundStreamTrainer(nn.Module):
             latent = teacher['decoder_attn'](latent)
         return teacher['decoder'](rearrange(latent, 'b n c -> b c n'))
 
+    @torch.no_grad()
+    def rvq_q0_teacher_latent64(self, wave):
+        teacher = self._rvq_q0_teacher
+        if teacher is None:
+            raise RuntimeError('RVQ adaptation requires a captured Q0 teacher')
+        model = self.unwrapped_soundstream
+        encoded, _ = model.process_input(wave)
+        latent = rearrange(teacher['encoder'](encoded), 'b c n -> b n c')
+        if teacher['encoder_attn'] is not None:
+            latent = teacher['encoder_attn'](latent)
+        return teacher['rq_output_projection'](
+            teacher['rq_input_projection'](latent)
+        )
+
+    @staticmethod
+    def rvq_projection_conditioning_loss(model):
+        win = model.rq_input_projection.weight.float()
+        wout = model.rq_output_projection.weight.float()
+        identity = torch.eye(win.shape[0], device=win.device, dtype=win.dtype)
+        orth = F.mse_loss(win @ win.T, identity)
+        tie = F.mse_loss(wout, win.T)
+        return 0.01 * orth + 0.01 * tie, orth, tie
+
     def rvq_frozen_teacher_loss(self, wave, student_recon):
         if self._rvq_q0_teacher is None:
             return student_recon.new_zeros(())
@@ -5341,12 +5373,15 @@ class SoundStreamTrainer(nn.Module):
         stft_loss_progress, frame_phase_loss_progress = self.update_spectral_refinement_weights(steps)
         stage2_recon_transition_progress = self.update_stage2_reconstruction_transition(steps)
         transient_loss_progress = self.update_transient_loss_weights(steps)
+        rvq_joint_curriculum = self._rvq_q0_teacher is not None
         freeze_codebook = (
             self.freeze_codebook_during_training or
+            (rvq_joint_curriculum and steps < 5000) or
             (exists(self.freeze_codebook_before_step) and steps < self.freeze_codebook_before_step) or
             (exists(self.freeze_codebook_after_step) and steps >= self.freeze_codebook_after_step)
         )
         freeze_encoder = (
+            (rvq_joint_curriculum and steps < 12000) or
             (exists(self.freeze_encoder_before_step) and steps < self.freeze_encoder_before_step) or
             (exists(self.freeze_encoder_after_step) and steps >= self.freeze_encoder_after_step)
         )
@@ -5471,6 +5506,25 @@ class SoundStreamTrainer(nn.Module):
                     runtime_model._last_rvq_joint_losses[
                         'continuous_teacher'
                     ] = continuous_teacher_loss.detach()
+                if rvq_joint_curriculum:
+                    student_latent = getattr(
+                        runtime_model, '_last_student_latent64_for_teacher', None
+                    )
+                    if student_latent is None:
+                        raise RuntimeError('student 64-D latent was not cached')
+                    teacher_latent = self.rvq_q0_teacher_latent64(wave).detach()
+                    latent64_loss = F.mse_loss(
+                        student_latent.float(), teacher_latent.float()
+                    ) / teacher_latent.float().square().mean().clamp_min(1e-8)
+                    projection_loss, projection_orth, projection_tie = (
+                        self.rvq_projection_conditioning_loss(runtime_model)
+                    )
+                    loss = loss + 0.10 * latent64_loss + projection_loss
+                    runtime_model._last_rvq_joint_losses.update(
+                        latent64_teacher=latent64_loss.detach(),
+                        projection_orth=projection_orth.detach(),
+                        projection_tie=projection_tie.detach(),
+                    )
                 (
                     recon_loss,
                     multi_spectral_recon_loss,
@@ -5818,6 +5872,12 @@ class SoundStreamTrainer(nn.Module):
             f"(w={getattr(model, 'rq_quantization_error_loss_weight', 0.):.4g})"
             f" | continuous_teacher={logs.get('rvq_continuous_teacher_loss', 0.):.6f}"
             f"(w={getattr(model, 'rq_continuous_teacher_loss_weight', 0.):.4g})"
+            f" | latent64_teacher={float(getattr(model, '_last_rvq_joint_losses', {}).get('latent64_teacher', 0.)):.6f}"
+            f"(w={0.1 if self._rvq_q0_teacher is not None else 0.:.4g})"
+            f" | projection_orth={float(getattr(model, '_last_rvq_joint_losses', {}).get('projection_orth', 0.)):.6f}"
+            f" | projection_tie={float(getattr(model, '_last_rvq_joint_losses', {}).get('projection_tie', 0.)):.6f}"
+            f" | projection_frozen={int(not train_rvq_projections)}"
+            f" | rvq_ema_updates={int(not freeze_codebook)}"
         )
         if 'projection_latent_mse' in logs:
             losses_str += (

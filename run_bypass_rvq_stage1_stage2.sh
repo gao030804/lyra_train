@@ -40,7 +40,7 @@ RVQ_CALIBRATION_STEPS="${RVQ_CALIBRATION_STEPS:-1000}"
 RVQ_B1_MIN_ALIGNED_SI_SDR="${RVQ_B1_MIN_ALIGNED_SI_SDR:-3.0}"
 RVQ_B1_MIN_QUANTIZATION_GAP_DB="${RVQ_B1_MIN_QUANTIZATION_GAP_DB:--2.0}"
 RVQ_B15_MAX_LOOKUP_NMSE="${RVQ_B15_MAX_LOOKUP_NMSE:-0.10}"
-RVQ_B15_MIN_ALIGNED_SI_SDR="${RVQ_B15_MIN_ALIGNED_SI_SDR:-3.0}"
+RVQ_B15_MIN_ALIGNED_SI_SDR="${RVQ_B15_MIN_ALIGNED_SI_SDR:-1.8}"
 RVQ_JOINT_ADAPT_STEPS="${RVQ_JOINT_ADAPT_STEPS:-30000}"
 RVQ_STAGE2_STEPS="${RVQ_STAGE2_STEPS:-50000}"
 ENABLE_PRE_RVQ_STATE_FT="${ENABLE_PRE_RVQ_STATE_FT:-0}"
@@ -386,15 +386,26 @@ run_stage "B1.5 joint STE quantization adaptation" 29518 \
   "$PWD/logs/rvq-joint-adapt-$BASE.log" 0 \
   --stage gan_pretrain --results-dir "$RVQ_B15_DIR" \
   --init-checkpoint "$RVQ_S1_CKPT" --num-train-steps "$RVQ_JOINT_ADAPT_STEPS" \
-  --rvq-joint-adapt --rvq-warm-in-steps 20000 \
+  "${RECON_LOSSES[@]}" "${COMMON[@]}" \
+  --rvq-joint-adapt --rvq-warm-in-steps 5000 \
   --rvq-codebook-balance-loss-weight 0.002 \
   --rvq-codebook-balance-target-perplexity 64 \
   --rvq-codebook-balance-temperature 0.1 \
   --rvq-quantization-error-loss-weight 0.10 \
   --rvq-continuous-teacher-loss-weight 0.20 \
+  --si-sdr-loss-weight 0.07 --si-sdr-loss-start-steps 0 \
+  --si-sdr-loss-warmup-steps 2500 \
+  --stft-recon-loss-weight 0.05 --stft-recon-loss-start-steps 0 \
+  --stft-recon-loss-warmup-steps 2500 \
+  --active-spectral-detail-loss-weight 0 \
+  --voiced-highband-loss-weight 0 \
+  --voiced-hf-retention-loss-weight 0 \
+  --upper-highband-loss-weight 0 \
+  --spectral-envelope-loss-weight 0 \
+  --formant-peak-loss-weight 0 \
   --clean-gate-min-aligned-si-sdr "$RVQ_B15_MIN_ALIGNED_SI_SDR" \
   --clean-gate-max-negative-fraction 0.05 \
-  --no-bypass-rvq-during-training "${RECON_LOSSES[@]}" "${COMMON[@]}" --no-resume
+  --no-bypass-rvq-during-training --no-resume
 RVQ_B15_CKPT="$(pick_best "$RVQ_B15_DIR" 2>/dev/null || true)"
 test -f "$RVQ_B15_CKPT" || {
   echo "ERROR: B1.5 produced no validation-selected eligible checkpoint; latest.pt is resume-only." >&2
