@@ -30,13 +30,19 @@ BYPASS_STAGE1_STEPS="${BYPASS_STAGE1_STEPS:-150000}"
 BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS="${BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS:-60000}"
 BYPASS_FORMANT_REFINE_STEPS="${BYPASS_FORMANT_REFINE_STEPS:-20000}"
 BYPASS_STAGE2_STEPS="${BYPASS_STAGE2_STEPS:-150000}"
-RVQ_PROJECTION_STEPS="${RVQ_PROJECTION_STEPS:-10000}"
+RVQ_PROJECTION_STEPS="${RVQ_PROJECTION_STEPS:-20000}"
 RVQ_PROJECTION_PCA_BATCHES="${RVQ_PROJECTION_PCA_BATCHES:-100}"
 RVQ_PROJECTION_MIN_EVR="${RVQ_PROJECTION_MIN_EVR:-0.90}"
-RVQ_PROJECTION_MIN_ALIGNED_SI_SDR="${RVQ_PROJECTION_MIN_ALIGNED_SI_SDR:-7.3}"
-RVQ_PROJECTION_LATENT_MSE_WEIGHT="${RVQ_PROJECTION_LATENT_MSE_WEIGHT:-0.25}"
-RVQ_PROJECTION_LATENT_COSINE_WEIGHT="${RVQ_PROJECTION_LATENT_COSINE_WEIGHT:-0.10}"
-RVQ_CALIBRATION_STEPS="${RVQ_CALIBRATION_STEPS:-1000}"
+RVQ_PROJECTION_MIN_ALIGNED_SI_SDR="${RVQ_PROJECTION_MIN_ALIGNED_SI_SDR:-4.8}"
+RVQ_PROJECTION_LR="${RVQ_PROJECTION_LR:-5e-5}"
+RVQ_PROJECTION_LATENT_MSE_WEIGHT="${RVQ_PROJECTION_LATENT_MSE_WEIGHT:-0.50}"
+RVQ_PROJECTION_LATENT_COSINE_WEIGHT="${RVQ_PROJECTION_LATENT_COSINE_WEIGHT:-0.15}"
+RVQ_PROJECTION_ORTH_WEIGHT="${RVQ_PROJECTION_ORTH_WEIGHT:-0.05}"
+RVQ_PROJECTION_TIE_WEIGHT="${RVQ_PROJECTION_TIE_WEIGHT:-0.05}"
+RVQ_PROJECTION_FREEZE_INPUT_STEPS="${RVQ_PROJECTION_FREEZE_INPUT_STEPS:-3000}"
+RVQ_PROJECTION_EARLY_STOPPING_MIN_STEPS="${RVQ_PROJECTION_EARLY_STOPPING_MIN_STEPS:-3000}"
+RVQ_PROJECTION_EARLY_STOPPING_PATIENCE="${RVQ_PROJECTION_EARLY_STOPPING_PATIENCE:-10}"
+RVQ_CALIBRATION_STEPS="${RVQ_CALIBRATION_STEPS:-500}"
 RVQ_B1_MIN_ALIGNED_SI_SDR="${RVQ_B1_MIN_ALIGNED_SI_SDR:-3.0}"
 RVQ_B1_MIN_QUANTIZATION_GAP_DB="${RVQ_B1_MIN_QUANTIZATION_GAP_DB:--2.0}"
 RVQ_B15_MAX_LOOKUP_NMSE="${RVQ_B15_MAX_LOOKUP_NMSE:-0.10}"
@@ -356,9 +362,19 @@ run_stage "Q0 PCA projection-only pretraining" 29519 \
   --rvq-projection-min-evr "$RVQ_PROJECTION_MIN_EVR" \
   --rvq-projection-latent-mse-weight "$RVQ_PROJECTION_LATENT_MSE_WEIGHT" \
   --rvq-projection-latent-cosine-weight "$RVQ_PROJECTION_LATENT_COSINE_WEIGHT" \
+  --rvq-projection-orth-loss-weight "$RVQ_PROJECTION_ORTH_WEIGHT" \
+  --rvq-projection-tie-loss-weight "$RVQ_PROJECTION_TIE_WEIGHT" \
+  --rvq-projection-freeze-input-steps "$RVQ_PROJECTION_FREEZE_INPUT_STEPS" \
   --clean-gate-min-aligned-si-sdr "$RVQ_PROJECTION_MIN_ALIGNED_SI_SDR" \
-  --generator-lr 1e-4 --early-stopping-min-steps "$RVQ_PROJECTION_STEPS" \
-  --no-bypass-rvq-during-training "${RECON_LOSSES[@]}" "${COMMON[@]}" --no-resume
+  "${RECON_LOSSES[@]}" "${COMMON[@]}" \
+  --generator-lr "$RVQ_PROJECTION_LR" \
+  --si-sdr-loss-weight 0.07 --si-sdr-loss-start-steps 0 \
+  --si-sdr-loss-warmup-steps 2000 \
+  --stft-recon-loss-weight 0.05 --stft-recon-loss-start-steps 0 \
+  --stft-recon-loss-warmup-steps 2500 \
+  --early-stopping-min-steps "$RVQ_PROJECTION_EARLY_STOPPING_MIN_STEPS" \
+  --early-stopping-patience "$RVQ_PROJECTION_EARLY_STOPPING_PATIENCE" \
+  --no-bypass-rvq-during-training --no-resume
 RVQ_PROJECTION_CKPT="$(pick_best "$RVQ_PROJECTION_DIR" 2>/dev/null || true)"
 if [[ -z "$RVQ_PROJECTION_CKPT" ]]; then
   echo "ERROR: Q0 projection path produced no clean validation-selected checkpoint." >&2
@@ -393,6 +409,9 @@ run_stage "B1.5 joint STE quantization adaptation" 29518 \
   --rvq-codebook-balance-temperature 0.1 \
   --rvq-quantization-error-loss-weight 0.10 \
   --rvq-continuous-teacher-loss-weight 0.20 \
+  --rvq-joint-latent64-teacher-loss-weight 0.50 \
+  --rvq-projection-orth-loss-weight 0.05 \
+  --rvq-projection-tie-loss-weight 0.05 \
   --si-sdr-loss-weight 0.07 --si-sdr-loss-start-steps 0 \
   --si-sdr-loss-warmup-steps 2500 \
   --stft-recon-loss-weight 0.05 --stft-recon-loss-start-steps 0 \
@@ -403,6 +422,7 @@ run_stage "B1.5 joint STE quantization adaptation" 29518 \
   --upper-highband-loss-weight 0 \
   --spectral-envelope-loss-weight 0 \
   --formant-peak-loss-weight 0 \
+  --stage2-encoder-lr 1e-7 --stage2-encoder-trainable-from-block 3 \
   --clean-gate-min-aligned-si-sdr "$RVQ_B15_MIN_ALIGNED_SI_SDR" \
   --clean-gate-max-negative-fraction 0.05 \
   --no-bypass-rvq-during-training --no-resume

@@ -91,6 +91,12 @@ def test_rvq_pipeline_runs_projection_gate_before_calibration():
     assert 'best_rvq_projection.pt' in launcher
     assert '--rvq-projection-latent-mse-weight' in launcher
     assert '--rvq-projection-latent-cosine-weight' in launcher
+    assert 'RVQ_PROJECTION_STEPS="${RVQ_PROJECTION_STEPS:-20000}"' in launcher
+    assert 'RVQ_PROJECTION_LR="${RVQ_PROJECTION_LR:-5e-5}"' in launcher
+    assert '--rvq-projection-freeze-input-steps' in launcher
+    assert '--si-sdr-loss-start-steps 0' in launcher
+    assert '--stft-recon-loss-start-steps 0' in launcher
+    assert '--early-stopping-min-steps "$RVQ_PROJECTION_EARLY_STOPPING_MIN_STEPS"' in launcher
 
 
 def test_q0_has_independent_checkpoint_and_fixed_decoder_scale_paths():
@@ -267,14 +273,18 @@ def test_pipeline_inserts_joint_rvq_adaptation_and_shortens_b2():
     )
     assert 'RVQ_DISTANCE="${RVQ_DISTANCE:-euclidean}"' in launcher
     assert '--rq-distance "$RVQ_DISTANCE"' in launcher
-    assert 'RVQ_CALIBRATION_STEPS="${RVQ_CALIBRATION_STEPS:-1000}"' in launcher
+    assert 'RVQ_CALIBRATION_STEPS="${RVQ_CALIBRATION_STEPS:-500}"' in launcher
     assert 'RVQ_JOINT_ADAPT_STEPS="${RVQ_JOINT_ADAPT_STEPS:-30000}"' in launcher
     assert 'RVQ_STAGE2_STEPS="${RVQ_STAGE2_STEPS:-50000}"' in launcher
     assert 'B1.5 joint STE quantization adaptation' in launcher
-    assert '--rvq-warm-in-steps 20000' in launcher
+    assert '--rvq-warm-in-steps 5000' in launcher
     assert '--rvq-codebook-balance-loss-weight 0.002' in launcher
     assert '--rvq-quantization-error-loss-weight 0.10' in launcher
     assert '--rvq-continuous-teacher-loss-weight 0.20' in launcher
+    assert '--rvq-joint-latent64-teacher-loss-weight 0.50' in launcher
+    assert '--rvq-projection-orth-loss-weight 0.05' in launcher
+    assert '--rvq-projection-tie-loss-weight 0.05' in launcher
+    assert '--stage2-encoder-lr 1e-7' in launcher
     assert '--rvq-codebook-balance-target-perplexity 64' in launcher
     assert '--stage2-encoder-unfreeze-step -1' in launcher
     assert '--early-stopping-patience 20 --stage2-quality-hard-stop' in launcher
@@ -288,7 +298,7 @@ def test_pipeline_inserts_joint_rvq_adaptation_and_shortens_b2():
         encoding="utf-8"
     )
     assert 'def rvq_codebook_balance_loss(self, encoded, indices):' in model_source
-    assert 'def rvq_quantization_error_loss(self, encoded, indices):' in model_source
+    assert 'def rvq_quantization_error_loss(self, encoded, quantized, indices):' in model_source
     assert 'x = projected_continuous_x + alpha * (x - projected_continuous_x)' in model_source
     trainer_source = (ROOT / "audiolm_pytorch" / "trainer.py").read_text(
         encoding="utf-8"

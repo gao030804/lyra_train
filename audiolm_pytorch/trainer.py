@@ -437,6 +437,10 @@ class SoundStreamTrainer(nn.Module):
         rvq_projection_min_evr: float = 0.90,
         rvq_projection_latent_mse_weight: float = 0.,
         rvq_projection_latent_cosine_weight: float = 0.,
+        rvq_projection_orth_loss_weight: float = 0.,
+        rvq_projection_tie_loss_weight: float = 0.,
+        rvq_projection_freeze_input_steps: int = 0,
+        rvq_joint_latent64_teacher_loss_weight: float = 0.10,
         freeze_codebook_after_step: int | None = None,
         freeze_codebook_before_step: int | None = None,
         freeze_codebook_during_training: bool = False,
@@ -743,6 +747,10 @@ class SoundStreamTrainer(nn.Module):
             "rvq_projection_min_evr": rvq_projection_min_evr,
             "rvq_projection_latent_mse_weight": rvq_projection_latent_mse_weight,
             "rvq_projection_latent_cosine_weight": rvq_projection_latent_cosine_weight,
+            "rvq_projection_orth_loss_weight": rvq_projection_orth_loss_weight,
+            "rvq_projection_tie_loss_weight": rvq_projection_tie_loss_weight,
+            "rvq_projection_freeze_input_steps": rvq_projection_freeze_input_steps,
+            "rvq_joint_latent64_teacher_loss_weight": rvq_joint_latent64_teacher_loss_weight,
             "decoder_lr_after_step": decoder_lr_after_step,
             "rq_excluded_from_generator_optimizer": exclude_rq_from_generator_optimizer,
             "encoder_excluded_from_generator_optimizer": (
@@ -1418,6 +1426,12 @@ class SoundStreamTrainer(nn.Module):
         self.rvq_projection_min_evr = float(rvq_projection_min_evr)
         self.rvq_projection_latent_mse_weight = float(rvq_projection_latent_mse_weight)
         self.rvq_projection_latent_cosine_weight = float(rvq_projection_latent_cosine_weight)
+        self.rvq_projection_orth_loss_weight = float(rvq_projection_orth_loss_weight)
+        self.rvq_projection_tie_loss_weight = float(rvq_projection_tie_loss_weight)
+        self.rvq_projection_freeze_input_steps = int(rvq_projection_freeze_input_steps)
+        self.rvq_joint_latent64_teacher_loss_weight = float(
+            rvq_joint_latent64_teacher_loss_weight
+        )
         self.best_rvq_projection_aligned_si_sdr = float('-inf')
         if self.rvq_projection_pca_batches < 0:
             raise ValueError('rvq_projection_pca_batches must be non-negative')
@@ -1427,6 +1441,14 @@ class SoundStreamTrainer(nn.Module):
             raise ValueError('rvq_projection_latent_mse_weight must be non-negative')
         if self.rvq_projection_latent_cosine_weight < 0.:
             raise ValueError('rvq_projection_latent_cosine_weight must be non-negative')
+        if self.rvq_projection_orth_loss_weight < 0.:
+            raise ValueError('rvq_projection_orth_loss_weight must be non-negative')
+        if self.rvq_projection_tie_loss_weight < 0.:
+            raise ValueError('rvq_projection_tie_loss_weight must be non-negative')
+        if self.rvq_projection_freeze_input_steps < 0:
+            raise ValueError('rvq_projection_freeze_input_steps must be non-negative')
+        if self.rvq_joint_latent64_teacher_loss_weight < 0.:
+            raise ValueError('rvq_joint_latent64_teacher_loss_weight must be non-negative')
         assert not exists(freeze_codebook_after_step) or freeze_codebook_after_step >= 0
         assert not exists(freeze_codebook_before_step) or freeze_codebook_before_step >= 0
         assert not exists(freeze_encoder_before_step) or freeze_encoder_before_step >= 0
@@ -4992,14 +5014,17 @@ class SoundStreamTrainer(nn.Module):
             teacher['rq_input_projection'](latent)
         )
 
-    @staticmethod
-    def rvq_projection_conditioning_loss(model):
+    def rvq_projection_conditioning_loss(self, model):
         win = model.rq_input_projection.weight.float()
         wout = model.rq_output_projection.weight.float()
         identity = torch.eye(win.shape[0], device=win.device, dtype=win.dtype)
         orth = F.mse_loss(win @ win.T, identity)
         tie = F.mse_loss(wout, win.T)
-        return 0.01 * orth + 0.01 * tie, orth, tie
+        weighted = (
+            self.rvq_projection_orth_loss_weight * orth +
+            self.rvq_projection_tie_loss_weight * tie
+        )
+        return weighted, orth, tie
 
     def rvq_frozen_teacher_loss(self, wave, student_recon):
         if self._rvq_q0_teacher is None:
@@ -5394,6 +5419,14 @@ class SoundStreamTrainer(nn.Module):
                 not self.rq_excluded_from_generator_optimizer
             )
         )
+        q0_input_projection_frozen = (
+            self.rvq_projection_only and
+            steps < self.rvq_projection_freeze_input_steps
+        )
+        # Keep Win in the distributed autograd graph during the Q0 Wout-only
+        # phase.  Toggling requires_grad after DDP wrapping can be interpreted
+        # as an unused parameter; its accumulated gradient is cleared before
+        # the optimizer step below instead.
         model.rq_input_projection.requires_grad_(train_rvq_projections)
         model.rq_output_projection.requires_grad_(train_rvq_projections)
         rvq_warm_in_alpha = (
@@ -5479,7 +5512,15 @@ class SoundStreamTrainer(nn.Module):
                         projection_normalized_mse,
                         projection_cosine_loss,
                     ) = self.rvq_projection_latent_loss(wave)
-                    loss = loss + projection_fidelity_loss
+                    (
+                        projection_conditioning_loss,
+                        projection_orth,
+                        projection_tie,
+                    ) = self.rvq_projection_conditioning_loss(runtime_model)
+                    loss = (
+                        loss + projection_fidelity_loss +
+                        projection_conditioning_loss
+                    )
                     if i == 0:
                         logs['projection_fidelity_loss'] = float(
                             projection_fidelity_loss.detach().cpu()
@@ -5490,6 +5531,11 @@ class SoundStreamTrainer(nn.Module):
                         logs['projection_cosine_loss'] = float(
                             projection_cosine_loss.detach().cpu()
                         )
+                        logs['projection_conditioning_loss'] = float(
+                            projection_conditioning_loss.detach().cpu()
+                        )
+                        logs['projection_orth'] = float(projection_orth.detach().cpu())
+                        logs['projection_tie'] = float(projection_tie.detach().cpu())
                 teacher_weight = float(getattr(
                     runtime_model, 'rq_continuous_teacher_loss_weight', 0.
                 ))
@@ -5519,7 +5565,11 @@ class SoundStreamTrainer(nn.Module):
                     projection_loss, projection_orth, projection_tie = (
                         self.rvq_projection_conditioning_loss(runtime_model)
                     )
-                    loss = loss + 0.10 * latent64_loss + projection_loss
+                    loss = (
+                        loss +
+                        self.rvq_joint_latent64_teacher_loss_weight * latent64_loss +
+                        projection_loss
+                    )
                     runtime_model._last_rvq_joint_losses.update(
                         latent64_teacher=latent64_loss.detach(),
                         projection_orth=projection_orth.detach(),
@@ -5780,6 +5830,10 @@ class SoundStreamTrainer(nn.Module):
                     'rvq_soft_top1_max': top1.max().item() / self.grad_accum_every,
                 })
 
+        if q0_input_projection_frozen:
+            for parameter in model.rq_input_projection.parameters():
+                parameter.grad = None
+
         if exists(self.max_grad_norm) and not generator_frozen:
             self.accelerator.clip_grad_norm_(self.soundstream.parameters(), self.max_grad_norm)
 
@@ -5873,10 +5927,11 @@ class SoundStreamTrainer(nn.Module):
             f" | continuous_teacher={logs.get('rvq_continuous_teacher_loss', 0.):.6f}"
             f"(w={getattr(model, 'rq_continuous_teacher_loss_weight', 0.):.4g})"
             f" | latent64_teacher={float(getattr(model, '_last_rvq_joint_losses', {}).get('latent64_teacher', 0.)):.6f}"
-            f"(w={0.1 if self._rvq_q0_teacher is not None else 0.:.4g})"
+            f"(w={self.rvq_joint_latent64_teacher_loss_weight if self._rvq_q0_teacher is not None else 0.:.4g})"
             f" | projection_orth={float(getattr(model, '_last_rvq_joint_losses', {}).get('projection_orth', 0.)):.6f}"
             f" | projection_tie={float(getattr(model, '_last_rvq_joint_losses', {}).get('projection_tie', 0.)):.6f}"
             f" | projection_frozen={int(not train_rvq_projections)}"
+            f" | projection_in_frozen={int(q0_input_projection_frozen)}"
             f" | rvq_ema_updates={int(not freeze_codebook)}"
         )
         if 'projection_latent_mse' in logs:
@@ -5890,6 +5945,9 @@ class SoundStreamTrainer(nn.Module):
                 f" | projection_fidelity={logs['projection_fidelity_loss']:.6f}"
                 f" | projection_nmse={logs['projection_normalized_mse']:.6f}"
                 f" | projection_cos_loss={logs['projection_cosine_loss']:.6f}"
+                f" | projection_conditioning={logs['projection_conditioning_loss']:.6f}"
+                f" | projection_orth={logs['projection_orth']:.6f}"
+                f" | projection_tie={logs['projection_tie']:.6f}"
             )
         rvq_stage_errors = getattr(model, '_last_rvq_quantization_stages', {})
         if rvq_stage_errors:

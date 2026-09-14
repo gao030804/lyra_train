@@ -583,6 +583,30 @@ def parse_args() -> argparse.Namespace:
         help="Q0 latent cosine-distance weight.",
     )
     parser.add_argument(
+        "--rvq-projection-orth-loss-weight",
+        type=float,
+        default=0.0,
+        help="Weight for keeping Win rows approximately orthonormal in Q0/B1.5.",
+    )
+    parser.add_argument(
+        "--rvq-projection-tie-loss-weight",
+        type=float,
+        default=0.0,
+        help="Weight for keeping Wout close to Win transpose in Q0/B1.5.",
+    )
+    parser.add_argument(
+        "--rvq-projection-freeze-input-steps",
+        type=int,
+        default=0,
+        help="Q0 steps that train only Wout while keeping PCA Win fixed.",
+    )
+    parser.add_argument(
+        "--rvq-joint-latent64-teacher-loss-weight",
+        type=float,
+        default=0.10,
+        help="B1.5 normalized 64-D latent teacher-loss weight.",
+    )
+    parser.add_argument(
         "--rvq-joint-adapt",
         action="store_true",
         help="Run non-GAN B1.5 joint Encoder-tail/RVQ-EMA/Decoder adaptation.",
@@ -2425,6 +2449,14 @@ def main() -> None:
         raise ValueError("--rvq-projection-latent-mse-weight cannot be negative")
     if args.rvq_projection_latent_cosine_weight < 0.:
         raise ValueError("--rvq-projection-latent-cosine-weight cannot be negative")
+    if args.rvq_projection_orth_loss_weight < 0.:
+        raise ValueError("--rvq-projection-orth-loss-weight cannot be negative")
+    if args.rvq_projection_tie_loss_weight < 0.:
+        raise ValueError("--rvq-projection-tie-loss-weight cannot be negative")
+    if args.rvq_projection_freeze_input_steps < 0:
+        raise ValueError("--rvq-projection-freeze-input-steps cannot be negative")
+    if args.rvq_joint_latent64_teacher_loss_weight < 0.:
+        raise ValueError("--rvq-joint-latent64-teacher-loss-weight cannot be negative")
     if (
         args.reinitialize_rvq_from_bypass_checkpoint and
         not (args.rvq_calibration_only or args.rvq_projection_only)
@@ -3194,8 +3226,9 @@ def main() -> None:
     )
     if rvq_joint_adapt:
         print(
-            "B1.5 curriculum: 0-5k Decoder-only; 5-12k Projection/RVQ EMA; "
-            ">=12k Encoder Block4/final at LR=5e-7. Warm-in ends at 5k; "
+            "B1.5 curriculum: 0-10k Decoder-only; 10-20k Projection/RVQ EMA; "
+            f">=20k Encoder Block4/final at LR={args.stage2_encoder_lr:.3e}. "
+            "Projection geometry and the frozen Q0 64-D latent remain anchored; "
             "SI-SDR starts immediately; GAN and HF-detail losses are disabled."
         )
     elif stage25_decoder_only_refine:
@@ -3851,9 +3884,21 @@ def main() -> None:
             args.rvq_projection_latent_cosine_weight
             if args.rvq_projection_only else 0.
         ),
+        rvq_projection_orth_loss_weight=args.rvq_projection_orth_loss_weight,
+        rvq_projection_tie_loss_weight=args.rvq_projection_tie_loss_weight,
+        rvq_projection_freeze_input_steps=(
+            args.rvq_projection_freeze_input_steps
+            if args.rvq_projection_only else 0
+        ),
+        rvq_joint_latent64_teacher_loss_weight=(
+            args.rvq_joint_latent64_teacher_loss_weight
+            if rvq_joint_adapt else 0.
+        ),
         lr=stage_defaults["lr"],
         encoder_lr=(
             args.stage2_encoder_lr
+            if rvq_joint_adapt
+            else args.stage2_encoder_lr
             if (
                 args.stage == "gan_pretrain" and
                 not args.stage2_targeted_refine and
@@ -4289,11 +4334,11 @@ def main() -> None:
             None if rvq_joint_adapt
             else stage_defaults.get("freeze_codebook_after_step")
         ),
-        freeze_codebook_before_step=(5_000 if rvq_joint_adapt else None),
+        freeze_codebook_before_step=(10_000 if rvq_joint_adapt else None),
         freeze_encoder_before_step=(
             num_train_steps + 1
             if args.rvq_projection_only
-            else 12_000
+            else 20_000
             if rvq_joint_adapt
             else
             num_train_steps + 1
