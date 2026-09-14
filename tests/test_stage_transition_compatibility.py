@@ -274,26 +274,27 @@ def test_pipeline_inserts_joint_rvq_adaptation_and_shortens_b2():
     assert 'RVQ_DISTANCE="${RVQ_DISTANCE:-euclidean}"' in launcher
     assert '--rq-distance "$RVQ_DISTANCE"' in launcher
     assert 'RVQ_CALIBRATION_STEPS="${RVQ_CALIBRATION_STEPS:-500}"' in launcher
-    assert 'RVQ_CALIBRATION_KMEANS_BATCHES="${RVQ_CALIBRATION_KMEANS_BATCHES:-50}"' in launcher
+    assert 'RVQ_CALIBRATION_KMEANS_BATCHES="${RVQ_CALIBRATION_KMEANS_BATCHES:-100}"' in launcher
     assert '--rvq-calibration-kmeans-batches "$RVQ_CALIBRATION_KMEANS_BATCHES"' in launcher
     assert 'RVQ_JOINT_ADAPT_STEPS="${RVQ_JOINT_ADAPT_STEPS:-30000}"' in launcher
+    assert 'RVQ_NUM_QUANTIZERS="${RVQ_NUM_QUANTIZERS:-9}"' in launcher
+    assert 'RVQ_CODEBOOK_SIZE="${RVQ_CODEBOOK_SIZE:-128}"' in launcher
+    assert '--num-quantizers "$RVQ_NUM_QUANTIZERS"' in launcher
+    assert '--codebook-size "$RVQ_CODEBOOK_SIZE"' in launcher
     assert 'RVQ_STAGE2_STEPS="${RVQ_STAGE2_STEPS:-50000}"' in launcher
     assert 'B1.5 joint STE quantization adaptation' in launcher
     assert '--rvq-warm-in-steps 5000' in launcher
-    assert '--rvq-codebook-balance-loss-weight 0.002' in launcher
-    assert '--rvq-quantization-error-loss-weight 0.10' in launcher
+    assert '--rvq-codebook-balance-loss-weight 0.002' not in launcher
+    assert '--rvq-quantization-error-loss-weight 0.10' not in launcher
     assert '--rvq-continuous-teacher-loss-weight 0.20' in launcher
-    assert '--rvq-joint-latent64-teacher-loss-weight 0.50' in launcher
-    assert '--rvq-projection-orth-loss-weight 0.05' in launcher
-    assert '--rvq-projection-tie-loss-weight 0.05' in launcher
-    assert '--rvq-joint-projection-lr "$RVQ_B15_PROJECTION_LR"' in launcher
+    assert '--rvq-joint-latent64-teacher-loss-weight 0' in launcher
     assert '--rvq-joint-decoder-only-steps "$RVQ_B15_DECODER_ONLY_STEPS"' in launcher
     assert '--rvq-joint-rvq-adapt-end-steps "$RVQ_B15_RVQ_ADAPT_END_STEPS"' in launcher
-    assert '--rvq-joint-projection-adapt-end-steps "$RVQ_B15_PROJECTION_ADAPT_END_STEPS"' in launcher
-    assert '--rvq-joint-recenter-end-steps "$RVQ_B15_RECENTER_END_STEPS"' in launcher
+    assert '--rvq-joint-polish-decoder-lr "$RVQ_B15_POLISH_DECODER_LR"' in launcher
+    assert '--rvq-joint-projection-adapt-end-steps' not in launcher
+    assert '--rvq-joint-recenter-end-steps' not in launcher
     assert 'RVQ_B15_MAX_LOOKUP_NMSE="${RVQ_B15_MAX_LOOKUP_NMSE:-0.07}"' in launcher
     assert 'RVQ_B15_MAX_LATENT64_NMSE="${RVQ_B15_MAX_LATENT64_NMSE:-0.10}"' in launcher
-    assert '--rvq-codebook-balance-target-perplexity 64' in launcher
     assert '--stage2-encoder-unfreeze-step -1' in launcher
     assert '--early-stopping-patience 20 --stage2-quality-hard-stop' in launcher
     assert launcher.index('B1 checkpoint=') < launcher.index(
@@ -316,9 +317,11 @@ def test_pipeline_inserts_joint_rvq_adaptation_and_shortens_b2():
     assert 'def initialize_rvq_codebooks_from_residual_kmeans(self):' in trainer_source
     assert "rvq_joint_phase = 'decoder_only'" in trainer_source
     assert "rvq_joint_phase = 'rvq_ema'" in trainer_source
-    assert "rvq_joint_phase = 'win_decoder'" in trainer_source
-    assert "rvq_joint_phase = 'rvq_recenter'" in trainer_source
+    assert "rvq_joint_phase = 'decoder_polish'" in trainer_source
+    assert "rvq_joint_phase = 'win_decoder'" not in trainer_source
+    assert "rvq_joint_phase = 'rvq_recenter'" not in trainer_source
     assert 'train_output_projection = False' in trainer_source
+    assert "parameter_group.setdefault('group_name', 'decoder')" in trainer_source
 
 
 def test_b15_loss_weights_are_applied_to_the_model_not_only_printed():
@@ -482,11 +485,11 @@ class GeneratorOnlyModel:
     encoder_low_rank_pointwise_ranks = (
         (0, 0), (8, 16), (16, 32), (32, 64)
     )
-    num_quantizers = 8
-    codebook_size = 256
+    num_quantizers = 9
+    codebook_size = 128
     codebook_dim = 64
-    rq_lookup_dim = 16
-    rq_use_cosine_sim = True
+    rq_lookup_dim = 32
+    rq_use_cosine_sim = False
     loaded_without_rvq = False
 
     def load_generator_state_dict(self, state_dict):
@@ -517,32 +520,32 @@ def matching_config(**overrides):
         "encoder_low_rank_pointwise_ranks": (
             (0, 0), (8, 16), (16, 32), (32, 64)
         ),
-        "rq_num_quantizers": 8,
-        "codebook_size": 256,
+        "rq_num_quantizers": 9,
+        "codebook_size": 128,
         "codebook_dim": 64,
-        "rq_lookup_dim": 16,
-        "rq_use_cosine_sim": True,
+        "rq_lookup_dim": 32,
+        "rq_use_cosine_sim": False,
     }
     config.update(overrides)
     return config
 
 
-def test_current_rvq_profile_is_8_by_256_by_16_lookup_and_3p2kbps():
+def test_current_rvq_profile_is_9_by_128_by_32_lookup_and_3p15kbps():
     config = matching_config()
     frame_rate = 16000 / 320
-    bits_per_index = 8
+    bits_per_index = 7
 
-    assert config["rq_num_quantizers"] == 8
-    assert config["codebook_size"] == 256
+    assert config["rq_num_quantizers"] == 9
+    assert config["codebook_size"] == 128
     assert config["codebook_dim"] == 64
-    assert config["rq_lookup_dim"] == 16
-    assert config["rq_use_cosine_sim"] is True
-    assert frame_rate * config["rq_num_quantizers"] * bits_per_index == 3200
+    assert config["rq_lookup_dim"] == 32
+    assert config["rq_use_cosine_sim"] is False
+    assert frame_rate * config["rq_num_quantizers"] * bits_per_index == 3150
     assert (
         config["rq_num_quantizers"] * config["codebook_size"]
         * config["rq_lookup_dim"] + 2 * config["codebook_dim"]
         * config["rq_lookup_dim"]
-        == 34816
+        == 40960
     )
 
 
@@ -579,9 +582,9 @@ def test_generator_checkpoint_rejects_old_rvq_shape(tmp_path):
     save_generator_checkpoint(
         checkpoint,
         matching_config(
-            rq_num_quantizers=16,
-            codebook_size=16,
-            rq_lookup_dim=64,
+            rq_num_quantizers=8,
+            codebook_size=256,
+            rq_lookup_dim=32,
             rq_use_cosine_sim=False,
         ),
     )

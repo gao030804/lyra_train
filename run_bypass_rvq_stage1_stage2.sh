@@ -8,7 +8,7 @@ set -euo pipefail
 #   optional A2.5 persistent-state alignment before RVQ calibration
 #   Q0 PCA initialization + projection-only reconstruction pretraining
 #   B1 Encoder -> RVQ EMA calibration (Encoder/Decoder weights frozen)
-#   B1.5 non-GAN coordinate adaptation (Decoder / RVQ EMA / Win schedule)
+#   B1.5 non-GAN adaptation (Decoder-only / RVQ EMA / Decoder polish)
 #   B2 Encoder -> frozen RVQ -> Decoder GAN adaptation (Encoder/RVQ frozen)
 #   final persistent-state Decoder fine-tune (Encoder/RVQ frozen, no GAN)
 
@@ -26,6 +26,8 @@ RUN_TAG="${RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
 SEED="${SEED:-42}"
 RVQ_LOOKUP_DIM="${RVQ_LOOKUP_DIM:-32}"
 RVQ_DISTANCE="${RVQ_DISTANCE:-euclidean}"
+RVQ_NUM_QUANTIZERS="${RVQ_NUM_QUANTIZERS:-9}"
+RVQ_CODEBOOK_SIZE="${RVQ_CODEBOOK_SIZE:-128}"
 BYPASS_STAGE1_STEPS="${BYPASS_STAGE1_STEPS:-150000}"
 BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS="${BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS:-60000}"
 BYPASS_FORMANT_REFINE_STEPS="${BYPASS_FORMANT_REFINE_STEPS:-20000}"
@@ -43,18 +45,16 @@ RVQ_PROJECTION_FREEZE_INPUT_STEPS="${RVQ_PROJECTION_FREEZE_INPUT_STEPS:-3000}"
 RVQ_PROJECTION_EARLY_STOPPING_MIN_STEPS="${RVQ_PROJECTION_EARLY_STOPPING_MIN_STEPS:-3000}"
 RVQ_PROJECTION_EARLY_STOPPING_PATIENCE="${RVQ_PROJECTION_EARLY_STOPPING_PATIENCE:-10}"
 RVQ_CALIBRATION_STEPS="${RVQ_CALIBRATION_STEPS:-500}"
-RVQ_CALIBRATION_KMEANS_BATCHES="${RVQ_CALIBRATION_KMEANS_BATCHES:-50}"
+RVQ_CALIBRATION_KMEANS_BATCHES="${RVQ_CALIBRATION_KMEANS_BATCHES:-100}"
 RVQ_B1_MIN_ALIGNED_SI_SDR="${RVQ_B1_MIN_ALIGNED_SI_SDR:-3.0}"
 RVQ_B1_MIN_QUANTIZATION_GAP_DB="${RVQ_B1_MIN_QUANTIZATION_GAP_DB:--2.0}"
 RVQ_B15_MAX_LOOKUP_NMSE="${RVQ_B15_MAX_LOOKUP_NMSE:-0.07}"
 RVQ_B15_MAX_LATENT64_NMSE="${RVQ_B15_MAX_LATENT64_NMSE:-0.10}"
 RVQ_B15_MIN_ALIGNED_SI_SDR="${RVQ_B15_MIN_ALIGNED_SI_SDR:-1.8}"
 RVQ_JOINT_ADAPT_STEPS="${RVQ_JOINT_ADAPT_STEPS:-30000}"
-RVQ_B15_PROJECTION_LR="${RVQ_B15_PROJECTION_LR:-2e-7}"
 RVQ_B15_DECODER_ONLY_STEPS="${RVQ_B15_DECODER_ONLY_STEPS:-10000}"
 RVQ_B15_RVQ_ADAPT_END_STEPS="${RVQ_B15_RVQ_ADAPT_END_STEPS:-20000}"
-RVQ_B15_PROJECTION_ADAPT_END_STEPS="${RVQ_B15_PROJECTION_ADAPT_END_STEPS:-25000}"
-RVQ_B15_RECENTER_END_STEPS="${RVQ_B15_RECENTER_END_STEPS:-26000}"
+RVQ_B15_POLISH_DECODER_LR="${RVQ_B15_POLISH_DECODER_LR:-1.5e-6}"
 RVQ_STAGE2_STEPS="${RVQ_STAGE2_STEPS:-50000}"
 ENABLE_PRE_RVQ_STATE_FT="${ENABLE_PRE_RVQ_STATE_FT:-0}"
 PRE_RVQ_STATE_STEPS="${PRE_RVQ_STATE_STEPS:-20000}"
@@ -79,7 +79,7 @@ if (( BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS > BYPASS_STAGE1_STEPS )); then
   BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS="$BYPASS_STAGE1_STEPS"
 fi
 
-BASE="lowrank-dscnn-b234-relu-convtranspose-fp-64d-8q256-l${RVQ_LOOKUP_DIM}-${RVQ_DISTANCE}-${RUN_TAG}"
+BASE="lowrank-dscnn-b234-relu-convtranspose-fp-64d-${RVQ_NUM_QUANTIZERS}q${RVQ_CODEBOOK_SIZE}-l${RVQ_LOOKUP_DIM}-${RVQ_DISTANCE}-${RUN_TAG}"
 BYPASS_S1_DIR="$PWD/results/bypass-recon-$BASE"
 BYPASS_FORMANT_DIR="$PWD/results/bypass-formant-refine-$BASE"
 BYPASS_S2_DIR="$PWD/results/bypass-gan-$BASE"
@@ -102,8 +102,8 @@ if (( FINAL_STATE_STEPS <= 0 )); then
   echo "ERROR: FINAL_STATE_STEPS must be positive; post-RVQ state alignment is mandatory." >&2
   exit 2
 fi
-if (( RVQ_JOINT_ADAPT_STEPS < RVQ_B15_RECENTER_END_STEPS )); then
-  echo "ERROR: RVQ_JOINT_ADAPT_STEPS must reach RVQ_B15_RECENTER_END_STEPS." >&2
+if (( RVQ_JOINT_ADAPT_STEPS < RVQ_B15_RVQ_ADAPT_END_STEPS )); then
+  echo "ERROR: RVQ_JOINT_ADAPT_STEPS must reach RVQ_B15_RVQ_ADAPT_END_STEPS." >&2
   exit 2
 fi
 if (( RVQ_STAGE2_STEPS <= 0 )); then
@@ -223,8 +223,27 @@ pick_best() {
   return 1
 }
 
+pick_b15_best() {
+  local dir="$1" candidate
+  # B1.5 is a reconstruction handoff, so select the strongest aligned
+  # waveform checkpoint before generic clarity/selection aliases.
+  for candidate in \
+    best_by_aligned_si_sdr.pt \
+    best_selected.pt \
+    best_by_clarity.pt; do
+    if [ -f "$dir/$candidate" ]; then
+      printf '%s\n' "$dir/$candidate"
+      return 0
+    fi
+  done
+  echo "ERROR: no validation-selected B1.5 checkpoint in $dir" >&2
+  return 1
+}
+
 COMMON=(
   --audio-dir "$AUDIO_DIR" --batch-size 4 --grad-accum-every 1
+  --num-quantizers "$RVQ_NUM_QUANTIZERS"
+  --codebook-size "$RVQ_CODEBOOK_SIZE"
   --rq-lookup-dim "$RVQ_LOOKUP_DIM"
   --rq-distance "$RVQ_DISTANCE"
   --segment-seconds 4 --dl-num-workers 6 --seed "$SEED"
@@ -404,27 +423,20 @@ RVQ_S1_CKPT="$RVQ_S1_DIR/latest.pt"
 test -f "$RVQ_S1_CKPT" || { echo "ERROR: missing $RVQ_S1_CKPT" >&2; exit 2; }
 echo "B1 checkpoint=$RVQ_S1_CKPT"
 
-# B1.5: coordinate descent. Keep Encoder and Wout immutable; adapt Decoder,
-# then RVQ EMA, then Win+Decoder, followed by a short RVQ recenter pass.
+# B1.5: keep Encoder, Win and Wout immutable. Adapt Decoder for 10k steps,
+# allow assignment-driven RVQ EMA updates until 20k, then finish with a
+# lower-LR Decoder-only polish. No projection adaptation or RVQ recenter pass.
 run_stage "B1.5 joint STE quantization adaptation" 29518 \
   "$PWD/logs/rvq-joint-adapt-$BASE.log" 0 \
   --stage gan_pretrain --results-dir "$RVQ_B15_DIR" \
   --init-checkpoint "$RVQ_S1_CKPT" --num-train-steps "$RVQ_JOINT_ADAPT_STEPS" \
   "${RECON_LOSSES[@]}" "${COMMON[@]}" \
   --rvq-joint-adapt --rvq-warm-in-steps 5000 \
-  --rvq-joint-projection-lr "$RVQ_B15_PROJECTION_LR" \
   --rvq-joint-decoder-only-steps "$RVQ_B15_DECODER_ONLY_STEPS" \
   --rvq-joint-rvq-adapt-end-steps "$RVQ_B15_RVQ_ADAPT_END_STEPS" \
-  --rvq-joint-projection-adapt-end-steps "$RVQ_B15_PROJECTION_ADAPT_END_STEPS" \
-  --rvq-joint-recenter-end-steps "$RVQ_B15_RECENTER_END_STEPS" \
-  --rvq-codebook-balance-loss-weight 0.002 \
-  --rvq-codebook-balance-target-perplexity 64 \
-  --rvq-codebook-balance-temperature 0.1 \
-  --rvq-quantization-error-loss-weight 0.10 \
+  --rvq-joint-polish-decoder-lr "$RVQ_B15_POLISH_DECODER_LR" \
   --rvq-continuous-teacher-loss-weight 0.20 \
-  --rvq-joint-latent64-teacher-loss-weight 0.50 \
-  --rvq-projection-orth-loss-weight 0.05 \
-  --rvq-projection-tie-loss-weight 0.05 \
+  --rvq-joint-latent64-teacher-loss-weight 0 \
   --si-sdr-loss-weight 0.07 --si-sdr-loss-start-steps 0 \
   --si-sdr-loss-warmup-steps 2500 \
   --stft-recon-loss-weight 0.05 --stft-recon-loss-start-steps 0 \
@@ -438,7 +450,7 @@ run_stage "B1.5 joint STE quantization adaptation" 29518 \
   --clean-gate-min-aligned-si-sdr "$RVQ_B15_MIN_ALIGNED_SI_SDR" \
   --clean-gate-max-negative-fraction 0.05 \
   --no-bypass-rvq-during-training --no-resume
-RVQ_B15_CKPT="$(pick_best "$RVQ_B15_DIR" 2>/dev/null || true)"
+RVQ_B15_CKPT="$(pick_b15_best "$RVQ_B15_DIR" 2>/dev/null || true)"
 test -f "$RVQ_B15_CKPT" || {
   echo "ERROR: B1.5 produced no validation-selected eligible checkpoint; latest.pt is resume-only." >&2
   exit 2

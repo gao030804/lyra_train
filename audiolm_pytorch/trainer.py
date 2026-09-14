@@ -445,8 +445,6 @@ class SoundStreamTrainer(nn.Module):
         projection_lr: float | None = None,
         rvq_joint_decoder_only_steps: int = 10000,
         rvq_joint_rvq_adapt_end_steps: int = 20000,
-        rvq_joint_projection_adapt_end_steps: int = 25000,
-        rvq_joint_recenter_end_steps: int = 26000,
         freeze_codebook_after_step: int | None = None,
         freeze_codebook_before_step: int | None = None,
         freeze_codebook_during_training: bool = False,
@@ -761,8 +759,6 @@ class SoundStreamTrainer(nn.Module):
             "projection_learning_rate": projection_lr,
             "rvq_joint_decoder_only_steps": rvq_joint_decoder_only_steps,
             "rvq_joint_rvq_adapt_end_steps": rvq_joint_rvq_adapt_end_steps,
-            "rvq_joint_projection_adapt_end_steps": rvq_joint_projection_adapt_end_steps,
-            "rvq_joint_recenter_end_steps": rvq_joint_recenter_end_steps,
             "decoder_lr_after_step": decoder_lr_after_step,
             "rq_excluded_from_generator_optimizer": exclude_rq_from_generator_optimizer,
             "encoder_excluded_from_generator_optimizer": (
@@ -999,6 +995,13 @@ class SoundStreamTrainer(nn.Module):
                 lr = lr,
                 wd = wd,
             )
+
+        if exclude_encoder_from_generator_optimizer and exclude_rq_from_generator_optimizer:
+            # The remaining generator parameters are Decoder-only. Name even
+            # the ordinary optimizer groups so the B1.5 polish LR transition
+            # can address them deterministically.
+            for parameter_group in generator_optimizer.param_groups:
+                parameter_group.setdefault('group_name', 'decoder')
 
         self.optim = OptimizerWithWarmupSchedule(
             self.accelerator,
@@ -1510,13 +1513,9 @@ class SoundStreamTrainer(nn.Module):
         self.projection_lr = projection_lr
         self.rvq_joint_decoder_only_steps = int(rvq_joint_decoder_only_steps)
         self.rvq_joint_rvq_adapt_end_steps = int(rvq_joint_rvq_adapt_end_steps)
-        self.rvq_joint_projection_adapt_end_steps = int(rvq_joint_projection_adapt_end_steps)
-        self.rvq_joint_recenter_end_steps = int(rvq_joint_recenter_end_steps)
         rvq_joint_boundaries = (
             self.rvq_joint_decoder_only_steps,
             self.rvq_joint_rvq_adapt_end_steps,
-            self.rvq_joint_projection_adapt_end_steps,
-            self.rvq_joint_recenter_end_steps,
         )
         if any(step < 0 for step in rvq_joint_boundaries):
             raise ValueError('RVQ joint phase boundaries must be non-negative')
@@ -5559,30 +5558,21 @@ class SoundStreamTrainer(nn.Module):
         rvq_joint_curriculum = self._rvq_q0_teacher is not None
         rvq_joint_phase = 'disabled'
         if rvq_joint_curriculum:
-            # Coordinate descent avoids moving Encoder, projections and the
-            # residual codebooks at the same time.  Wout is the immutable Q0
-            # coordinate system; only Win receives the short projection pass.
+            # Preserve Q0's latent coordinate system throughout B1.5. Adapt
+            # Decoder first, then allow assignment-driven RVQ EMA updates, and
+            # finish with a lower-LR Decoder-only polish. Encoder, Win and Wout
+            # never move in this curriculum.
             freeze_encoder = True
             if steps < self.rvq_joint_decoder_only_steps:
                 rvq_joint_phase = 'decoder_only'
                 freeze_codebook = True
-                train_input_projection = False
             elif steps < self.rvq_joint_rvq_adapt_end_steps:
                 rvq_joint_phase = 'rvq_ema'
                 freeze_codebook = False
-                train_input_projection = False
-            elif steps < self.rvq_joint_projection_adapt_end_steps:
-                rvq_joint_phase = 'win_decoder'
-                freeze_codebook = True
-                train_input_projection = True
-            elif steps < self.rvq_joint_recenter_end_steps:
-                rvq_joint_phase = 'rvq_recenter'
-                freeze_codebook = False
-                train_input_projection = False
             else:
-                rvq_joint_phase = 'decoder_consolidate'
+                rvq_joint_phase = 'decoder_polish'
                 freeze_codebook = True
-                train_input_projection = False
+            train_input_projection = False
             train_output_projection = False
         else:
             freeze_codebook = (

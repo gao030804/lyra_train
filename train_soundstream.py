@@ -34,12 +34,12 @@ DEFAULT_AUDIO_DIR = (
 )
 
 STAGE_RESULTS_DIRS = {
-    "overfit": PROJECT_DIR / "results" / "overfit-lowrank-dscnn-fp-64d-8q256-l16",
-    "recon_pretrain": PROJECT_DIR / "results" / "recon-pretrain-lowrank-dscnn-fp-64d-8q256-l16",
-    "spectral_refine": PROJECT_DIR / "results" / "spectral-refine-lowrank-dscnn-fp-64d-8q256-l16",
-    "gan_pretrain": PROJECT_DIR / "results" / "gan-pretrain-lowrank-dscnn-fp-64d-8q256-l16",
-    "stream_finetune": PROJECT_DIR / "results" / "stream-finetune-lowrank-dscnn-fp-64d-8q256-l16",
-    "stream_finetune_long": PROJECT_DIR / "results" / "stream-finetune-long-lowrank-dscnn-fp-64d-8q256-l16",
+    "overfit": PROJECT_DIR / "results" / "overfit-lowrank-dscnn-fp-64d-9q128-l32",
+    "recon_pretrain": PROJECT_DIR / "results" / "recon-pretrain-lowrank-dscnn-fp-64d-9q128-l32",
+    "spectral_refine": PROJECT_DIR / "results" / "spectral-refine-lowrank-dscnn-fp-64d-9q128-l32",
+    "gan_pretrain": PROJECT_DIR / "results" / "gan-pretrain-lowrank-dscnn-fp-64d-9q128-l32",
+    "stream_finetune": PROJECT_DIR / "results" / "stream-finetune-lowrank-dscnn-fp-64d-9q128-l32",
+    "stream_finetune_long": PROJECT_DIR / "results" / "stream-finetune-long-lowrank-dscnn-fp-64d-9q128-l32",
 }
 
 RECONSTRUCTION_STAGES = frozenset((
@@ -316,7 +316,7 @@ SUPPORTED_AUDIO_EXTENSIONS = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a staged 3.2 kbps streaming SoundStream speech codec."
+        description="Train a staged configurable-bitrate streaming SoundStream speech codec."
     )
     parser.add_argument('--preceding-context-seconds', type=float, default=0.,
                         help='Real contiguous prefix excluded from waveform losses; use 0.4 for context-aware crops.')
@@ -566,6 +566,18 @@ def parse_args() -> argparse.Namespace:
         help="RVQ lookup/PCA dimension; bitrate is unchanged, storage scales with this value.",
     )
     parser.add_argument(
+        "--num-quantizers",
+        type=int,
+        default=9,
+        help="Number of residual RVQ levels (default: 9).",
+    )
+    parser.add_argument(
+        "--codebook-size",
+        type=int,
+        default=128,
+        help="Uniform codebook size at every RVQ level (default: 128).",
+    )
+    parser.add_argument(
         "--rq-distance",
         choices=("cosine", "euclidean"),
         default="euclidean",
@@ -616,20 +628,21 @@ def parse_args() -> argparse.Namespace:
         default=0.10,
         help="B1.5 normalized 64-D latent teacher-loss weight.",
     )
-    parser.add_argument(
-        "--rvq-joint-projection-lr",
-        type=float,
-        default=None,
-        help="Optional B1.5 optimizer LR for projection parameters only.",
-    )
     parser.add_argument("--rvq-joint-decoder-only-steps", type=int, default=10000)
     parser.add_argument("--rvq-joint-rvq-adapt-end-steps", type=int, default=20000)
-    parser.add_argument("--rvq-joint-projection-adapt-end-steps", type=int, default=25000)
-    parser.add_argument("--rvq-joint-recenter-end-steps", type=int, default=26000)
+    parser.add_argument(
+        "--rvq-joint-polish-decoder-lr",
+        type=float,
+        default=1.5e-6,
+        help="Decoder LR after the RVQ EMA phase in B1.5 (default: 1.5e-6).",
+    )
     parser.add_argument(
         "--rvq-joint-adapt",
         action="store_true",
-        help="Run non-GAN B1.5 joint Encoder-tail/RVQ-EMA/Decoder adaptation.",
+        help=(
+            "Run non-GAN B1.5 Decoder/RVQ-EMA adaptation while keeping "
+            "Encoder and both projection matrices fixed."
+        ),
     )
     parser.add_argument("--rvq-warm-in-steps", type=int, default=0,
                         help="Linearly mix continuous latent into full RVQ latent over N steps.")
@@ -2488,13 +2501,11 @@ def main() -> None:
         raise ValueError("--rvq-projection-freeze-input-steps cannot be negative")
     if args.rvq_joint_latent64_teacher_loss_weight < 0.:
         raise ValueError("--rvq-joint-latent64-teacher-loss-weight cannot be negative")
-    if args.rvq_joint_projection_lr is not None and args.rvq_joint_projection_lr <= 0.:
-        raise ValueError("--rvq-joint-projection-lr must be positive")
+    if args.rvq_joint_polish_decoder_lr <= 0.:
+        raise ValueError("--rvq-joint-polish-decoder-lr must be positive")
     rvq_joint_boundaries = (
         args.rvq_joint_decoder_only_steps,
         args.rvq_joint_rvq_adapt_end_steps,
-        args.rvq_joint_projection_adapt_end_steps,
-        args.rvq_joint_recenter_end_steps,
     )
     if any(step < 0 for step in rvq_joint_boundaries):
         raise ValueError("RVQ joint phase boundaries cannot be negative")
@@ -2516,8 +2527,15 @@ def main() -> None:
         raise ValueError("--rvq-warm-in-steps cannot be negative.")
     if args.rvq_codebook_balance_loss_weight < 0.:
         raise ValueError("--rvq-codebook-balance-loss-weight cannot be negative.")
-    if not 1. <= args.rvq_codebook_balance_target_perplexity <= 256.:
-        raise ValueError("--rvq-codebook-balance-target-perplexity must be in [1, 256].")
+    if args.num_quantizers <= 0:
+        raise ValueError("--num-quantizers must be positive.")
+    if args.codebook_size <= 1 or args.codebook_size & (args.codebook_size - 1):
+        raise ValueError("--codebook-size must be a power of two greater than one.")
+    if not 1. <= args.rvq_codebook_balance_target_perplexity <= args.codebook_size:
+        raise ValueError(
+            "--rvq-codebook-balance-target-perplexity must be in "
+            f"[1, {args.codebook_size}]."
+        )
     if args.rvq_codebook_balance_temperature <= 0.:
         raise ValueError("--rvq-codebook-balance-temperature must be positive.")
     if args.rvq_quantization_error_loss_weight < 0.:
@@ -2531,11 +2549,11 @@ def main() -> None:
             raise ValueError("--rvq-joint-adapt requires RVQ in the training path.")
         if (
             (args.num_train_steps or stage_defaults["steps"]) <
-            args.rvq_joint_recenter_end_steps
+            args.rvq_joint_rvq_adapt_end_steps
         ):
             raise ValueError(
                 "--rvq-joint-adapt training steps must reach the end of the "
-                "configured RVQ recenter phase."
+                "configured RVQ EMA phase."
             )
     if args.gan_feature_max is not None:
         if args.gan_feature_max < 0:
@@ -3044,11 +3062,11 @@ def main() -> None:
     strides = (2, 4, 5, 8)
     stream_frame_size = math.prod(strides)
     stream_context_frames = args.stream_context_frames
-    # RVQ v2: 50 frames/s * 8 quantizers * 8 bits/index = 3.2 kbps.
-    # The codec representation remains 64-D while lookup happens in 16-D.
-    # Bitrate depends on indices only; lookup dimension changes table/storage cost.
-    codebook_size = 256
-    num_quantizers = 8
+    # Default RVQ profile: 50 frames/s * 9 levels * 7 bits/index = 3.15 kbps.
+    # The codec representation remains 64-D while lookup happens in 32-D.
+    # Both topology values remain explicit CLI parameters for controlled A/B tests.
+    codebook_size = args.codebook_size
+    num_quantizers = args.num_quantizers
     rq_lookup_dim = args.rq_lookup_dim
     if args.stage in RECONSTRUCTION_STAGES:
         si_sdr_loss_weight = (
@@ -3275,9 +3293,10 @@ def main() -> None:
     )
     if rvq_joint_adapt:
         print(
-            "B1.5 curriculum: 0-10k Decoder-only; 10-20k Projection/RVQ EMA; "
-            f">=20k Encoder Block4/final at LR={args.stage2_encoder_lr:.3e}. "
-            "Projection geometry and the frozen Q0 64-D latent remain anchored; "
+            "B1.5 curriculum: 0-10k Decoder-only; 10-20k RVQ EMA + Decoder; "
+            ">=20k Decoder-only polish at "
+            f"LR={args.rvq_joint_polish_decoder_lr:.3e}. "
+            "Encoder and both projections remain frozen; "
             "SI-SDR starts immediately; GAN and HF-detail losses are disabled."
         )
     elif stage25_decoder_only_refine:
@@ -3753,7 +3772,12 @@ def main() -> None:
     print("RVQ quantize dropout: False")
     print("RVQ dead-code threshold: 2")
     print(f"RVQ codebook synchronization: {world_size > 1}")
-    if args.stage in ("stream_finetune", "stream_finetune_long"):
+    if rvq_joint_adapt:
+        print(
+            "RVQ codebook training: EMA enabled only during the configured "
+            "10k-20k B1.5 phase; frozen before and after it"
+        )
+    elif args.stage in ("stream_finetune", "stream_finetune_long"):
         print("RVQ codebook training: frozen")
     elif args.stage == "gan_pretrain":
         print(
@@ -3767,7 +3791,7 @@ def main() -> None:
         )
     else:
         print("RVQ codebook training: enabled")
-    print(f"Theoretical bitrate: {bitrate / 1000:.1f} kbps")
+    print(f"Theoretical bitrate: {bitrate / 1000:.3f} kbps")
     if args.stage in ("stream_finetune", "stream_finetune_long"):
         print(
             f"Final test: continuous stateful full-file streaming, "
@@ -3792,9 +3816,9 @@ def main() -> None:
             f"{args.test_context_ms:.1f} ms previous context discarded from output"
         )
 
-    # Fixed RVQ-v2 3.2 kbps profile:
+    # Default RVQ-v4 profile:
     # 16000 / 320 = 50 frames/s
-    # log2(256) = 8 bits/token; 8 quantizers = 3.2 kbps
+    # log2(128) = 7 bits/token; 9 quantizers = 3.15 kbps
     soundstream = build_model(
         args.stage,
         sample_rate=sample_rate,
@@ -3963,15 +3987,11 @@ def main() -> None:
             args.rvq_joint_latent64_teacher_loss_weight
             if rvq_joint_adapt else 0.
         ),
-        projection_lr=(
-            args.rvq_joint_projection_lr if rvq_joint_adapt else None
-        ),
+        # B1.5 keeps both 64<->lookup projections immutable. RVQ codebooks are
+        # EMA-managed and excluded from Adam; only Decoder parameters optimize.
+        projection_lr=None,
         rvq_joint_decoder_only_steps=args.rvq_joint_decoder_only_steps,
         rvq_joint_rvq_adapt_end_steps=args.rvq_joint_rvq_adapt_end_steps,
-        rvq_joint_projection_adapt_end_steps=(
-            args.rvq_joint_projection_adapt_end_steps
-        ),
-        rvq_joint_recenter_end_steps=args.rvq_joint_recenter_end_steps,
         lr=stage_defaults["lr"],
         encoder_lr=(
             None
@@ -4003,6 +4023,7 @@ def main() -> None:
         # below is what enables EMA/dead-code state updates.
         exclude_rq_from_generator_optimizer=(
             args.bypass_rvq_during_training or
+            rvq_joint_adapt or
             (args.stage2_targeted_refine and not rvq_joint_adapt) or
             (args.stage == "gan_pretrain" and not rvq_joint_adapt) or
             args.stage in ("stream_finetune", "stream_finetune_long")
@@ -4436,7 +4457,13 @@ def main() -> None:
         ),
         freeze_encoder_after_step=None,
         rvq_warm_in_steps=args.rvq_warm_in_steps,
-        decoder_lr_after_step=None,
+        decoder_lr_after_step=(
+            (
+                args.rvq_joint_rvq_adapt_end_steps,
+                args.rvq_joint_polish_decoder_lr,
+            )
+            if rvq_joint_adapt else None
+        ),
         freeze_decoder_before_step=(
             num_train_steps
             if (args.rvq_projection_only or stage25_rvq_midband_refine)

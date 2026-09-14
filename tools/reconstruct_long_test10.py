@@ -29,7 +29,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--valid-frac", type=float, default=0.05)
     parser.add_argument("--test-frac", type=float, default=0.05)
-    parser.add_argument("--bitrate", type=int, default=9200)
+    parser.add_argument(
+        "--bitrate",
+        type=int,
+        default=None,
+        help="Optional payload bitrate; omitted uses all checkpoint RVQ levels.",
+    )
     parser.add_argument("--block-seconds", type=float, default=5.0)
     parser.add_argument("--context-ms", type=float, default=60.0)
     parser.add_argument(
@@ -202,13 +207,13 @@ def main() -> None:
                 row["reconstruction"],
                 "--weights",
                 args.weights,
-                "--bitrate",
-                str(args.bitrate),
                 "--block-seconds",
                 str(args.block_seconds),
                 "--context-ms",
                 str(args.context_ms),
             ]
+            if args.bitrate is not None:
+                command.extend(("--bitrate", str(args.bitrate)))
             if args.whole_file:
                 command.append("--whole-file")
             subprocess.run(
