@@ -559,6 +559,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--reinitialize-rvq-codebooks-from-projection-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Load a checkpoint explicitly saved with rq_projection_only=True, "
+            "retain Encoder/Decoder and both trained 64<->lookup projections, "
+            "but discard rq.* embeddings and EMA buffers. This is the safe "
+            "Q0-reuse path for starting RVQ calibration with a new topology."
+        ),
+    )
+    parser.add_argument(
         "--rq-lookup-dim",
         type=int,
         choices=(16, 24, 32),
@@ -576,6 +587,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=128,
         help="Uniform codebook size at every RVQ level (default: 128).",
+    )
+    parser.add_argument(
+        "--codebook-sizes",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "Optional per-level RVQ codebook sizes. When set, this overrides "
+            "--codebook-size and must contain --num-quantizers powers of two. "
+            "Recommended 3.2 kbps profile: 256 128 128 128 128 128 128 128 128."
+        ),
     )
     parser.add_argument(
         "--rq-distance",
@@ -1795,14 +1817,19 @@ def latest_checkpoint(results_dir: Path) -> Path | None:
 def calculate_bitrate(
     sample_rate: int,
     strides: tuple[int, ...],
-    codebook_size: int,
-    num_quantizers: int,
+    codebook_size: int | tuple[int, ...],
+    num_quantizers: int | None = None,
 ) -> float:
     downsample_factor = math.prod(strides)
     frame_rate = sample_rate / downsample_factor
-    bits_per_token = math.log2(codebook_size)
+    if isinstance(codebook_size, int):
+        if num_quantizers is None:
+            raise ValueError("num_quantizers is required for a uniform codebook")
+        codebook_sizes = (codebook_size,) * num_quantizers
+    else:
+        codebook_sizes = tuple(codebook_size)
 
-    return frame_rate * num_quantizers * bits_per_token
+    return frame_rate * sum(math.log2(size) for size in codebook_sizes)
 
 
 def load_model_weights_only(
@@ -1811,7 +1838,10 @@ def load_model_weights_only(
     *,
     generator_only: bool = False,
     reinitialize_rvq_from_bypass: bool = False,
+    reinitialize_rvq_codebooks_from_projection: bool = False,
 ) -> dict:
+    if reinitialize_rvq_from_bypass and reinitialize_rvq_codebooks_from_projection:
+        raise ValueError("RVQ bypass and Q0 projection migration modes are mutually exclusive")
     pkg = torch.load(str(checkpoint), map_location="cpu")
     checkpoint_config = {}
     if reinitialize_rvq_from_bypass and "config" not in pkg:
@@ -1819,11 +1849,15 @@ def load_model_weights_only(
             "--reinitialize-rvq-from-bypass-checkpoint requires checkpoint "
             "configuration metadata proving bypass_rvq=True."
         )
+    if reinitialize_rvq_codebooks_from_projection and "config" not in pkg:
+        raise ValueError(
+            "--reinitialize-rvq-codebooks-from-projection-checkpoint requires "
+            "checkpoint configuration metadata proving rq_projection_only=True."
+        )
     if "config" in pkg:
         checkpoint_config = pickle.loads(pkg["config"])
         rvq_fields = (
             ("rq_num_quantizers", "num_quantizers"),
-            ("codebook_size", "codebook_size"),
             ("codebook_dim", "codebook_dim"),
             ("rq_lookup_dim", "rq_lookup_dim"),
         )
@@ -1840,13 +1874,61 @@ def load_model_weights_only(
                     f"{config_name}: checkpoint={checkpoint_value}, "
                     f"current_model={model_value}"
                 )
+        checkpoint_codebook_sizes = checkpoint_config.get("codebook_size")
+        if isinstance(checkpoint_codebook_sizes, int):
+            checkpoint_codebook_sizes = (
+                int(checkpoint_codebook_sizes),
+            ) * int(checkpoint_config.get("rq_num_quantizers", 0))
+        elif checkpoint_codebook_sizes is not None:
+            checkpoint_codebook_sizes = tuple(
+                int(size) for size in checkpoint_codebook_sizes
+            )
+        model_codebook_sizes = tuple(getattr(model, "codebook_sizes", ()))
+        if (
+            checkpoint_codebook_sizes and
+            model_codebook_sizes and
+            tuple(checkpoint_codebook_sizes) != model_codebook_sizes
+        ):
+            rvq_mismatches.append(
+                "codebook_sizes: checkpoint="
+                f"{tuple(checkpoint_codebook_sizes)}, "
+                f"current_model={model_codebook_sizes}"
+            )
         checkpoint_bypassed_rvq = bool(checkpoint_config.get("bypass_rvq", False))
+        checkpoint_projection_only = bool(checkpoint_config.get("rq_projection_only", False))
         if reinitialize_rvq_from_bypass and not checkpoint_bypassed_rvq:
             raise ValueError(
                 "--reinitialize-rvq-from-bypass-checkpoint requires a source "
                 "checkpoint whose saved config records bypass_rvq=True."
             )
-        if rvq_mismatches and not reinitialize_rvq_from_bypass:
+        if reinitialize_rvq_codebooks_from_projection and not checkpoint_projection_only:
+            raise ValueError(
+                "--reinitialize-rvq-codebooks-from-projection-checkpoint requires "
+                "a source checkpoint whose saved config records rq_projection_only=True."
+            )
+        if reinitialize_rvq_codebooks_from_projection:
+            for config_name, model_name in (
+                ("codebook_dim", "codebook_dim"),
+                ("rq_lookup_dim", "rq_lookup_dim"),
+            ):
+                checkpoint_value = checkpoint_config.get(config_name)
+                model_value = getattr(model, model_name, None)
+                if (
+                    checkpoint_value is not None and
+                    model_value is not None and
+                    int(checkpoint_value) != int(model_value)
+                ):
+                    raise ValueError(
+                        "Q0 projection dimension mismatch: "
+                        f"{config_name}: checkpoint={checkpoint_value}, "
+                        f"current_model={model_value}. Projection matrices "
+                        "cannot be reused across different dimensions."
+                    )
+        if (
+            rvq_mismatches and
+            not reinitialize_rvq_from_bypass and
+            not reinitialize_rvq_codebooks_from_projection
+        ):
             raise ValueError(
                 "Checkpoint RVQ topology mismatch: "
                 + "; ".join(rvq_mismatches)
@@ -1854,7 +1936,10 @@ def load_model_weights_only(
             )
         checkpoint_cosine = bool(checkpoint_config.get("rq_use_cosine_sim", False))
         model_cosine = bool(getattr(model, "rq_use_cosine_sim", False))
-        if checkpoint_cosine != model_cosine and not reinitialize_rvq_from_bypass:
+        if (
+            checkpoint_cosine != model_cosine and
+            not reinitialize_rvq_from_bypass
+        ):
             raise ValueError(
                 "Checkpoint RVQ distance mismatch: "
                 f"checkpoint_cosine={checkpoint_cosine}, current_model_cosine={model_cosine}. "
@@ -1987,7 +2072,24 @@ def load_model_weights_only(
                     "fresh run or use a checkpoint with matching ranks."
                 )
     state_dict = pkg["model"] if "model" in pkg else pkg
-    if reinitialize_rvq_from_bypass:
+    if reinitialize_rvq_codebooks_from_projection:
+        if not hasattr(model, "load_state_dict_without_rvq_codebooks"):
+            raise TypeError(
+                "model does not support retaining Q0 projections while "
+                "reinitializing RVQ codebooks"
+            )
+        skipped_keys = model.load_state_dict_without_rvq_codebooks(
+            state_dict,
+            include_discriminators=not generator_only,
+        )
+        print(
+            "Reused validated Q0 Encoder/Decoder and 64<->lookup projections; "
+            "discarded all source rq.* embeddings and EMA buffers, then "
+            f"initialized codebooks for topology {getattr(model, 'codebook_sizes', 'unknown')} "
+            f"({len(skipped_keys)} fresh state keys)."
+        )
+        print("Optimizer, scheduler, codebook EMA statistics, and training step start fresh.")
+    elif reinitialize_rvq_from_bypass:
         if not hasattr(model, "load_state_dict_without_rvq"):
             raise TypeError(
                 "model does not support loading a bypass checkpoint while "
@@ -2048,7 +2150,7 @@ def build_model(
     stream_consistency_loss_weight: float,
     stream_consistency_loss_start_steps: int,
     stream_consistency_loss_warmup_steps: int,
-    codebook_size: int,
+    codebook_size: int | tuple[int, ...],
     num_quantizers: int,
     rq_lookup_dim: int,
     rq_use_cosine_sim: bool,
@@ -2519,6 +2621,19 @@ def main() -> None:
             "--reinitialize-rvq-from-bypass-checkpoint requires projection-only "
             "pretraining or RVQ calibration"
         )
+    if (
+        args.reinitialize_rvq_codebooks_from_projection_checkpoint and
+        not args.rvq_calibration_only
+    ):
+        raise ValueError(
+            "--reinitialize-rvq-codebooks-from-projection-checkpoint requires "
+            "--rvq-calibration-only"
+        )
+    if (
+        args.reinitialize_rvq_from_bypass_checkpoint and
+        args.reinitialize_rvq_codebooks_from_projection_checkpoint
+    ):
+        raise ValueError("RVQ bypass and Q0 projection migration modes are mutually exclusive")
     if args.gan_adversarial_max is not None:
         if args.gan_adversarial_max < 0:
             raise ValueError("--gan-adversarial-max cannot be negative.")
@@ -2529,12 +2644,22 @@ def main() -> None:
         raise ValueError("--rvq-codebook-balance-loss-weight cannot be negative.")
     if args.num_quantizers <= 0:
         raise ValueError("--num-quantizers must be positive.")
-    if args.codebook_size <= 1 or args.codebook_size & (args.codebook_size - 1):
-        raise ValueError("--codebook-size must be a power of two greater than one.")
-    if not 1. <= args.rvq_codebook_balance_target_perplexity <= args.codebook_size:
+    codebook_sizes = (
+        tuple(args.codebook_sizes)
+        if args.codebook_sizes is not None
+        else (args.codebook_size,) * args.num_quantizers
+    )
+    if len(codebook_sizes) != args.num_quantizers:
+        raise ValueError(
+            "--codebook-sizes must contain exactly --num-quantizers values; "
+            f"got {len(codebook_sizes)} for {args.num_quantizers} levels."
+        )
+    if any(size <= 1 or size & (size - 1) for size in codebook_sizes):
+        raise ValueError("Every RVQ codebook size must be a power of two greater than one.")
+    if not 1. <= args.rvq_codebook_balance_target_perplexity <= min(codebook_sizes):
         raise ValueError(
             "--rvq-codebook-balance-target-perplexity must be in "
-            f"[1, {args.codebook_size}]."
+            f"[1, {min(codebook_sizes)}] for the smallest RVQ level."
         )
     if args.rvq_codebook_balance_temperature <= 0.:
         raise ValueError("--rvq-codebook-balance-temperature must be positive.")
@@ -3062,10 +3187,19 @@ def main() -> None:
     strides = (2, 4, 5, 8)
     stream_frame_size = math.prod(strides)
     stream_context_frames = args.stream_context_frames
-    # Default RVQ profile: 50 frames/s * 9 levels * 7 bits/index = 3.15 kbps.
-    # The codec representation remains 64-D while lookup happens in 32-D.
-    # Both topology values remain explicit CLI parameters for controlled A/B tests.
-    codebook_size = args.codebook_size
+    # Default deployment profile: q0 uses K256 and q1-q8 use K128.  At 50
+    # frames/s this is 8 + 8*7 = 64 bits/frame = exactly 3.2 kbps.  The codec
+    # representation remains 64-D while lookup happens in 32-D.
+    codebook_sizes = (
+        tuple(args.codebook_sizes)
+        if args.codebook_sizes is not None
+        else (args.codebook_size,) * args.num_quantizers
+    )
+    codebook_size = (
+        codebook_sizes[0]
+        if len(set(codebook_sizes)) == 1
+        else codebook_sizes
+    )
     num_quantizers = args.num_quantizers
     rq_lookup_dim = args.rq_lookup_dim
     if args.stage in RECONSTRUCTION_STAGES:
@@ -3238,7 +3372,7 @@ def main() -> None:
         else 1.0
     )
     multi_spectral_recon_loss_weight = (
-        1.0 if rvq_joint_adapt
+        0.8 if rvq_joint_adapt
         else 1.1 if args.stage == "recon_pretrain"
         else 0.8 if args.stage == "spectral_refine"
         else 0.7
@@ -3293,8 +3427,11 @@ def main() -> None:
     )
     if rvq_joint_adapt:
         print(
-            "B1.5 curriculum: 0-10k Decoder-only; 10-20k RVQ EMA + Decoder; "
-            ">=20k Decoder-only polish at "
+            "B1.5 curriculum: 0-"
+            f"{args.rvq_joint_decoder_only_steps} Decoder-only; "
+            f"{args.rvq_joint_decoder_only_steps}-"
+            f"{args.rvq_joint_rvq_adapt_end_steps} RVQ EMA + Decoder; "
+            f">={args.rvq_joint_rvq_adapt_end_steps} Decoder-only polish at "
             f"LR={args.rvq_joint_polish_decoder_lr:.3e}. "
             "Encoder and both projections remain frozen; "
             "SI-SDR starts immediately; GAN and HF-detail losses are disabled."
@@ -3750,7 +3887,7 @@ def main() -> None:
             f"warmup={args.stream_consistency_loss_warmup_steps}"
         )
         print(f"Boundary loss radius: {args.boundary_loss_radius} samples")
-    print(f"Codebook size: {codebook_size}")
+    print(f"Codebook sizes by RVQ level: {codebook_sizes}")
     print(f"RVQ quantizers: {num_quantizers}")
     print("Codec latent dimension: 64")
     print(f"RVQ lookup dimension: {rq_lookup_dim}")
@@ -3762,7 +3899,7 @@ def main() -> None:
             f"{args.rvq_projection_pca_batches} distributed batches; "
             "Encoder/Decoder/RVQ frozen; discrete lookup bypassed."
         )
-    codebook_storage = num_quantizers * codebook_size * rq_lookup_dim
+    codebook_storage = sum(codebook_sizes) * rq_lookup_dim
     projection_storage = 2 * 64 * rq_lookup_dim
     print(
         "RVQ INT8 storage: "
@@ -3775,7 +3912,9 @@ def main() -> None:
     if rvq_joint_adapt:
         print(
             "RVQ codebook training: EMA enabled only during the configured "
-            "10k-20k B1.5 phase; frozen before and after it"
+            f"{args.rvq_joint_decoder_only_steps}-"
+            f"{args.rvq_joint_rvq_adapt_end_steps} B1.5 phase; "
+            "frozen before and after it"
         )
     elif args.stage in ("stream_finetune", "stream_finetune_long"):
         print("RVQ codebook training: frozen")
@@ -3908,10 +4047,10 @@ def main() -> None:
                 "B1.5 waveform loss weight did not reach SoundStream: "
                 f"expected 7.5, got {soundstream.recon_loss_weight}"
             )
-        if soundstream.multi_spectral_recon_loss_weight != 1.0:
+        if soundstream.multi_spectral_recon_loss_weight != 0.8:
             raise RuntimeError(
                 "B1.5 Mel loss weight did not reach SoundStream: "
-                "expected 1.0, got "
+                "expected 0.8, got "
                 f"{soundstream.multi_spectral_recon_loss_weight}"
             )
 
@@ -4667,6 +4806,9 @@ def main() -> None:
                 reinitialize_rvq_from_bypass=(
                     args.reinitialize_rvq_from_bypass_checkpoint
                 ),
+                reinitialize_rvq_codebooks_from_projection=(
+                    args.reinitialize_rvq_codebooks_from_projection_checkpoint
+                ),
             )
             if args.rvq_projection_only or args.stage in (
                 "spectral_refine",
@@ -5262,7 +5404,7 @@ def main() -> None:
             if local_metrics is not None
             else torch.zeros(
                 num_quantizers,
-                codebook_size,
+                max(codebook_sizes),
                 dtype=torch.float64
             )
         ).to(trainer.device)
@@ -5278,7 +5420,10 @@ def main() -> None:
                 for index, name in enumerate(metric_names)
             }
             test_metrics.update(
-                trainer.codebook_metrics_from_counts(global_code_counts)
+                trainer.codebook_metrics_from_counts(
+                    global_code_counts,
+                    codebook_sizes,
+                )
             )
             print(
                 "Test report: "

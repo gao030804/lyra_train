@@ -399,21 +399,29 @@ def main() -> None:
     if args.bitrate is None:
         num_quantizers = model.num_quantizers
     else:
-        bits_per_index = math.log2(model.codebook_size)
         frame_rate = model.target_sample_hz / model.seq_len_multiple_of
-        quantizers_exact = args.bitrate / (frame_rate * bits_per_index)
-        num_quantizers = round(quantizers_exact)
-        if num_quantizers <= 0 or not math.isclose(
-            quantizers_exact,
-            num_quantizers,
-            rel_tol=0.,
-            abs_tol=1e-9,
-        ):
+        codebook_sizes = tuple(getattr(
+            model,
+            "codebook_sizes",
+            (model.codebook_size,) * model.num_quantizers,
+        ))
+        cumulative_bitrates = [
+            frame_rate * sum(math.log2(size) for size in codebook_sizes[:level])
+            for level in range(1, len(codebook_sizes) + 1)
+        ]
+        matching_levels = [
+            level
+            for level, bitrate in enumerate(cumulative_bitrates, start=1)
+            if math.isclose(args.bitrate, bitrate, rel_tol=0., abs_tol=1e-9)
+        ]
+        if not matching_levels:
             raise ValueError(
-                f"{args.bitrate} bps is not representable by an integer number "
-                f"of RVQ stages for frame_rate={frame_rate:g} and "
-                f"codebook_size={model.codebook_size}."
+                f"{args.bitrate} bps is not representable by an RVQ prefix "
+                f"for frame_rate={frame_rate:g} and per-level codebook sizes "
+                f"{codebook_sizes}; available rates are "
+                f"{tuple(round(rate) for rate in cumulative_bitrates)}."
             )
+        num_quantizers = matching_levels[0]
     if num_quantizers > model.num_quantizers:
         raise ValueError(
             f"{args.bitrate} bps requires {num_quantizers} RVQ quantizers, "
@@ -505,12 +513,15 @@ def main() -> None:
     print(f"Input: {args.input_audio}")
     print(f"Output: {args.output}")
     print(f"Sample rate: {sample_rate} Hz")
-    bits_per_index = math.log2(model.codebook_size)
+    codebook_sizes = tuple(getattr(
+        model,
+        "codebook_sizes",
+        (model.codebook_size,) * model.num_quantizers,
+    ))
     bitrate = (
         sample_rate
         / model.seq_len_multiple_of
-        * num_quantizers
-        * bits_per_index
+        * sum(math.log2(size) for size in codebook_sizes[:num_quantizers])
     )
     print(f"RVQ quantizers: {num_quantizers}/{model.num_quantizers}")
     print(f"Codec payload bitrate: {bitrate:.0f} bps")

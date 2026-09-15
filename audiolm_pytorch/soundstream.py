@@ -940,7 +940,7 @@ class SoundStream(Module):
         channel_mults = (2, 4, 8, 16),
         codebook_dim = 512,
         rq_lookup_dim: int | None = None,
-        codebook_size: int | None = None,
+        codebook_size: int | tuple[int, ...] | None = None,
         finite_scalar_quantizer_levels: list[int] | None = None,
         rq_num_quantizers = 8,
         rq_commitment_weight = 1.,
@@ -1028,6 +1028,12 @@ class SoundStream(Module):
         complex_stft_discr_kwargs: dict = dict()
     ):
         super().__init__()
+
+        # Normalize heterogeneous RVQ topology before autosaving the config so
+        # checkpoints carry the exact per-level allocation.  ResidualVQ accepts
+        # a tuple and constructs each level with its own K.
+        if isinstance(codebook_size, list):
+            codebook_size = tuple(int(size) for size in codebook_size)
 
         # for autosaving the config
 
@@ -1238,7 +1244,26 @@ class SoundStream(Module):
         self.use_lookup_free_quantizer = use_lookup_free_quantizer
         self.use_finite_scalar_quantizer = use_finite_scalar_quantizer
 
+        if exists(codebook_size):
+            if isinstance(codebook_size, int):
+                codebook_sizes = (int(codebook_size),) * rq_num_quantizers
+            else:
+                codebook_sizes = tuple(int(size) for size in codebook_size)
+                if len(codebook_sizes) != rq_num_quantizers:
+                    raise ValueError(
+                        'heterogeneous codebook_size must contain exactly one '
+                        f'value per RVQ level; expected {rq_num_quantizers}, '
+                        f'got {len(codebook_sizes)}'
+                    )
+            if any(size <= 1 or size & (size - 1) for size in codebook_sizes):
+                raise ValueError('every RVQ codebook size must be a power of two greater than one')
+            self.codebook_sizes = codebook_sizes
+        else:
+            self.codebook_sizes = ()
+
         if use_lookup_free_quantizer:
+            if not isinstance(codebook_size, int):
+                raise ValueError('lookup-free quantization requires a uniform integer codebook_size')
             assert exists(codebook_size) and not exists(finite_scalar_quantizer_levels), 'if use_finite_scalar_quantizer is set to False, `codebook_size` must be set (and not `finite_scalar_quantizer_levels`)'
 
             self.rq = GroupedResidualLFQ(
@@ -1252,6 +1277,7 @@ class SoundStream(Module):
             )
 
             self.codebook_size = codebook_size
+            self.codebook_sizes = (int(codebook_size),) * rq_num_quantizers
 
         elif use_finite_scalar_quantizer:
             assert not exists(codebook_size) and exists(finite_scalar_quantizer_levels), 'if use_finite_scalar_quantizer is set to True, `finite_scalar_quantizer_levels` must be set (and not `codebook_size`). the effective codebook size is the cumulative product of all the FSQ levels'
@@ -1267,6 +1293,7 @@ class SoundStream(Module):
             )
 
             self.codebook_size = self.rq.codebook_size
+            self.codebook_sizes = (int(self.codebook_size),) * rq_num_quantizers
 
         else:
             assert exists(codebook_size) and not exists(finite_scalar_quantizer_levels), 'if use_finite_scalar_quantizer is set to False, `codebook_size` must be set (and not `finite_scalar_quantizer_levels`)'
@@ -1288,7 +1315,9 @@ class SoundStream(Module):
                 **rq_kwargs
             )
 
-            self.codebook_size = codebook_size
+            # Keep the scalar attribute as the padded diagnostic width for
+            # legacy callers; codebook_sizes is the authoritative topology.
+            self.codebook_size = max(self.codebook_sizes)
 
         self.decoder_film = FiLM(codebook_dim, dim_cond = 2)
 
@@ -3225,6 +3254,43 @@ class SoundStream(Module):
             )
         return tuple(incompatible.missing_keys)
 
+    def load_state_dict_without_rvq_codebooks(
+        self,
+        state_dict,
+        *,
+        include_discriminators = True,
+    ):
+        """Load a validated Q0 checkpoint while rebuilding discrete codebooks.
+
+        Unlike load_state_dict_without_rvq, this deliberately retains the
+        trained rq_input_projection and rq_output_projection matrices.  Only
+        state owned by GroupedResidualVQ itself (the ``rq.`` namespace,
+        including embeddings and EMA buffers) is left freshly initialized.
+        """
+        retained_state = {
+            key: value
+            for key, value in state_dict.items()
+            if not self.is_rvq_codebook_state_key(key) and (
+                include_discriminators or
+                not self.is_discriminator_state_key(key)
+            )
+        }
+        incompatible = self.load_state_dict(retained_state, strict = False)
+        unexpected = list(incompatible.unexpected_keys)
+        illegal_missing = [
+            key for key in incompatible.missing_keys
+            if not self.is_rvq_codebook_state_key(key) and not (
+                not include_discriminators and
+                self.is_discriminator_state_key(key)
+            )
+        ]
+        if unexpected or illegal_missing:
+            raise RuntimeError(
+                'Q0 checkpoint migration was not strict outside RVQ codebooks: '
+                f'missing={illegal_missing}, unexpected={unexpected}'
+            )
+        return tuple(incompatible.missing_keys)
+
     @staticmethod
     def is_rvq_state_key(key):
         return key.startswith((
@@ -3232,6 +3298,10 @@ class SoundStream(Module):
             'rq_input_projection.',
             'rq_output_projection.',
         ))
+
+    @staticmethod
+    def is_rvq_codebook_state_key(key):
+        return key.startswith('rq.')
 
     def set_rvq_ema_decay(self, decay):
         """Update every residual codebook EMA decay without touching weights."""
@@ -3346,16 +3416,16 @@ class SoundStream(Module):
         stage_indices = indices[0]
         residual = encoded.float()
         losses, entropies, perplexities, top1_probabilities = [], [], [], []
-        target_entropy = math.log(min(
-            self.rq_codebook_balance_target_perplexity,
-            float(self.codebook_size),
-        ))
         temperature = max(self.rq_codebook_balance_temperature, 1e-4)
         for stage, layer in enumerate(residual_vq.layers):
             embed = layer._codebook.embed
             if embed.ndim == 3:
                 embed = embed[0]
             embed = embed.detach().float()
+            target_entropy = math.log(min(
+                self.rq_codebook_balance_target_perplexity,
+                float(embed.shape[0]),
+            ))
             if self.rq_use_cosine_sim:
                 logits = torch.einsum(
                     'bnd,kd->bnk',

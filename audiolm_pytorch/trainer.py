@@ -1432,6 +1432,7 @@ class SoundStreamTrainer(nn.Module):
             float('-inf') if self.early_stopping_mode == 'max' else float('inf')
         )
         self.best_aligned_si_sdr = float('-inf')
+        self.best_rvq_fidelity_score = float('-inf')
         self.best_raw_online_aligned_si_sdr = float('-inf')
         self.best_raw_online_clarity_score = float('-inf')
         self.best_clean_online_clarity_score = float('-inf')
@@ -1639,6 +1640,7 @@ class SoundStreamTrainer(nn.Module):
             early_stopping_best_score = self.early_stopping_best_score,
             early_stopping_metric = self.early_stopping_metric,
             best_aligned_si_sdr = self.best_aligned_si_sdr,
+            best_rvq_fidelity_score = self.best_rvq_fidelity_score,
             best_raw_online_aligned_si_sdr = self.best_raw_online_aligned_si_sdr,
             best_raw_online_clarity_score = self.best_raw_online_clarity_score,
             best_clean_online_clarity_score = self.best_clean_online_clarity_score,
@@ -1760,6 +1762,15 @@ class SoundStreamTrainer(nn.Module):
                     best_aligned_si_sdr
                 )
 
+        best_rvq_fidelity_score = self.saved_model_only_score(
+            self.results_folder / 'best_rvq_fidelity.pt'
+        )
+        if exists(best_rvq_fidelity_score):
+            self.best_rvq_fidelity_score = max(
+                self.best_rvq_fidelity_score,
+                best_rvq_fidelity_score,
+            )
+
         best_raw_online_aligned_si_sdr = self.saved_model_only_score(
             self.results_folder / 'best_raw_online_by_aligned_si_sdr.pt'
         )
@@ -1852,46 +1863,75 @@ class SoundStreamTrainer(nn.Module):
 
     def codebook_metrics(self, model, indices):
         counts = self.codebook_counts(model, indices)
-        return self.codebook_metrics_from_counts(counts)
+        return self.codebook_metrics_from_counts(
+            counts,
+            getattr(model, 'codebook_sizes', None),
+        )
 
     def codebook_counts(self, model, indices):
         flattened_indices = indices.reshape(-1, indices.shape[-1])
         all_counts = []
+        codebook_sizes = tuple(getattr(model, 'codebook_sizes', ()))
+        if not codebook_sizes:
+            codebook_sizes = (int(model.codebook_size),) * flattened_indices.shape[-1]
+        if len(codebook_sizes) != flattened_indices.shape[-1]:
+            raise RuntimeError(
+                'RVQ diagnostic topology mismatch: '
+                f'{len(codebook_sizes)} codebook sizes for '
+                f'{flattened_indices.shape[-1]} index levels'
+            )
+        padded_codebook_size = max(codebook_sizes)
 
         for quantizer_index in range(flattened_indices.shape[-1]):
             codes = flattened_indices[:, quantizer_index]
             codes = codes[codes >= 0]
+            level_size = codebook_sizes[quantizer_index]
+            if codes.numel() and int(codes.max()) >= level_size:
+                raise RuntimeError(
+                    f'RVQ q{quantizer_index:02d} emitted code '
+                    f'{int(codes.max())} outside K={level_size}'
+                )
             if codes.numel() == 0:
                 all_counts.append(torch.zeros(
-                    model.codebook_size,
+                    padded_codebook_size,
                     dtype=torch.float64,
                     device=indices.device
                 ))
                 continue
             counts = torch.bincount(
                 codes.long(),
-                minlength = model.codebook_size
+                minlength = padded_codebook_size
             ).to(dtype=torch.float64)
             all_counts.append(counts)
 
         if not all_counts:
             return torch.zeros(
                 0,
-                model.codebook_size,
+                padded_codebook_size,
                 dtype=torch.float64,
                 device=indices.device
             )
 
         return torch.stack(all_counts)
 
-    def codebook_metrics_from_counts(self, counts):
+    def codebook_metrics_from_counts(self, counts, codebook_sizes = None):
         active_ratios = []
         perplexities = []
         collapsed_quantizers = 0
         metrics = {}
 
-        for quantizer_index, quantizer_counts in enumerate(counts):
-            codebook_size = quantizer_counts.numel()
+        if codebook_sizes is None:
+            codebook_sizes = (counts.shape[-1],) * counts.shape[0]
+        codebook_sizes = tuple(int(size) for size in codebook_sizes)
+        if len(codebook_sizes) != counts.shape[0]:
+            raise RuntimeError(
+                'RVQ count topology mismatch: '
+                f'{len(codebook_sizes)} sizes for {counts.shape[0]} count rows'
+            )
+
+        for quantizer_index, padded_counts in enumerate(counts):
+            codebook_size = codebook_sizes[quantizer_index]
+            quantizer_counts = padded_counts[:codebook_size]
             if quantizer_counts.sum() <= 0:
                 active_ratio = quantizer_counts.new_tensor(0.)
                 perplexity = quantizer_counts.new_tensor(0.)
@@ -1926,6 +1966,7 @@ class SoundStreamTrainer(nn.Module):
                 float(top_probabilities[:1].sum().detach().cpu()) > 0.90
             )
             prefix = f'codebook_q{quantizer_index:02d}'
+            metrics[f'{prefix}_size'] = codebook_size
             metrics[f'{prefix}_active_codes'] = active_codes
             metrics[f'codebook_q{quantizer_index:02d}_active_ratio'] = float(
                 active_ratio.detach().cpu()
@@ -1951,7 +1992,7 @@ class SoundStreamTrainer(nn.Module):
             )
 
         metrics.update(
-            codebook_size=(counts.shape[-1] if counts.ndim == 2 else 0),
+            codebook_size=(max(codebook_sizes) if codebook_sizes else 0),
             active_code_ratio = float(
                 torch.stack(active_ratios).mean().detach().cpu()
                 if active_ratios
@@ -2224,7 +2265,10 @@ class SoundStreamTrainer(nn.Module):
             for key, value in totals.items()
         }
         averaged_metrics.update(
-            self.codebook_metrics_from_counts(total_code_counts)
+            self.codebook_metrics_from_counts(
+                total_code_counts,
+                getattr(model, 'codebook_sizes', None),
+            )
         )
         return averaged_metrics
 
@@ -3019,7 +3063,10 @@ class SoundStreamTrainer(nn.Module):
             for key, value in totals.items()
         }
         averaged_metrics.update(
-            self.codebook_metrics_from_counts(total_code_counts)
+            self.codebook_metrics_from_counts(
+                total_code_counts,
+                getattr(model, 'codebook_sizes', None),
+            )
         )
         averaged_metrics['reconstruction_score'] = averaged_metrics['score']
         hf_score_penalty = 0.
@@ -3660,7 +3707,10 @@ class SoundStreamTrainer(nn.Module):
             for key, value in totals.items()
         }
         averaged_metrics.update(
-            self.codebook_metrics_from_counts(total_code_counts)
+            self.codebook_metrics_from_counts(
+                total_code_counts,
+                getattr(model, 'codebook_sizes', None),
+            )
         )
         averaged_metrics['reconstruction_score'] = averaged_metrics['score']
         hf_low_score_penalty = 0.
@@ -4128,6 +4178,10 @@ class SoundStreamTrainer(nn.Module):
             self.discr_optim.load_state_dict(pkg['discr_optim'])
         self.best_valid_score = pkg.get('best_valid_score', float('inf'))
         self.best_aligned_si_sdr = pkg.get('best_aligned_si_sdr', float('-inf'))
+        self.best_rvq_fidelity_score = pkg.get(
+            'best_rvq_fidelity_score',
+            float('-inf'),
+        )
         self.best_raw_online_aligned_si_sdr = pkg.get(
             'best_raw_online_aligned_si_sdr',
             float('-inf')
@@ -5244,10 +5298,16 @@ class SoundStreamTrainer(nn.Module):
                 )
 
             flat_indices = indices.reshape(-1, indices.shape[-1]).long()
+            codebook_sizes = tuple(getattr(
+                self.unwrapped_soundstream,
+                'codebook_sizes',
+                (self.unwrapped_soundstream.codebook_size,) * flat_indices.shape[-1],
+            ))
+            padded_codebook_size = max(codebook_sizes)
             batch_counts = torch.stack([
                 torch.bincount(
                     flat_indices[:, quantizer][flat_indices[:, quantizer] >= 0],
-                    minlength = self.unwrapped_soundstream.codebook_size,
+                    minlength = padded_codebook_size,
                 )
                 for quantizer in range(flat_indices.shape[-1])
             ])
@@ -5259,15 +5319,14 @@ class SoundStreamTrainer(nn.Module):
         valid_tokens = int(
             self.accelerator.reduce(valid_tensor, reduction='sum').item()
         )
-        probabilities = counts.float() / counts.sum(dim=-1, keepdim=True).clamp_min(1.)
-        perplexities = torch.exp(
-            -(probabilities * probabilities.clamp_min(1e-12).log()).sum(dim=-1)
+        codebook_metrics = self.codebook_metrics_from_counts(
+            counts,
+            codebook_sizes,
         )
-        active_ratios = (counts > 0).float().mean(dim=-1)
         logs = {
             'rvq_calibration_tokens': valid_tokens,
-            'rvq_calibration_active_ratio_mean': float(active_ratios.mean().cpu()),
-            'rvq_calibration_perplexity_mean': float(perplexities.mean().cpu()),
+            'rvq_calibration_active_ratio_mean': codebook_metrics['active_code_ratio'],
+            'rvq_calibration_perplexity_mean': codebook_metrics['codebook_perplexity'],
         }
 
         if self.is_main and (
@@ -5607,7 +5666,16 @@ class SoundStreamTrainer(nn.Module):
         )
         rvq_ema_decay = None
         if self.rvq_warm_in_steps > 0 and hasattr(model, 'set_rvq_ema_decay'):
-            rvq_ema_decay = 0.95 if steps < 5000 else (0.98 if steps < 15000 else 0.99)
+            # B1.5 coarse levels must move conservatively.  The previous 0.98
+            # EMA improved NMSE but also let q0 drift quickly; 0.995 preserves
+            # the K-means geometry while assignments and Decoder adapt.
+            rvq_ema_decay = (
+                0.995
+                if rvq_joint_curriculum and rvq_joint_phase == 'rvq_ema'
+                else 0.95 if steps < 5000
+                else 0.98 if steps < 15000
+                else 0.99
+            )
             model.set_rvq_ema_decay(rvq_ema_decay)
         if exists(self.decoder_lr_after_step):
             lr_step, decoder_lr = self.decoder_lr_after_step
@@ -7135,6 +7203,17 @@ class SoundStreamTrainer(nn.Module):
                 exists(si_sdr_selected_model) and
                 si_sdr_selected_metrics['aligned_si_sdr'] > self.best_aligned_si_sdr
             )
+            rvq_fidelity_score = (
+                float(online_score.get('aligned_si_sdr', float('-inf'))) -
+                2. * float(online_score.get('rvq_latent_nmse_lookup', float('inf'))) -
+                float(online_score.get('rvq_latent_nmse_64d', float('inf')))
+            )
+            rvq_fidelity_improved = (
+                rvq_joint_curriculum and
+                rvq_joint_phase == 'rvq_ema' and
+                isfinite(rvq_fidelity_score) and
+                rvq_fidelity_score > self.best_rvq_fidelity_score
+            )
             frame_leakage_improved = (
                 self.frame_leakage_checkpoint and
                 exists(leakage_selected_model) and
@@ -7232,6 +7311,24 @@ class SoundStreamTrainer(nn.Module):
                     f"{steps}: saving best_rvq_projection.pt "
                     f"(aligned_si_sdr={self.best_rvq_projection_aligned_si_sdr:.3f}; "
                     "Q0 clean gate passed)"
+                )
+
+            if rvq_fidelity_improved:
+                self.best_rvq_fidelity_score = rvq_fidelity_score
+                self.save_model_only(
+                    self.results_folder / 'best_rvq_fidelity.pt',
+                    online_model,
+                    score = self.best_rvq_fidelity_score,
+                    step = steps,
+                    weight_source = 'online_rvq_ema_fidelity',
+                )
+                self.save(str(self.results_folder / 'latest.pt'))
+                self.print(
+                    f"{steps}: saving best_rvq_fidelity.pt "
+                    f"(score={self.best_rvq_fidelity_score:.4f}, "
+                    f"aligned_si_sdr={online_score.get('aligned_si_sdr', float('-inf')):.3f}, "
+                    f"lookup_nmse={online_score.get('rvq_latent_nmse_lookup', float('inf')):.4f}, "
+                    f"latent64_nmse={online_score.get('rvq_latent_nmse_64d', float('inf')):.4f})"
                 )
 
             if formant_improved:

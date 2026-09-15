@@ -255,6 +255,8 @@ def test_stateful_stages_have_distinct_pre_and_post_rvq_roles():
     assert "FINAL_STATE_STEPS <= 0" in launcher
     assert "post-RVQ state alignment is mandatory" in launcher
     assert "--reinitialize-rvq-from-bypass-checkpoint" in launcher
+    assert "--reinitialize-rvq-codebooks-from-projection-checkpoint" in launcher
+    assert 'PRETRAINED_Q0_CKPT="${PRETRAINED_Q0_CKPT:-}"' in launcher
     assert '--stage stream_finetune --results-dir "$PRE_RVQ_STATE_DIR"' in launcher
     assert '--stage stream_finetune_long --results-dir "$FINAL_STATE_DIR"' in launcher
     assert launcher.index('A2.5 pre-RVQ stateful alignment') < launcher.index(
@@ -273,16 +275,20 @@ def test_pipeline_inserts_joint_rvq_adaptation_and_shortens_b2():
     )
     assert 'RVQ_DISTANCE="${RVQ_DISTANCE:-euclidean}"' in launcher
     assert '--rq-distance "$RVQ_DISTANCE"' in launcher
-    assert 'RVQ_CALIBRATION_STEPS="${RVQ_CALIBRATION_STEPS:-500}"' in launcher
+    assert 'RVQ_CALIBRATION_STEPS="${RVQ_CALIBRATION_STEPS:-1000}"' in launcher
     assert 'RVQ_CALIBRATION_KMEANS_BATCHES="${RVQ_CALIBRATION_KMEANS_BATCHES:-100}"' in launcher
     assert '--rvq-calibration-kmeans-batches "$RVQ_CALIBRATION_KMEANS_BATCHES"' in launcher
-    assert 'RVQ_JOINT_ADAPT_STEPS="${RVQ_JOINT_ADAPT_STEPS:-30000}"' in launcher
+    assert 'RVQ_JOINT_ADAPT_STEPS="${RVQ_JOINT_ADAPT_STEPS:-60000}"' in launcher
     assert 'RVQ_NUM_QUANTIZERS="${RVQ_NUM_QUANTIZERS:-9}"' in launcher
-    assert 'RVQ_CODEBOOK_SIZE="${RVQ_CODEBOOK_SIZE:-128}"' in launcher
+    assert 'RVQ_CODEBOOK_SIZES="${RVQ_CODEBOOK_SIZES:-256,128,128,128,128,128,128,128,128}"' in launcher
     assert '--num-quantizers "$RVQ_NUM_QUANTIZERS"' in launcher
-    assert '--codebook-size "$RVQ_CODEBOOK_SIZE"' in launcher
-    assert 'RVQ_STAGE2_STEPS="${RVQ_STAGE2_STEPS:-50000}"' in launcher
-    assert 'B1.5 joint STE quantization adaptation' in launcher
+    assert '--codebook-sizes "${RVQ_CODEBOOK_SIZE_VALUES[@]}"' in launcher
+    assert 'RVQ_STAGE2_STEPS="${RVQ_STAGE2_STEPS:-75000}"' in launcher
+    assert 'B1.5a joint STE quantization adaptation' in launcher
+    assert 'B1.5b Decoder polish from best RVQ fidelity' in launcher
+    assert 'START_PHASE=rvq_polish requires PRETRAINED_RVQ_B15_FIDELITY_CKPT' in launcher
+    assert '--early-stopping-min-steps "$RVQ_B15_POLISH_STEPS"' in launcher
+    assert 'best_rvq_fidelity.pt' in launcher
     assert '--rvq-warm-in-steps 5000' in launcher
     assert '--rvq-codebook-balance-loss-weight 0.002' not in launcher
     assert '--rvq-quantization-error-loss-weight 0.10' not in launcher
@@ -298,7 +304,7 @@ def test_pipeline_inserts_joint_rvq_adaptation_and_shortens_b2():
     assert '--stage2-encoder-unfreeze-step -1' in launcher
     assert '--early-stopping-patience 20 --stage2-quality-hard-stop' in launcher
     assert launcher.index('B1 checkpoint=') < launcher.index(
-        'B1.5 joint STE quantization adaptation'
+        'B1.5a joint STE quantization adaptation'
     ) < launcher.index('B2 RVQ GAN decoder adaptation')
 
     source = (ROOT / "train_soundstream.py").read_text(encoding="utf-8")
@@ -487,10 +493,12 @@ class GeneratorOnlyModel:
     )
     num_quantizers = 9
     codebook_size = 128
+    codebook_sizes = (128,) * 9
     codebook_dim = 64
     rq_lookup_dim = 32
     rq_use_cosine_sim = False
     loaded_without_rvq = False
+    loaded_without_rvq_codebooks = False
 
     def load_generator_state_dict(self, state_dict):
         assert state_dict == {}
@@ -500,6 +508,14 @@ class GeneratorOnlyModel:
         assert state_dict == {}
         assert include_discriminators is False
         self.loaded_without_rvq = True
+        return ("rq.rvqs.0.layers.0._codebook.embed",)
+
+    def load_state_dict_without_rvq_codebooks(
+        self, state_dict, *, include_discriminators
+    ):
+        assert state_dict == {}
+        assert include_discriminators is False
+        self.loaded_without_rvq_codebooks = True
         return ("rq.rvqs.0.layers.0._codebook.embed",)
 
 
@@ -549,8 +565,77 @@ def test_current_rvq_profile_is_9_by_128_by_32_lookup_and_3p15kbps():
     )
 
 
+def test_nonuniform_9_level_profile_is_exactly_3p2kbps():
+    codebook_sizes = (256,) + (128,) * 8
+
+    assert train_soundstream.calculate_bitrate(
+        sample_rate=16000,
+        strides=(2, 4, 5, 8),
+        codebook_size=codebook_sizes,
+    ) == 3200
+    assert sum(codebook_sizes) * 32 + 2 * 64 * 32 == 45056
+
+
+def test_soundstream_builds_each_nonuniform_rvq_level_with_its_own_size():
+    from audiolm_pytorch.soundstream import SoundStream
+
+    model = SoundStream(
+        channels=4,
+        channel_mults=(2, 2),
+        strides=(2, 2),
+        codebook_dim=8,
+        rq_lookup_dim=4,
+        codebook_size=(16, 8),
+        rq_num_quantizers=2,
+        rq_quantize_dropout=False,
+        discr_multi_scales=(1,),
+        generator_waveform_discr_loss_weights=(1.,),
+        use_local_attn=False,
+        pad_mode="constant",
+    )
+
+    layers = model.rq.rvqs[0].layers
+    assert model.codebook_sizes == (16, 8)
+    assert model.codebook_size == 16
+    assert [layer._codebook.embed.shape[-2] for layer in layers] == [16, 8]
+
+
 def save_generator_checkpoint(path, config):
     torch.save({"config": pickle.dumps(config), "model": {}}, path)
+
+
+def test_q0_reuse_keeps_projections_and_allows_new_codebook_sizes(tmp_path):
+    checkpoint = tmp_path / "q0.pt"
+    save_generator_checkpoint(
+        checkpoint,
+        matching_config(rq_projection_only=True),
+    )
+    model = GeneratorOnlyModel()
+    model.codebook_sizes = (256,) + (128,) * 8
+    model.codebook_size = 256
+
+    config = load_model_weights_only(
+        model,
+        checkpoint,
+        generator_only=True,
+        reinitialize_rvq_codebooks_from_projection=True,
+    )
+
+    assert config["rq_projection_only"] is True
+    assert model.loaded_without_rvq_codebooks is True
+
+
+def test_q0_reuse_rejects_checkpoint_not_marked_projection_only(tmp_path):
+    checkpoint = tmp_path / "not-q0.pt"
+    save_generator_checkpoint(checkpoint, matching_config())
+
+    with pytest.raises(ValueError, match="rq_projection_only=True"):
+        load_model_weights_only(
+            GeneratorOnlyModel(),
+            checkpoint,
+            generator_only=True,
+            reinitialize_rvq_codebooks_from_projection=True,
+        )
 
 
 def test_generator_checkpoint_accepts_matching_current_topology(tmp_path):
