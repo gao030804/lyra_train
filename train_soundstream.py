@@ -653,6 +653,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rvq-joint-decoder-only-steps", type=int, default=10000)
     parser.add_argument("--rvq-joint-rvq-adapt-end-steps", type=int, default=20000)
     parser.add_argument(
+        "--rvq-plateau-freeze-start-steps",
+        type=int,
+        default=30000,
+        help="Earliest B1.5 step at which lookup-NMSE plateau checks may freeze RVQ EMA.",
+    )
+    parser.add_argument(
+        "--rvq-plateau-freeze-patience",
+        type=int,
+        default=7,
+        help="Validation checks without lookup-NMSE improvement before freezing RVQ EMA; 0 disables.",
+    )
+    parser.add_argument(
+        "--rvq-plateau-freeze-min-delta",
+        type=float,
+        default=0.001,
+        help="Minimum lookup-NMSE reduction that resets the B1.5 RVQ plateau counter.",
+    )
+    parser.add_argument(
         "--rvq-joint-polish-decoder-lr",
         type=float,
         default=1.5e-6,
@@ -2613,6 +2631,12 @@ def main() -> None:
         raise ValueError("RVQ joint phase boundaries cannot be negative")
     if tuple(sorted(rvq_joint_boundaries)) != rvq_joint_boundaries:
         raise ValueError("RVQ joint phase boundaries must be monotonic")
+    if args.rvq_plateau_freeze_start_steps < 0:
+        raise ValueError("--rvq-plateau-freeze-start-steps cannot be negative")
+    if args.rvq_plateau_freeze_patience < 0:
+        raise ValueError("--rvq-plateau-freeze-patience cannot be negative")
+    if args.rvq_plateau_freeze_min_delta < 0.:
+        raise ValueError("--rvq-plateau-freeze-min-delta cannot be negative")
     if (
         args.reinitialize_rvq_from_bypass_checkpoint and
         not (args.rvq_calibration_only or args.rvq_projection_only)
@@ -3372,7 +3396,7 @@ def main() -> None:
         else 1.0
     )
     multi_spectral_recon_loss_weight = (
-        0.8 if rvq_joint_adapt
+        0.6 if rvq_joint_adapt
         else 1.1 if args.stage == "recon_pretrain"
         else 0.8 if args.stage == "spectral_refine"
         else 0.7
@@ -3430,7 +3454,10 @@ def main() -> None:
             "B1.5 curriculum: 0-"
             f"{args.rvq_joint_decoder_only_steps} Decoder-only; "
             f"{args.rvq_joint_decoder_only_steps}-"
-            f"{args.rvq_joint_rvq_adapt_end_steps} RVQ EMA + Decoder; "
+            f"{args.rvq_joint_rvq_adapt_end_steps} RVQ EMA + Decoder "
+            f"(plateau freeze from step {args.rvq_plateau_freeze_start_steps}, "
+            f"patience={args.rvq_plateau_freeze_patience}, "
+            f"lookup-NMSE min_delta={args.rvq_plateau_freeze_min_delta:g}); "
             f">={args.rvq_joint_rvq_adapt_end_steps} Decoder-only polish at "
             f"LR={args.rvq_joint_polish_decoder_lr:.3e}. "
             "Encoder and both projections remain frozen; "
@@ -4047,10 +4074,10 @@ def main() -> None:
                 "B1.5 waveform loss weight did not reach SoundStream: "
                 f"expected 7.5, got {soundstream.recon_loss_weight}"
             )
-        if soundstream.multi_spectral_recon_loss_weight != 0.8:
+        if soundstream.multi_spectral_recon_loss_weight != 0.6:
             raise RuntimeError(
                 "B1.5 Mel loss weight did not reach SoundStream: "
-                "expected 0.8, got "
+                "expected 0.6, got "
                 f"{soundstream.multi_spectral_recon_loss_weight}"
             )
 
@@ -4131,6 +4158,9 @@ def main() -> None:
         projection_lr=None,
         rvq_joint_decoder_only_steps=args.rvq_joint_decoder_only_steps,
         rvq_joint_rvq_adapt_end_steps=args.rvq_joint_rvq_adapt_end_steps,
+        rvq_plateau_freeze_start_steps=args.rvq_plateau_freeze_start_steps,
+        rvq_plateau_freeze_patience=args.rvq_plateau_freeze_patience,
+        rvq_plateau_freeze_min_delta=args.rvq_plateau_freeze_min_delta,
         lr=stage_defaults["lr"],
         encoder_lr=(
             None

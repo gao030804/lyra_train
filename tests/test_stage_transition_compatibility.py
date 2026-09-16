@@ -280,15 +280,31 @@ def test_pipeline_inserts_joint_rvq_adaptation_and_shortens_b2():
     assert '--rvq-calibration-kmeans-batches "$RVQ_CALIBRATION_KMEANS_BATCHES"' in launcher
     assert 'RVQ_JOINT_ADAPT_STEPS="${RVQ_JOINT_ADAPT_STEPS:-60000}"' in launcher
     assert 'RVQ_NUM_QUANTIZERS="${RVQ_NUM_QUANTIZERS:-9}"' in launcher
-    assert 'RVQ_CODEBOOK_SIZES="${RVQ_CODEBOOK_SIZES:-256,128,128,128,128,128,128,128,128}"' in launcher
+    assert 'RVQ_CODEBOOK_SIZES="256,128,128,128,128,128,128,128,128"' in launcher
     assert '--num-quantizers "$RVQ_NUM_QUANTIZERS"' in launcher
     assert '--codebook-sizes "${RVQ_CODEBOOK_SIZE_VALUES[@]}"' in launcher
     assert 'RVQ_STAGE2_STEPS="${RVQ_STAGE2_STEPS:-75000}"' in launcher
     assert 'B1.5a joint STE quantization adaptation' in launcher
     assert 'B1.5b Decoder polish from best RVQ fidelity' in launcher
     assert 'START_PHASE=rvq_polish requires PRETRAINED_RVQ_B15_FIDELITY_CKPT' in launcher
-    assert '--early-stopping-min-steps "$RVQ_B15_POLISH_STEPS"' in launcher
+    assert 'START_PHASE=rvq_stage2 requires PRETRAINED_RVQ_B15_CKPT' in launcher
+    assert 'PRETRAINED_RVQ_B15_CKPT="${PRETRAINED_RVQ_B15_CKPT:-}"' in launcher
+    assert 'Skipping A1 through B1.5; entering B2 from validation-selected checkpoint' in launcher
+    assert 'STOP_AFTER_PHASE must be empty with START_PHASE=rvq_stage2' in launcher
+    assert 'if [[ "$START_PHASE" == "rvq_polish" ]]; then\n    echo "Reused B1.5a fidelity checkpoint=$RVQ_B15_FIDELITY_CKPT"' in launcher
+    assert '"alignment_negative_fraction"' in launcher
+    assert '"q00_validation_eligible"' in launcher
+    assert '"q01_validation_eligible"' in launcher
+    assert '"rvq_validation_eligible"' in launcher
+    assert '--early-stopping-min-steps "$RVQ_B15_POLISH_EARLY_STOPPING_MIN_STEPS"' in launcher
+    assert 'RVQ_B15_POLISH_EARLY_STOPPING_MIN_STEPS="${RVQ_B15_POLISH_EARLY_STOPPING_MIN_STEPS:-3000}"' in launcher
     assert 'best_rvq_fidelity.pt' in launcher
+    assert 'RVQ_TOPOLOGY_PROFILE="${RVQ_TOPOLOGY_PROFILE:-baseline_256_128x8}"' in launcher
+    assert 'RVQ_CODEBOOK_SIZES="256,256,128,128,128,128,128,128,64"' in launcher
+    assert 'STOP_AFTER_PHASE" == "rvq_b15"' in launcher
+    assert '--rvq-plateau-freeze-start-steps "$RVQ_PLATEAU_FREEZE_START_STEPS"' in launcher
+    assert '--rvq-plateau-freeze-patience "$RVQ_PLATEAU_FREEZE_PATIENCE"' in launcher
+    assert '--rvq-plateau-freeze-min-delta "$RVQ_PLATEAU_FREEZE_MIN_DELTA"' in launcher
     assert '--rvq-warm-in-steps 5000' in launcher
     assert '--rvq-codebook-balance-loss-weight 0.002' not in launcher
     assert '--rvq-quantization-error-loss-weight 0.10' not in launcher
@@ -299,8 +315,8 @@ def test_pipeline_inserts_joint_rvq_adaptation_and_shortens_b2():
     assert '--rvq-joint-polish-decoder-lr "$RVQ_B15_POLISH_DECODER_LR"' in launcher
     assert '--rvq-joint-projection-adapt-end-steps' not in launcher
     assert '--rvq-joint-recenter-end-steps' not in launcher
-    assert 'RVQ_B15_MAX_LOOKUP_NMSE="${RVQ_B15_MAX_LOOKUP_NMSE:-0.07}"' in launcher
-    assert 'RVQ_B15_MAX_LATENT64_NMSE="${RVQ_B15_MAX_LATENT64_NMSE:-0.10}"' in launcher
+    assert 'RVQ_B15_MAX_LOOKUP_NMSE="${RVQ_B15_MAX_LOOKUP_NMSE:-0.085}"' in launcher
+    assert 'RVQ_B15_MAX_LATENT64_NMSE="${RVQ_B15_MAX_LATENT64_NMSE:-0.115}"' in launcher
     assert '--stage2-encoder-unfreeze-step -1' in launcher
     assert '--early-stopping-patience 20 --stage2-quality-hard-stop' in launcher
     assert launcher.index('B1 checkpoint=') < launcher.index(
@@ -324,6 +340,9 @@ def test_pipeline_inserts_joint_rvq_adaptation_and_shortens_b2():
     assert "rvq_joint_phase = 'decoder_only'" in trainer_source
     assert "rvq_joint_phase = 'rvq_ema'" in trainer_source
     assert "rvq_joint_phase = 'decoder_polish'" in trainer_source
+    assert "'rvq_plateau_polish'" in trainer_source
+    assert "RVQ lookup-NMSE plateau reached; freezing" in trainer_source
+    assert "online_score.get('clean_validation_eligible', 0.) >= 0.5" in trainer_source
     assert "rvq_joint_phase = 'win_decoder'" not in trainer_source
     assert "rvq_joint_phase = 'rvq_recenter'" not in trainer_source
     assert 'train_output_projection = False' in trainer_source

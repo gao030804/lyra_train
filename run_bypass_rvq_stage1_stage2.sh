@@ -27,7 +27,24 @@ SEED="${SEED:-42}"
 RVQ_LOOKUP_DIM="${RVQ_LOOKUP_DIM:-32}"
 RVQ_DISTANCE="${RVQ_DISTANCE:-euclidean}"
 RVQ_NUM_QUANTIZERS="${RVQ_NUM_QUANTIZERS:-9}"
-RVQ_CODEBOOK_SIZES="${RVQ_CODEBOOK_SIZES:-256,128,128,128,128,128,128,128,128}"
+RVQ_TOPOLOGY_PROFILE="${RVQ_TOPOLOGY_PROFILE:-baseline_256_128x8}"
+if [[ -n "${RVQ_CODEBOOK_SIZES:-}" ]]; then
+  RVQ_TOPOLOGY_PROFILE="custom"
+else
+  case "$RVQ_TOPOLOGY_PROFILE" in
+    baseline_256_128x8)
+      RVQ_CODEBOOK_SIZES="256,128,128,128,128,128,128,128,128"
+      ;;
+    frontload_q1)
+      RVQ_CODEBOOK_SIZES="256,256,128,128,128,128,128,128,64"
+      ;;
+    *)
+      echo "ERROR: RVQ_TOPOLOGY_PROFILE must be baseline_256_128x8 or frontload_q1." >&2
+      echo "Use RVQ_CODEBOOK_SIZES for an explicit custom profile." >&2
+      exit 2
+      ;;
+  esac
+fi
 BYPASS_STAGE1_STEPS="${BYPASS_STAGE1_STEPS:-150000}"
 BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS="${BYPASS_STAGE1_EARLY_STOPPING_MIN_STEPS:-60000}"
 BYPASS_FORMANT_REFINE_STEPS="${BYPASS_FORMANT_REFINE_STEPS:-20000}"
@@ -47,14 +64,18 @@ RVQ_PROJECTION_EARLY_STOPPING_PATIENCE="${RVQ_PROJECTION_EARLY_STOPPING_PATIENCE
 RVQ_CALIBRATION_STEPS="${RVQ_CALIBRATION_STEPS:-1000}"
 RVQ_CALIBRATION_KMEANS_BATCHES="${RVQ_CALIBRATION_KMEANS_BATCHES:-100}"
 RVQ_B1_MIN_ALIGNED_SI_SDR="${RVQ_B1_MIN_ALIGNED_SI_SDR:-3.0}"
-RVQ_B1_MIN_QUANTIZATION_GAP_DB="${RVQ_B1_MIN_QUANTIZATION_GAP_DB:--2.0}"
-RVQ_B15_MAX_LOOKUP_NMSE="${RVQ_B15_MAX_LOOKUP_NMSE:-0.07}"
-RVQ_B15_MAX_LATENT64_NMSE="${RVQ_B15_MAX_LATENT64_NMSE:-0.10}"
+RVQ_B1_MIN_QUANTIZATION_GAP_DB="${RVQ_B1_MIN_QUANTIZATION_GAP_DB:--2.5}"
+RVQ_B15_MAX_LOOKUP_NMSE="${RVQ_B15_MAX_LOOKUP_NMSE:-0.085}"
+RVQ_B15_MAX_LATENT64_NMSE="${RVQ_B15_MAX_LATENT64_NMSE:-0.115}"
 RVQ_B15_MIN_ALIGNED_SI_SDR="${RVQ_B15_MIN_ALIGNED_SI_SDR:-1.8}"
 RVQ_JOINT_ADAPT_STEPS="${RVQ_JOINT_ADAPT_STEPS:-60000}"
 RVQ_B15_DECODER_ONLY_STEPS="${RVQ_B15_DECODER_ONLY_STEPS:-10000}"
 RVQ_B15_RVQ_ADAPT_END_STEPS="${RVQ_B15_RVQ_ADAPT_END_STEPS:-45000}"
 RVQ_B15_POLISH_DECODER_LR="${RVQ_B15_POLISH_DECODER_LR:-1.5e-6}"
+RVQ_B15_POLISH_EARLY_STOPPING_MIN_STEPS="${RVQ_B15_POLISH_EARLY_STOPPING_MIN_STEPS:-3000}"
+RVQ_PLATEAU_FREEZE_START_STEPS="${RVQ_PLATEAU_FREEZE_START_STEPS:-30000}"
+RVQ_PLATEAU_FREEZE_PATIENCE="${RVQ_PLATEAU_FREEZE_PATIENCE:-7}"
+RVQ_PLATEAU_FREEZE_MIN_DELTA="${RVQ_PLATEAU_FREEZE_MIN_DELTA:-0.001}"
 RVQ_STAGE2_STEPS="${RVQ_STAGE2_STEPS:-75000}"
 ENABLE_PRE_RVQ_STATE_FT="${ENABLE_PRE_RVQ_STATE_FT:-0}"
 PRE_RVQ_STATE_STEPS="${PRE_RVQ_STATE_STEPS:-20000}"
@@ -66,6 +87,7 @@ BYPASS_STAGE1_CKPT="${BYPASS_STAGE1_CKPT:-}"
 BYPASS_STAGE2_CKPT="${BYPASS_STAGE2_CKPT:-}"
 PRETRAINED_Q0_CKPT="${PRETRAINED_Q0_CKPT:-}"
 PRETRAINED_RVQ_B15_FIDELITY_CKPT="${PRETRAINED_RVQ_B15_FIDELITY_CKPT:-}"
+PRETRAINED_RVQ_B15_CKPT="${PRETRAINED_RVQ_B15_CKPT:-}"
 PRECEDING_CONTEXT_SECONDS="${PRECEDING_CONTEXT_SECONDS:-0.5}"
 
 case "$RVQ_LOOKUP_DIM" in
@@ -128,6 +150,9 @@ if (( RVQ_B15_POLISH_STEPS <= 0 )); then
   echo "ERROR: B1.5 total steps must leave a positive Decoder-polish segment." >&2
   exit 2
 fi
+if (( RVQ_B15_POLISH_EARLY_STOPPING_MIN_STEPS > RVQ_B15_POLISH_STEPS )); then
+  RVQ_B15_POLISH_EARLY_STOPPING_MIN_STEPS="$RVQ_B15_POLISH_STEPS"
+fi
 if (( RVQ_STAGE2_STEPS <= 0 )); then
   echo "ERROR: RVQ_STAGE2_STEPS must be positive." >&2
   exit 2
@@ -136,16 +161,18 @@ fi
 if [[ "$START_PHASE" != "bypass_stage1" && \
       "$START_PHASE" != "bypass_formant_refine" && \
       "$START_PHASE" != "rvq_stage1" && \
-      "$START_PHASE" != "rvq_polish" ]]; then
-  echo "ERROR: START_PHASE must be bypass_stage1, bypass_formant_refine, rvq_stage1, or rvq_polish." >&2
+      "$START_PHASE" != "rvq_polish" && \
+      "$START_PHASE" != "rvq_stage2" ]]; then
+  echo "ERROR: START_PHASE must be bypass_stage1, bypass_formant_refine, rvq_stage1, rvq_polish, or rvq_stage2." >&2
   exit 2
 fi
 
 if [[ -n "$STOP_AFTER_PHASE" && \
       "$STOP_AFTER_PHASE" != "bypass_stage1" && \
       "$STOP_AFTER_PHASE" != "bypass_formant_refine" && \
-      "$STOP_AFTER_PHASE" != "bypass_stage2" ]]; then
-  echo "ERROR: STOP_AFTER_PHASE must be empty, bypass_stage1, bypass_formant_refine, or bypass_stage2." >&2
+      "$STOP_AFTER_PHASE" != "bypass_stage2" && \
+      "$STOP_AFTER_PHASE" != "rvq_b15" ]]; then
+  echo "ERROR: STOP_AFTER_PHASE must be empty, bypass_stage1, bypass_formant_refine, bypass_stage2, or rvq_b15." >&2
   exit 2
 fi
 
@@ -155,7 +182,22 @@ if [[ "$RESUME_BYPASS_STAGE1" != "0" && "$RESUME_BYPASS_STAGE1" != "1" ]]; then
 fi
 
 B1_Q0_REUSE_FLAGS=()
-if [[ "$START_PHASE" == "rvq_polish" ]]; then
+if [[ "$START_PHASE" == "rvq_stage2" ]]; then
+  if [[ "$RESUME_BYPASS_STAGE1" != "0" ]]; then
+    echo "ERROR: RESUME_BYPASS_STAGE1 is not valid with START_PHASE=rvq_stage2." >&2
+    exit 2
+  fi
+  if [[ -n "$STOP_AFTER_PHASE" ]]; then
+    echo "ERROR: STOP_AFTER_PHASE must be empty with START_PHASE=rvq_stage2; B2 must be followed by the mandatory final state fine-tune." >&2
+    exit 2
+  fi
+  if [[ -z "$PRETRAINED_RVQ_B15_CKPT" || ! -f "$PRETRAINED_RVQ_B15_CKPT" ]]; then
+    echo "ERROR: START_PHASE=rvq_stage2 requires PRETRAINED_RVQ_B15_CKPT." >&2
+    echo "received: ${PRETRAINED_RVQ_B15_CKPT:-<empty>}" >&2
+    exit 2
+  fi
+  RVQ_B15_CKPT="$(readlink -f "$PRETRAINED_RVQ_B15_CKPT")"
+elif [[ "$START_PHASE" == "rvq_polish" ]]; then
   if [[ "$RESUME_BYPASS_STAGE1" != "0" ]]; then
     echo "ERROR: RESUME_BYPASS_STAGE1 is not valid with START_PHASE=rvq_polish." >&2
     exit 2
@@ -222,6 +264,9 @@ if [[ -n "$PRETRAINED_Q0_CKPT" ]]; then
 fi
 if [[ "$START_PHASE" == "rvq_polish" ]]; then
   CHECK_DIRS=("$RVQ_B15_POLISH_DIR" "$RVQ_S2_DIR" "$FINAL_STATE_DIR")
+fi
+if [[ "$START_PHASE" == "rvq_stage2" ]]; then
+  CHECK_DIRS=("$RVQ_S2_DIR" "$FINAL_STATE_DIR")
 fi
 if [[ "$START_PHASE" == "bypass_stage1" || \
       "$START_PHASE" == "bypass_formant_refine" ]]; then
@@ -333,7 +378,9 @@ GAN_LOSSES=(
   --no-stage2-quality-hard-stop --gan-grad-diagnostics-every 500 --loss-grad-diagnostics-every 1000
 )
 
-if [[ "$START_PHASE" != "rvq_stage1" && "$START_PHASE" != "rvq_polish" ]]; then
+if [[ "$START_PHASE" != "rvq_stage1" && \
+      "$START_PHASE" != "rvq_polish" && \
+      "$START_PHASE" != "rvq_stage2" ]]; then
   if [[ "$START_PHASE" == "bypass_stage1" ]]; then
   # A1: RVQ is absent from both the forward signal and checkpoint selection gate.
   run_stage "A1 bypass-RVQ reconstruction" 29511 "$PWD/logs/bypass-recon-$BASE.log" "$A1_APPEND_LOG" \
@@ -424,7 +471,9 @@ if [[ "$START_PHASE" != "rvq_stage1" && "$START_PHASE" != "rvq_polish" ]]; then
     echo "A2.5 pre-RVQ stateful alignment skipped; run the consistency check before B1."
   fi
 else
-  if [[ "$START_PHASE" == "rvq_polish" ]]; then
+  if [[ "$START_PHASE" == "rvq_stage2" ]]; then
+    echo "Skipping A1 through B1.5; entering B2 from validation-selected checkpoint: $RVQ_B15_CKPT"
+  elif [[ "$START_PHASE" == "rvq_polish" ]]; then
     echo "Skipping Q0, B1, and B1.5a; resuming from validation-selected RVQ fidelity checkpoint: $RVQ_B15_FIDELITY_CKPT"
   elif [[ -n "$PRETRAINED_Q0_CKPT" ]]; then
     echo "Skipping bypass and Q0 training; reusing validated Q0 checkpoint: $RVQ_PROJECTION_CKPT"
@@ -435,13 +484,14 @@ else
 fi
 
 echo "State policy: pre-RVQ A2.5 enabled=$ENABLE_PRE_RVQ_STATE_FT; post-RVQ state fine-tune is mandatory (${FINAL_STATE_STEPS} steps)."
+echo "RVQ topology profile=$RVQ_TOPOLOGY_PROFILE; sizes=$RVQ_CODEBOOK_SIZES; lookup=${RVQ_LOOKUP_DIM}D; distance=$RVQ_DISTANCE"
 
 # Q0: estimate the frozen Encoder latent rank across all workers, initialize
 # Win/Wout from centered PCA, and train only the two projections through the
 # frozen Decoder. A validation-selected Q0 may be reused explicitly; B1 then
 # retains Win/Wout and rebuilds only rq.* codebooks and EMA state.  A failed
 # B1.5b may resume explicitly from B1.5a's validation-selected fidelity model.
-if [[ "$START_PHASE" != "rvq_polish" ]]; then
+if [[ "$START_PHASE" != "rvq_polish" && "$START_PHASE" != "rvq_stage2" ]]; then
 if [[ -z "$PRETRAINED_Q0_CKPT" ]]; then
 run_stage "Q0 PCA projection-only pretraining" 29519 \
   "$PWD/logs/rvq-projection-$BASE.log" 0 \
@@ -502,10 +552,13 @@ run_stage "B1.5a joint STE quantization adaptation" 29518 \
   --rvq-joint-adapt --rvq-warm-in-steps 5000 \
   --rvq-joint-decoder-only-steps "$RVQ_B15_DECODER_ONLY_STEPS" \
   --rvq-joint-rvq-adapt-end-steps "$RVQ_B15_RVQ_ADAPT_END_STEPS" \
+  --rvq-plateau-freeze-start-steps "$RVQ_PLATEAU_FREEZE_START_STEPS" \
+  --rvq-plateau-freeze-patience "$RVQ_PLATEAU_FREEZE_PATIENCE" \
+  --rvq-plateau-freeze-min-delta "$RVQ_PLATEAU_FREEZE_MIN_DELTA" \
   --rvq-joint-polish-decoder-lr "$RVQ_B15_POLISH_DECODER_LR" \
   --rvq-continuous-teacher-loss-weight 0.20 \
   --rvq-joint-latent64-teacher-loss-weight 0 \
-  --si-sdr-loss-weight 0.10 --si-sdr-loss-start-steps 0 \
+  --si-sdr-loss-weight 0.12 --si-sdr-loss-start-steps 0 \
   --si-sdr-loss-warmup-steps 2500 \
   --stft-recon-loss-weight 0.05 --stft-recon-loss-start-steps 0 \
   --stft-recon-loss-warmup-steps 2500 \
@@ -525,27 +578,31 @@ test -f "$RVQ_B15_FIDELITY_CKPT" || {
 }
 echo "B1.5a fidelity checkpoint=$RVQ_B15_FIDELITY_CKPT"
 else
-  echo "Reused B1.5a fidelity checkpoint=$RVQ_B15_FIDELITY_CKPT"
+  if [[ "$START_PHASE" == "rvq_polish" ]]; then
+    echo "Reused B1.5a fidelity checkpoint=$RVQ_B15_FIDELITY_CKPT"
+  fi
 fi
 
 # B1.5b: restore the best EMA-phase fidelity point, freeze RVQ for every
 # polish step, and use the reduced Decoder LR.  Together B1.5a+B1.5b consume
 # RVQ_JOINT_ADAPT_STEPS (default 45k + 15k = 60k).
+if [[ "$START_PHASE" != "rvq_stage2" ]]; then
 run_stage "B1.5b Decoder polish from best RVQ fidelity" 29519 \
   "$PWD/logs/rvq-decoder-polish-$BASE.log" 0 \
   --stage gan_pretrain --results-dir "$RVQ_B15_POLISH_DIR" \
   --init-checkpoint "$RVQ_B15_FIDELITY_CKPT" \
   --num-train-steps "$RVQ_B15_POLISH_STEPS" \
-  --early-stopping-min-steps "$RVQ_B15_POLISH_STEPS" \
+  --early-stopping-min-steps "$RVQ_B15_POLISH_EARLY_STOPPING_MIN_STEPS" \
   "${RECON_LOSSES[@]}" "${COMMON[@]}" \
   --generator-lr "$RVQ_B15_POLISH_DECODER_LR" \
   --rvq-joint-adapt --rvq-warm-in-steps 0 \
   --rvq-joint-decoder-only-steps "$RVQ_B15_POLISH_STEPS" \
   --rvq-joint-rvq-adapt-end-steps "$RVQ_B15_POLISH_STEPS" \
+  --rvq-plateau-freeze-patience 0 \
   --rvq-joint-polish-decoder-lr "$RVQ_B15_POLISH_DECODER_LR" \
   --rvq-continuous-teacher-loss-weight 0.20 \
   --rvq-joint-latent64-teacher-loss-weight 0 \
-  --si-sdr-loss-weight 0.10 --si-sdr-loss-start-steps 0 \
+  --si-sdr-loss-weight 0.12 --si-sdr-loss-start-steps 0 \
   --si-sdr-loss-warmup-steps 2500 \
   --stft-recon-loss-weight 0.05 --stft-recon-loss-start-steps 0 \
   --stft-recon-loss-warmup-steps 2500 \
@@ -564,13 +621,21 @@ test -f "$RVQ_B15_CKPT" || {
   exit 2
 }
 echo "B1.5 final checkpoint=$RVQ_B15_CKPT"
+else
+  echo "Reused validation-selected B1.5 checkpoint=$RVQ_B15_CKPT"
+fi
 
 # The fidelity gate belongs after joint representation learning, not after the
 # short B1 codebook bootstrap. GAN must not be used to hide RVQ distortion.
+B15_VALIDATION_RESULTS_DIR="$RVQ_B15_POLISH_DIR"
 B15_VALIDATION_REPORT="$RVQ_B15_POLISH_DIR/b15_fixed_validation.tsv"
+if [[ "$START_PHASE" == "rvq_stage2" ]]; then
+  B15_VALIDATION_RESULTS_DIR="$(dirname "$RVQ_B15_CKPT")"
+  B15_VALIDATION_REPORT="$PWD/logs/rvq-stage2-handoff-$BASE.tsv"
+fi
 run_stage "B1.5 fixed quantization-fidelity validation" 29520 \
   "$PWD/logs/rvq-joint-adapt-validation-$BASE.log" 0 \
-  --stage gan_pretrain --results-dir "$RVQ_B15_POLISH_DIR" \
+  --stage gan_pretrain --results-dir "$B15_VALIDATION_RESULTS_DIR" \
   --validation-only --validation-checkpoint "$RVQ_B15_CKPT" \
   --validation-report-file "$B15_VALIDATION_REPORT" \
   --no-bypass-rvq-during-training "${COMMON[@]}" --no-resume
@@ -579,7 +644,8 @@ python - \
   "$RVQ_B1_MIN_ALIGNED_SI_SDR" \
   "$RVQ_B1_MIN_QUANTIZATION_GAP_DB" \
   "$RVQ_B15_MAX_LOOKUP_NMSE" \
-  "$RVQ_B15_MAX_LATENT64_NMSE" <<'PY'
+  "$RVQ_B15_MAX_LATENT64_NMSE" \
+  "0.05" <<'PY'
 import sys
 from pathlib import Path
 
@@ -588,6 +654,7 @@ minimum_si_sdr = float(sys.argv[2])
 minimum_gap = float(sys.argv[3])
 maximum_lookup_nmse = float(sys.argv[4])
 maximum_latent64_nmse = float(sys.argv[5])
+maximum_negative_fraction = float(sys.argv[6])
 metrics = {}
 with report.open("r", encoding="utf-8") as handle:
     header = handle.readline().rstrip("\n").split("\t")
@@ -603,6 +670,10 @@ required = (
     "quantization_gap_db",
     "rvq_latent_nmse_lookup",
     "rvq_latent_nmse_64d",
+    "alignment_negative_fraction",
+    "q00_validation_eligible",
+    "q01_validation_eligible",
+    "rvq_validation_eligible",
 )
 missing = [name for name in required if name not in metrics]
 if missing:
@@ -613,12 +684,14 @@ projection = metrics["projection_only_aligned_si_sdr"]
 gap = metrics["quantization_gap_db"]
 lookup_nmse = metrics["rvq_latent_nmse_lookup"]
 latent64_nmse = metrics["rvq_latent_nmse_64d"]
+negative_fraction = metrics["alignment_negative_fraction"]
 print(
     "RVQ handoff: "
     f"projection_aligned_si_sdr={projection:.3f} dB, "
     f"quantized_aligned_si_sdr={aligned:.3f} dB, "
     f"gap={gap:+.3f} dB, lookup_nmse={lookup_nmse:.4f}, "
-    f"latent64_nmse={latent64_nmse:.4f}"
+    f"latent64_nmse={latent64_nmse:.4f}, "
+    f"negative_fraction={negative_fraction:.4f}"
 )
 failures = []
 if aligned < minimum_si_sdr:
@@ -631,10 +704,28 @@ if latent64_nmse > maximum_latent64_nmse:
     failures.append(
         f"latent64_nmse {latent64_nmse:.4f} > {maximum_latent64_nmse:.4f}"
     )
+if negative_fraction > maximum_negative_fraction:
+    failures.append(
+        f"negative_fraction {negative_fraction:.4f} > "
+        f"{maximum_negative_fraction:.4f}"
+    )
+for name in (
+    "q00_validation_eligible",
+    "q01_validation_eligible",
+    "rvq_validation_eligible",
+):
+    if metrics[name] < 0.5:
+        failures.append(f"{name} is false")
 if failures:
     raise SystemExit("RVQ handoff FAILED: " + "; ".join(failures))
 print("RVQ handoff PASSED")
 PY
+
+if [[ "$STOP_AFTER_PHASE" == "rvq_b15" ]]; then
+  echo "Stopping after clean-gated B1.5 validation as requested."
+  echo "B1.5 comparison checkpoint=$RVQ_B15_CKPT"
+  exit 0
+fi
 
 # B2: Encoder and RVQ are frozen for the whole shortened GAN phase;
 # Decoder adapts to quantization error while GAN discriminators are trained.

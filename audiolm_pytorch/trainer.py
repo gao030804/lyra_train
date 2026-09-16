@@ -445,6 +445,9 @@ class SoundStreamTrainer(nn.Module):
         projection_lr: float | None = None,
         rvq_joint_decoder_only_steps: int = 10000,
         rvq_joint_rvq_adapt_end_steps: int = 20000,
+        rvq_plateau_freeze_start_steps: int = 30000,
+        rvq_plateau_freeze_patience: int = 7,
+        rvq_plateau_freeze_min_delta: float = 0.001,
         freeze_codebook_after_step: int | None = None,
         freeze_codebook_before_step: int | None = None,
         freeze_codebook_during_training: bool = False,
@@ -759,6 +762,9 @@ class SoundStreamTrainer(nn.Module):
             "projection_learning_rate": projection_lr,
             "rvq_joint_decoder_only_steps": rvq_joint_decoder_only_steps,
             "rvq_joint_rvq_adapt_end_steps": rvq_joint_rvq_adapt_end_steps,
+            "rvq_plateau_freeze_start_steps": rvq_plateau_freeze_start_steps,
+            "rvq_plateau_freeze_patience": rvq_plateau_freeze_patience,
+            "rvq_plateau_freeze_min_delta": rvq_plateau_freeze_min_delta,
             "decoder_lr_after_step": decoder_lr_after_step,
             "rq_excluded_from_generator_optimizer": exclude_rq_from_generator_optimizer,
             "encoder_excluded_from_generator_optimizer": (
@@ -1514,6 +1520,13 @@ class SoundStreamTrainer(nn.Module):
         self.projection_lr = projection_lr
         self.rvq_joint_decoder_only_steps = int(rvq_joint_decoder_only_steps)
         self.rvq_joint_rvq_adapt_end_steps = int(rvq_joint_rvq_adapt_end_steps)
+        self.rvq_plateau_freeze_start_steps = int(rvq_plateau_freeze_start_steps)
+        self.rvq_plateau_freeze_patience = int(rvq_plateau_freeze_patience)
+        self.rvq_plateau_freeze_min_delta = float(rvq_plateau_freeze_min_delta)
+        self.rvq_plateau_best_lookup_nmse = float('inf')
+        self.rvq_plateau_bad_evals = 0
+        self.rvq_plateau_frozen = False
+        self.rvq_plateau_freeze_step = None
         rvq_joint_boundaries = (
             self.rvq_joint_decoder_only_steps,
             self.rvq_joint_rvq_adapt_end_steps,
@@ -1522,6 +1535,12 @@ class SoundStreamTrainer(nn.Module):
             raise ValueError('RVQ joint phase boundaries must be non-negative')
         if tuple(sorted(rvq_joint_boundaries)) != rvq_joint_boundaries:
             raise ValueError('RVQ joint phase boundaries must be monotonic')
+        if self.rvq_plateau_freeze_start_steps < 0:
+            raise ValueError('RVQ plateau freeze start step must be non-negative')
+        if self.rvq_plateau_freeze_patience < 0:
+            raise ValueError('RVQ plateau freeze patience must be non-negative')
+        if self.rvq_plateau_freeze_min_delta < 0.:
+            raise ValueError('RVQ plateau freeze minimum delta must be non-negative')
         assert not exists(freeze_codebook_after_step) or freeze_codebook_after_step >= 0
         assert not exists(freeze_codebook_before_step) or freeze_codebook_before_step >= 0
         assert not exists(freeze_encoder_before_step) or freeze_encoder_before_step >= 0
@@ -1641,6 +1660,10 @@ class SoundStreamTrainer(nn.Module):
             early_stopping_metric = self.early_stopping_metric,
             best_aligned_si_sdr = self.best_aligned_si_sdr,
             best_rvq_fidelity_score = self.best_rvq_fidelity_score,
+            rvq_plateau_best_lookup_nmse = self.rvq_plateau_best_lookup_nmse,
+            rvq_plateau_bad_evals = self.rvq_plateau_bad_evals,
+            rvq_plateau_frozen = self.rvq_plateau_frozen,
+            rvq_plateau_freeze_step = self.rvq_plateau_freeze_step,
             best_raw_online_aligned_si_sdr = self.best_raw_online_aligned_si_sdr,
             best_raw_online_clarity_score = self.best_raw_online_clarity_score,
             best_clean_online_clarity_score = self.best_clean_online_clarity_score,
@@ -4182,6 +4205,13 @@ class SoundStreamTrainer(nn.Module):
             'best_rvq_fidelity_score',
             float('-inf'),
         )
+        self.rvq_plateau_best_lookup_nmse = pkg.get(
+            'rvq_plateau_best_lookup_nmse',
+            float('inf'),
+        )
+        self.rvq_plateau_bad_evals = pkg.get('rvq_plateau_bad_evals', 0)
+        self.rvq_plateau_frozen = pkg.get('rvq_plateau_frozen', False)
+        self.rvq_plateau_freeze_step = pkg.get('rvq_plateau_freeze_step')
         self.best_raw_online_aligned_si_sdr = pkg.get(
             'best_raw_online_aligned_si_sdr',
             float('-inf')
@@ -5625,11 +5655,19 @@ class SoundStreamTrainer(nn.Module):
             if steps < self.rvq_joint_decoder_only_steps:
                 rvq_joint_phase = 'decoder_only'
                 freeze_codebook = True
-            elif steps < self.rvq_joint_rvq_adapt_end_steps:
+            elif (
+                steps < self.rvq_joint_rvq_adapt_end_steps and
+                not self.rvq_plateau_frozen
+            ):
                 rvq_joint_phase = 'rvq_ema'
                 freeze_codebook = False
             else:
-                rvq_joint_phase = 'decoder_polish'
+                rvq_joint_phase = (
+                    'rvq_plateau_polish'
+                    if self.rvq_plateau_frozen and
+                    steps < self.rvq_joint_rvq_adapt_end_steps
+                    else 'decoder_polish'
+                )
                 freeze_codebook = True
             train_input_projection = False
             train_output_projection = False
@@ -5665,7 +5703,11 @@ class SoundStreamTrainer(nn.Module):
             if self.rvq_warm_in_steps > 0 else 1.
         )
         rvq_ema_decay = None
-        if self.rvq_warm_in_steps > 0 and hasattr(model, 'set_rvq_ema_decay'):
+        if (
+            self.rvq_warm_in_steps > 0 and
+            not freeze_codebook and
+            hasattr(model, 'set_rvq_ema_decay')
+        ):
             # B1.5 coarse levels must move conservatively.  The previous 0.98
             # EMA improved NMSE but also let q0 drift quickly; 0.995 preserves
             # the K-means geometry while assignments and Decoder adapt.
@@ -5679,7 +5721,9 @@ class SoundStreamTrainer(nn.Module):
             model.set_rvq_ema_decay(rvq_ema_decay)
         if exists(self.decoder_lr_after_step):
             lr_step, decoder_lr = self.decoder_lr_after_step
-            if steps >= lr_step:
+            if steps >= lr_step or (
+                rvq_joint_curriculum and self.rvq_plateau_frozen
+            ):
                 for group in self.optim.optimizer.param_groups:
                     if group.get('group_name') == 'decoder':
                         group['lr'] = decoder_lr
@@ -6503,13 +6547,91 @@ class SoundStreamTrainer(nn.Module):
             not (steps % self.best_eval_every)
         )
         plateau_metric_tensor = None
+        rvq_plateau_state_tensor = None
         early_stopping_triggered_by_patience = False
         if should_eval_best and exists(self.plateau_scheduler):
             plateau_metric_tensor = torch.zeros(3, device = device)
+        if (
+            should_eval_best and
+            rvq_joint_curriculum and
+            self.rvq_plateau_freeze_patience > 0
+        ):
+            rvq_plateau_state_tensor = torch.tensor(
+                [
+                    self.rvq_plateau_best_lookup_nmse,
+                    float(self.rvq_plateau_bad_evals),
+                    float(self.rvq_plateau_frozen),
+                    float(
+                        self.rvq_plateau_freeze_step
+                        if exists(self.rvq_plateau_freeze_step) else -1
+                    ),
+                ],
+                device = device,
+            )
 
         if self.is_main and should_eval_best:
             online_model = self.unwrapped_soundstream
             online_score = self.evaluate_fixed_validation_score(online_model)
+            if (
+                rvq_joint_phase == 'rvq_ema' and
+                steps >= self.rvq_plateau_freeze_start_steps and
+                self.rvq_plateau_freeze_patience > 0
+            ):
+                lookup_nmse = float(
+                    online_score.get('rvq_latent_nmse_lookup', float('inf'))
+                )
+                plateau_improved = (
+                    isfinite(lookup_nmse) and
+                    lookup_nmse < (
+                        self.rvq_plateau_best_lookup_nmse -
+                        self.rvq_plateau_freeze_min_delta
+                    )
+                )
+                if plateau_improved:
+                    self.rvq_plateau_best_lookup_nmse = lookup_nmse
+                    self.rvq_plateau_bad_evals = 0
+                elif isfinite(lookup_nmse):
+                    self.rvq_plateau_bad_evals += 1
+
+                if (
+                    self.rvq_plateau_bad_evals >=
+                    self.rvq_plateau_freeze_patience
+                ):
+                    self.rvq_plateau_frozen = True
+                    self.rvq_plateau_freeze_step = steps
+                    self.save(str(self.results_folder / 'latest.pt'))
+                    self.print(
+                        f"{steps}: RVQ lookup-NMSE plateau reached; freezing "
+                        "all RVQ EMA updates and switching to Decoder polish "
+                        f"(best={self.rvq_plateau_best_lookup_nmse:.6f}, "
+                        f"current={lookup_nmse:.6f}, checks="
+                        f"{self.rvq_plateau_bad_evals}/"
+                        f"{self.rvq_plateau_freeze_patience}, min_delta="
+                        f"{self.rvq_plateau_freeze_min_delta:.6f})"
+                    )
+                else:
+                    status = 'improved' if plateau_improved else 'plateau'
+                    self.print(
+                        f"{steps}: RVQ lookup-NMSE plateau monitor "
+                        f"{status} (best={self.rvq_plateau_best_lookup_nmse:.6f}, "
+                        f"current={lookup_nmse:.6f}, checks="
+                        f"{self.rvq_plateau_bad_evals}/"
+                        f"{self.rvq_plateau_freeze_patience})"
+                    )
+
+            if exists(rvq_plateau_state_tensor):
+                rvq_plateau_state_tensor.copy_(torch.tensor(
+                    [
+                        self.rvq_plateau_best_lookup_nmse,
+                        float(self.rvq_plateau_bad_evals),
+                        float(self.rvq_plateau_frozen),
+                        float(
+                            self.rvq_plateau_freeze_step
+                            if exists(self.rvq_plateau_freeze_step) else -1
+                        ),
+                    ],
+                    device = device,
+                ))
             ema_model = self.ema_soundstream.ema_model if self.use_ema else None
             ema_score = (
                 self.evaluate_fixed_validation_score(ema_model.to(device))
@@ -7205,12 +7327,18 @@ class SoundStreamTrainer(nn.Module):
             )
             rvq_fidelity_score = (
                 float(online_score.get('aligned_si_sdr', float('-inf'))) -
+                0.25 * abs(min(
+                    float(online_score.get('quantization_gap_db', float('-inf'))),
+                    0.,
+                )) -
                 2. * float(online_score.get('rvq_latent_nmse_lookup', float('inf'))) -
                 float(online_score.get('rvq_latent_nmse_64d', float('inf')))
             )
             rvq_fidelity_improved = (
                 rvq_joint_curriculum and
                 rvq_joint_phase == 'rvq_ema' and
+                online_score.get('clean_validation_eligible', 0.) >= 0.5 and
+                online_score.get('rvq_validation_eligible', 0.) >= 0.5 and
                 isfinite(rvq_fidelity_score) and
                 rvq_fidelity_score > self.best_rvq_fidelity_score
             )
@@ -7327,8 +7455,10 @@ class SoundStreamTrainer(nn.Module):
                     f"{steps}: saving best_rvq_fidelity.pt "
                     f"(score={self.best_rvq_fidelity_score:.4f}, "
                     f"aligned_si_sdr={online_score.get('aligned_si_sdr', float('-inf')):.3f}, "
+                    f"gap_db={online_score.get('quantization_gap_db', float('-inf')):+.3f}, "
                     f"lookup_nmse={online_score.get('rvq_latent_nmse_lookup', float('inf')):.4f}, "
-                    f"latent64_nmse={online_score.get('rvq_latent_nmse_64d', float('inf')):.4f})"
+                    f"latent64_nmse={online_score.get('rvq_latent_nmse_64d', float('inf')):.4f}; "
+                    "clean gate and RVQ health passed)"
                 )
 
             if formant_improved:
@@ -7542,6 +7672,25 @@ class SoundStreamTrainer(nn.Module):
                     f"{steps}: early stopping is inactive until "
                     f"step {self.early_stopping_start_steps}"
                 )
+
+        if exists(rvq_plateau_state_tensor):
+            if (
+                self.is_distributed and
+                torch.distributed.is_available() and
+                torch.distributed.is_initialized()
+            ):
+                torch.distributed.broadcast(rvq_plateau_state_tensor, src = 0)
+            self.rvq_plateau_best_lookup_nmse = float(
+                rvq_plateau_state_tensor[0].item()
+            )
+            self.rvq_plateau_bad_evals = int(
+                round(float(rvq_plateau_state_tensor[1].item()))
+            )
+            self.rvq_plateau_frozen = bool(
+                rvq_plateau_state_tensor[2].item() >= 0.5
+            )
+            freeze_step = int(round(float(rvq_plateau_state_tensor[3].item())))
+            self.rvq_plateau_freeze_step = freeze_step if freeze_step >= 0 else None
 
         if should_eval_best and exists(self.plateau_scheduler):
             if (
