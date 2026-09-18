@@ -77,6 +77,7 @@ RVQ_PLATEAU_FREEZE_START_STEPS="${RVQ_PLATEAU_FREEZE_START_STEPS:-30000}"
 RVQ_PLATEAU_FREEZE_PATIENCE="${RVQ_PLATEAU_FREEZE_PATIENCE:-7}"
 RVQ_PLATEAU_FREEZE_MIN_DELTA="${RVQ_PLATEAU_FREEZE_MIN_DELTA:-0.001}"
 RVQ_STAGE2_STEPS="${RVQ_STAGE2_STEPS:-75000}"
+RVQ_STAGE2_BEST_EVAL_BATCHES="${RVQ_STAGE2_BEST_EVAL_BATCHES:-80}"
 ENABLE_PRE_RVQ_STATE_FT="${ENABLE_PRE_RVQ_STATE_FT:-0}"
 PRE_RVQ_STATE_STEPS="${PRE_RVQ_STATE_STEPS:-20000}"
 FINAL_STATE_STEPS="${FINAL_STATE_STEPS:-10000}"
@@ -339,6 +340,23 @@ pick_b15_best() {
   return 1
 }
 
+pick_b2_best() {
+  local dir="$1" candidate
+  # A reconstruction-only phase-A checkpoint is not a trained B2 artifact.
+  # Require a quality-gated checkpoint that has received meaningful GAN ramp.
+  for candidate in \
+    best_full_gan_formant_balanced.pt \
+    best_full_gan_balanced.pt \
+    best_gan_balanced.pt; do
+    if [ -f "$dir/$candidate" ]; then
+      printf '%s\n' "$dir/$candidate"
+      return 0
+    fi
+  done
+  echo "ERROR: no quality-gated GAN checkpoint in $dir" >&2
+  return 1
+}
+
 COMMON=(
   --audio-dir "$AUDIO_DIR" --batch-size 4 --grad-accum-every 1
   --num-quantizers "$RVQ_NUM_QUANTIZERS"
@@ -362,20 +380,29 @@ RECON_LOSSES=(
 )
 
 GAN_LOSSES=(
-  --generator-lr 5e-7 --gan-adversarial-max 2e-4 --gan-feature-max 1.0
-  --si-sdr-loss-weight 0.05 --spectral-envelope-loss-weight 0.02 --formant-peak-loss-weight 0
-  --stft-recon-loss-weight 0.02 --voiced-highband-loss-weight 0 --noise-floor-loss-weight 0.03
-  --voiced-hf-retention-loss-weight 0.01 --upper-highband-loss-weight 0
+  --generator-lr 2.5e-7 --gan-adversarial-max 1e-4 --gan-feature-max 0.20
+  --waveform-recon-loss-weight 7.5 --multi-spectral-recon-loss-weight 0.6
+  --si-sdr-loss-weight 0.12 --spectral-envelope-loss-weight 0 --formant-peak-loss-weight 0
+  --stft-recon-loss-weight 0.05 --stft-recon-loss-start-steps 0 --stft-recon-loss-warmup-steps 2500
+  --voiced-highband-loss-weight 0 --noise-floor-loss-weight 0.03
+  --voiced-hf-retention-loss-weight 0 --upper-highband-loss-weight 0
   --active-spectral-detail-loss-weight 0
-  --waveform-discr-lrs 5e-7 5e-7 2.5e-7 --stft-discr-lr 2.5e-7
+  --waveform-discr-lrs 2e-7 1e-7 1e-7 --stft-discr-lr 1e-7
   --waveform-discr-update-every 2 4 4 --waveform-discr-loss-weights 1.0 0.25 0.25
   --stft-discr-update-every 4 --stft-discr-loss-weight 0.5
-  --stage2-generator-freeze-steps 2000 --stage2-generator-hold-steps 5000 --stage2-generator-hold-lr 1e-7
+  --stage2-generator-freeze-steps 0 --stage2-generator-hold-steps 0 --stage2-generator-hold-lr 1e-7
+  --stage2-gan-start-step 3000 --stage2-gan-ramp-steps 40000
+  --stage2-discriminator-start-steps 3000
   --stage2-encoder-unfreeze-step 10000 --stage2-encoder-trainable-from-block 3 --stage2-encoder-lr 1e-7
-  --stage2-phase2-start-step 2000 --stage2-phase3-start-step 10000
-  --stage2-phase2-generator-lr 5e-7 --stage2-phase3-generator-lr 5e-7
+  --stage2-phase2-start-step 3000 --stage2-phase3-start-step 15000
+  --stage2-phase2-generator-lr 2e-7 --stage2-phase3-generator-lr 2.5e-7
+  --stage2-phase3-gan-adversarial-max 1e-4 --stage2-phase3-gan-feature-max 0.20
+  --stage2-teacher-retention-weight 0.10 --stage2-decoder-lr-multipliers 0.2 0.5 1.0
+  --stage2-adaptive-gan --stage2-max-gan-grad-ratio 0.05
+  --stage2-best-checkpoint-min-step 3000 --stage2-quality-gate-start-steps 3000
+  --stage2-quality-retention-patience 4 --stage2-max-aligned-si-sdr-drop 0.15
   --early-stopping-min-steps 150000
-  --no-stage2-quality-hard-stop --gan-grad-diagnostics-every 500 --loss-grad-diagnostics-every 1000
+  --stage2-quality-hard-stop --gan-grad-diagnostics-every 500 --loss-grad-diagnostics-every 1000
 )
 
 if [[ "$START_PHASE" != "rvq_stage1" && \
@@ -463,7 +490,7 @@ if [[ "$START_PHASE" != "rvq_stage1" && \
       --num-train-steps "$PRE_RVQ_STATE_STEPS" \
       --bypass-rvq-during-training \
       --preceding-context-seconds "$PRECEDING_CONTEXT_SECONDS" \
-      --stream-frame-size 320 --stream-tbptt-frames 20 \
+      --stream-tbptt-frames 20 \
       "${COMMON[@]}" --no-resume
     BYPASS_S2_CKPT="$(pick_best "$PRE_RVQ_STATE_DIR")"
     echo "A2.5 state-aligned checkpoint=$BYPASS_S2_CKPT"
@@ -735,9 +762,11 @@ run_stage "B2 RVQ GAN decoder adaptation" 29514 "$PWD/logs/rvq-gan-$BASE.log" 0 
   --no-bypass-rvq-during-training "${GAN_LOSSES[@]}" \
   --stage2-encoder-unfreeze-step -1 --early-stopping-min-steps 10000 \
   --early-stopping-patience 20 --stage2-quality-hard-stop \
+  --no-stage2-plateau-lr \
+  --best-eval-batches "$RVQ_STAGE2_BEST_EVAL_BATCHES" \
   --clean-gate-max-negative-fraction 0.05 \
   "${COMMON[@]}" --no-resume
-RVQ_S2_CKPT="$(pick_best "$RVQ_S2_DIR")"
+RVQ_S2_CKPT="$(pick_b2_best "$RVQ_S2_DIR")"
 echo "B2 checkpoint=$RVQ_S2_CKPT"
 
 # Final state alignment is mandatory for the deployable path. The
@@ -751,7 +780,7 @@ run_stage "Final post-RVQ stateful Decoder fine-tune" 29517 \
   --num-train-steps "$FINAL_STATE_STEPS" \
   --no-bypass-rvq-during-training \
   --preceding-context-seconds "$PRECEDING_CONTEXT_SECONDS" \
-  --stream-frame-size 320 --stream-tbptt-frames 20 \
+  --stream-tbptt-frames 20 \
   "${COMMON[@]}" --no-resume
 FINAL_STATE_CKPT="$(pick_best "$FINAL_STATE_DIR")"
 echo "Final stateful checkpoint=$FINAL_STATE_CKPT"

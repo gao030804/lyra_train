@@ -183,16 +183,21 @@ STAGE_DEFAULTS = {
         preemph_loss_weight=0., noise_floor_loss_weight=0.03,
         transient_loss_warmup_steps=0,
         wave_mse_loss_weight=0.10, energy_loss_weight=0.,
-        spectral_envelope_loss_weight=0.02,
+        # B2 inherits the B1.5 waveform / Mel / SI-SDR / MR-STFT fidelity
+        # objective.  Keep the formant-envelope auxiliary loss disabled here;
+        # the frozen B1.5 teacher already retains that behavior without adding
+        # a competing spectral target during GAN adaptation.
+        spectral_envelope_loss_weight=0.,
         spectral_envelope_loss_start_steps=0,
         spectral_envelope_loss_warmup_steps=0,
         formant_peak_loss_weight=0.,
         formant_peak_loss_start_steps=0,
         formant_peak_loss_warmup_steps=5_000,
-        # Let GAN branches choose high-band texture; retain only the one-sided
-        # energy-deficit guard so excess HF is never rewarded.
+        # B2 begins from an already polished RVQ decoder.  Preserve the B1.5
+        # reconstruction objective and let the staged GAN add texture only
+        # after the reconstruction-only retention phase.
         voiced_highband_loss_weight=0.,
-        voiced_hf_retention_loss_weight=0.01,
+        voiced_hf_retention_loss_weight=0.,
         voiced_highband_loss_start_steps=0,
         voiced_highband_loss_warmup_steps=0,
         # Nyquist-edge and broad active-spectrum objectives are disabled in
@@ -206,26 +211,23 @@ STAGE_DEFAULTS = {
         active_spectral_detail_loss_weight=0.,
         active_spectral_detail_loss_start_steps=0,
         active_spectral_detail_loss_warmup_steps=0,
-        stft_recon_loss_weight=0.02,
-        stft_recon_loss_start_steps=2_000,
-        stft_recon_loss_warmup_steps=8_000,
+        stft_recon_loss_weight=0.05,
+        stft_recon_loss_start_steps=0,
+        stft_recon_loss_warmup_steps=2_500,
         # Keep frame-leakage validation diagnostics, but disable the training
         # loss because the latest diagnostic run increased ac_320.
         frame_phase_loss_weight=0.,
         frame_phase_loss_start_steps=0,
         frame_phase_loss_warmup_steps=0,
-        # SI-SDR protects intelligibility and waveform alignment, while the
-        # slightly lower Stage-2 weight avoids over-constraining perceptual
-        # high-frequency detail learned by the GAN.
-        si_sdr_loss_weight=0.05,
+        si_sdr_loss_weight=0.12,
         si_sdr_loss_start_steps=0,
         si_sdr_loss_warmup_steps=0,
-        # Warm up fresh discriminators against a frozen Stage-1 generator for
-        # 2k steps. Then introduce GAN gradients slowly over 15k steps. Favor
-        # feature matching over a stronger adversarial term: it is the safer
-        # route to natural detail without raising the learned noise floor.
-        gan_start=2_000, gan_ramp=15_000,
-        gan_adversarial_max=2e-4, gan_feature_max=1.00,
+        # Phase A is reconstruction-only. Phase B introduces only the full-
+        # resolution waveform discriminator, and the full discriminator set
+        # is enabled later by the trainer.  The long ramp and reduced feature
+        # matching weight prevent GAN gradients from displacing B1.5.
+        gan_start=3_000, gan_ramp=40_000,
+        gan_adversarial_max=1e-4, gan_feature_max=0.20,
     ),
     "stream_finetune": dict(
         steps=20_000, batch_size=4, segment_seconds=4.,
@@ -403,6 +405,18 @@ def parse_args() -> argparse.Namespace:
             "Optional maximum discriminator feature-matching weight override. "
             "The stage default is retained when omitted."
         ),
+    )
+    parser.add_argument(
+        "--waveform-recon-loss-weight",
+        type=float,
+        default=None,
+        help="Optional waveform L1 reconstruction-weight override.",
+    )
+    parser.add_argument(
+        "--multi-spectral-recon-loss-weight",
+        type=float,
+        default=None,
+        help="Optional multi-spectral Mel reconstruction-weight override.",
     )
     parser.add_argument(
         "--batch-size",
@@ -1514,34 +1528,49 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage2-generator-freeze-steps",
         type=int,
-        default=2_000,
+        default=0,
         help=(
-            "For gan_pretrain, keep all generator parameters unchanged while "
-            "fresh discriminators warm up; defaults to 2000 steps."
+            "Optional initial full-generator freeze. The safe B2 schedule "
+            "defaults to zero and trains Decoder reconstruction from step 0."
         ),
+    )
+    parser.add_argument(
+        "--stage2-gan-start-step",
+        type=int,
+        default=None,
+        help=(
+            "First step that exposes the Stage-2 generator to GAN/feature "
+            "losses; earlier Decoder updates are reconstruction-only."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-gan-ramp-steps",
+        type=int,
+        default=None,
+        help="Number of steps used to ramp Stage-2 GAN and feature weights.",
     )
     parser.add_argument(
         "--stage2-phase2-start-step",
         type=int,
-        default=2_000,
-        help="Absolute Stage-2 step where Decoder training starts.",
+        default=3_000,
+        help="Absolute Stage-2 step where the single-scale safe GAN starts.",
     )
     parser.add_argument(
         "--stage2-phase3-start-step",
         type=int,
-        default=10_000,
-        help="Absolute Stage-2 step where the selected Encoder tail is released.",
+        default=15_000,
+        help="Absolute Stage-2 step where all discriminator branches are enabled.",
     )
     parser.add_argument(
         "--stage2-phase2-generator-lr",
         type=float,
-        default=5e-7,
+        default=2e-7,
         help="Decoder LR from phase2-start through the start of phase 3.",
     )
     parser.add_argument(
         "--stage2-phase3-generator-lr",
         type=float,
-        default=5e-7,
+        default=2.5e-7,
         help="Decoder LR from phase3-start through the end of Stage 2.",
     )
     parser.add_argument(
@@ -1553,8 +1582,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage2-phase3-gan-feature-max",
         type=float,
-        default=1.0,
-        help="Feature-matching weight used from the 100k refinement phase onward.",
+        default=0.20,
+        help="Feature-matching ceiling used in the full perceptual phase.",
+    )
+    parser.add_argument(
+        "--stage2-teacher-retention-weight",
+        type=float,
+        default=0.,
+        help=(
+            "Frozen B1.5 Decoder waveform/log-STFT retention-loss weight "
+            "during ordinary Stage-2 GAN training."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-adaptive-gan",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Adapt the GAN ceiling from validation SI-SDR retention and the "
+            "measured GAN/reconstruction gradient ratio."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-max-gan-grad-ratio",
+        type=float,
+        default=0.05,
+        help="Maximum target GAN-to-reconstruction Decoder gradient ratio.",
+    )
+    parser.add_argument(
+        "--stage2-decoder-lr-multipliers",
+        type=float,
+        nargs=3,
+        default=(1., 1., 1.),
+        metavar=("EARLY", "MID", "LATE"),
+        help=(
+            "Relative LRs for early Decoder modules, the middle block, and "
+            "late/output modules."
+        ),
     )
     parser.add_argument(
         "--stft-recon-loss-weight",
@@ -1604,7 +1668,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage2-discriminator-start-steps",
         type=int,
-        default=0,
+        default=None,
         help=(
             "First Stage-2 step that updates discriminators. Defaults to GAN "
             "start; targeted refinement uses step 0 for discriminator warmup."
@@ -2708,6 +2772,27 @@ def main() -> None:
         if args.gan_feature_max < 0:
             raise ValueError("--gan-feature-max cannot be negative.")
         stage_defaults["gan_feature_max"] = args.gan_feature_max
+    if args.stage2_gan_start_step is not None:
+        if args.stage2_gan_start_step < 0:
+            raise ValueError("--stage2-gan-start-step cannot be negative.")
+        stage_defaults["gan_start"] = args.stage2_gan_start_step
+    if args.stage2_gan_ramp_steps is not None:
+        if args.stage2_gan_ramp_steps < 0:
+            raise ValueError("--stage2-gan-ramp-steps cannot be negative.")
+        stage_defaults["gan_ramp"] = args.stage2_gan_ramp_steps
+    if args.waveform_recon_loss_weight is not None and args.waveform_recon_loss_weight < 0.:
+        raise ValueError("--waveform-recon-loss-weight cannot be negative.")
+    if (
+        args.multi_spectral_recon_loss_weight is not None and
+        args.multi_spectral_recon_loss_weight < 0.
+    ):
+        raise ValueError("--multi-spectral-recon-loss-weight cannot be negative.")
+    if args.stage2_teacher_retention_weight < 0.:
+        raise ValueError("--stage2-teacher-retention-weight cannot be negative.")
+    if args.stage2_max_gan_grad_ratio <= 0.:
+        raise ValueError("--stage2-max-gan-grad-ratio must be positive.")
+    if any(multiplier <= 0. for multiplier in args.stage2_decoder_lr_multipliers):
+        raise ValueError("--stage2-decoder-lr-multipliers values must be positive.")
 
     if args.seed < 0:
         raise ValueError("--seed must be non-negative.")
@@ -3390,13 +3475,17 @@ def main() -> None:
         else stage_defaults.get("frame_phase_loss_warmup_steps", 0)
     )
     waveform_recon_loss_weight = (
-        7.5 if rvq_joint_adapt
+        args.waveform_recon_loss_weight
+        if args.waveform_recon_loss_weight is not None
+        else 7.5 if rvq_joint_adapt
         else 10.0 if args.stage in ("overfit", "recon_pretrain")
         else 5.0 if args.stage in ("spectral_refine", "gan_pretrain")
         else 1.0
     )
     multi_spectral_recon_loss_weight = (
-        0.6 if rvq_joint_adapt
+        args.multi_spectral_recon_loss_weight
+        if args.multi_spectral_recon_loss_weight is not None
+        else 0.6 if rvq_joint_adapt
         else 1.1 if args.stage == "recon_pretrain"
         else 0.8 if args.stage == "spectral_refine"
         else 0.7
@@ -3610,14 +3699,20 @@ def main() -> None:
                 f"by step {args.stage2_generator_hold_steps}."
             )
             print(
-                "Stage-2 150k schedule: "
-                f"phase1=[0,{args.stage2_phase2_start_step}) lr={stage_defaults['lr']:.3e}; "
-                f"phase2=[{args.stage2_phase2_start_step},{args.stage2_phase3_start_step}) "
-                f"lr={args.stage2_phase2_generator_lr:.3e}; "
-                f"phase3=[{args.stage2_phase3_start_step},{num_train_steps}) "
+                "Stage-2 safe schedule: "
+                f"phase1 reconstruction-only=[0,{args.stage2_phase2_start_step}) "
+                f"lr={stage_defaults['lr']:.3e}; "
+                f"phase2 scale-1 waveform GAN=[{args.stage2_phase2_start_step},"
+                f"{args.stage2_phase3_start_step}) lr="
+                f"{args.stage2_phase2_generator_lr:.3e}; "
+                f"phase3 full perceptual=[{args.stage2_phase3_start_step},"
+                f"{num_train_steps}) "
                 f"lr={args.stage2_phase3_generator_lr:.3e}, "
                 f"adv={args.stage2_phase3_gan_adversarial_max:.3e}, "
                 f"feature={args.stage2_phase3_gan_feature_max:g}; "
+                f"teacher={args.stage2_teacher_retention_weight:g}, "
+                "decoder_lr_multipliers="
+                f"{tuple(args.stage2_decoder_lr_multipliers)}; "
                 f"quality_hard_stop={int(args.stage2_quality_hard_stop)}."
             )
         if args.stage2_recon_transition_start_steps is None:
@@ -4152,6 +4247,22 @@ def main() -> None:
         rvq_joint_latent64_teacher_loss_weight=(
             args.rvq_joint_latent64_teacher_loss_weight
             if rvq_joint_adapt else 0.
+        ),
+        stage2_teacher_retention_weight=(
+            args.stage2_teacher_retention_weight
+            if args.stage == "gan_pretrain" and not rvq_joint_adapt
+            else 0.
+        ),
+        stage2_adaptive_gan=(
+            args.stage2_adaptive_gan
+            if args.stage == "gan_pretrain" and not rvq_joint_adapt
+            else False
+        ),
+        stage2_max_gan_grad_ratio=args.stage2_max_gan_grad_ratio,
+        decoder_lr_multipliers=(
+            tuple(args.stage2_decoder_lr_multipliers)
+            if args.stage == "gan_pretrain" and not rvq_joint_adapt
+            else (1., 1., 1.)
         ),
         # B1.5 keeps both 64<->lookup projections immutable. RVQ codebooks are
         # EMA-managed and excluded from Adam; only Decoder parameters optimize.
@@ -4907,6 +5018,12 @@ def main() -> None:
                     "Captured the Stage-2 initialization Encoder as the latent "
                     "drift reference (diagnostic only; no latent penalty)."
                 )
+                if args.stage2_teacher_retention_weight > 0.:
+                    trainer.capture_stage2_decoder_teacher()
+                    print(
+                        "Captured immutable B1.5 Decoder teacher for Stage-2 "
+                        "waveform/log-STFT retention."
+                    )
 
         print("Starting a new training run.")
 

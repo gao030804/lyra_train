@@ -89,6 +89,51 @@ def canonicalize_waveform_pair(target, recon):
         )
     return target, recon
 
+def canonicalize_stream_waveform_pair(offline, streamed):
+    """Align offline/stateful waveforms while rejecting unsafe broadcasting.
+
+    The grouped RVQ decode path may retain one leading singleton group axis,
+    yielding ``[1, batch, channels, samples]``.  Remove only a singleton axis
+    whose removal exactly matches the canonical streamed shape.  Any other
+    rank/shape mismatch is an implementation error rather than something
+    PyTorch broadcasting should conceal.
+    """
+    if streamed.ndim <= 3:
+        streamed = canonicalize_waveform_pair(streamed, streamed)[0]
+    else:
+        raise ValueError(
+            'streamed waveform must have at most 3 dimensions, got '
+            f'{streamed.ndim}'
+        )
+
+    if offline.ndim <= 3:
+        offline = canonicalize_waveform_pair(offline, offline)[0]
+    elif offline.ndim == 4:
+        candidates = [
+            offline.squeeze(axis)
+            for axis in range(offline.ndim - 1)
+            if offline.shape[axis] == 1 and
+            offline.squeeze(axis).shape == streamed.shape
+        ]
+        if not candidates:
+            raise ValueError(
+                'offline waveform has no removable singleton group axis: '
+                f'{tuple(offline.shape)} versus streamed {tuple(streamed.shape)}'
+            )
+        offline = candidates[0]
+    else:
+        raise ValueError(
+            'offline waveform must have at most one singleton group axis, got '
+            f'{offline.ndim} dimensions'
+        )
+
+    if offline.shape != streamed.shape:
+        raise ValueError(
+            'offline and streamed waveform shapes must match, got '
+            f'{tuple(offline.shape)} and {tuple(streamed.shape)}'
+        )
+    return offline, streamed
+
 def filter_by_keys(fn, d):
     return {k: v for k, v in d.items() if fn(k)}
 
@@ -4041,6 +4086,10 @@ class FrameStreamingSoundStream(SoundStream):
             offline_recon = offline_recon[..., context_samples:]
         offline_recon = offline_recon[..., :stream_recon.shape[-1]]
         stream_recon = stream_recon[..., :offline_recon.shape[-1]]
+        offline_recon, stream_recon = canonicalize_stream_waveform_pair(
+            offline_recon,
+            stream_recon,
+        )
         # This objective measures implementation consistency, not perceptual
         # reconstruction quality.  The previous reuse of reconstruction_losses
         # included a multi-scale log-Mel L2 term.  Tiny near-silence differences
@@ -4223,7 +4272,8 @@ class FrameStreamingSoundStream(SoundStream):
         x,
         is_denoising = None,
         num_quantizers = None,
-        freeze_codebook = False
+        freeze_codebook = False,
+        rvq_warm_in_alpha = 1.
     ):
         frame_size = self.stream_frame_size
         assert x.shape[-1] % frame_size == 0, f'input length must be a multiple of {frame_size}'
@@ -4279,6 +4329,17 @@ class FrameStreamingSoundStream(SoundStream):
             all_quantized = self.rq_output_projection(all_quantized)
             all_commit_loss = self.zero
 
+        if not self.bypass_rvq and not self.rq_projection_only:
+            alpha = float(max(0., min(1., rvq_warm_in_alpha)))
+            projected_continuous = self.rq_output_projection(
+                self.rq_input_projection(all_latents)
+            )
+            all_quantized = (
+                projected_continuous +
+                alpha * (all_quantized - projected_continuous)
+            )
+            self.rq_warm_in_alpha = alpha
+
         if exists(num_quantizers) and not self.bypass_rvq:
             assert 0 < num_quantizers <= self.num_quantizers
             all_indices = all_indices[..., :num_quantizers]
@@ -4323,7 +4384,8 @@ class FrameStreamingSoundStream(SoundStream):
         stft_grad_penalty_gamma = 5e-3,
         curtail_from_left = False,
         num_quantizers = None,
-        freeze_codebook = False
+        freeze_codebook = False,
+        rvq_warm_in_alpha = 1.
     ):
         assert not (exists(is_denoising) and not exists(target))
         assert not (exists(num_quantizers) and self.training), 'num_quantizers is an inference-only option'
@@ -4340,7 +4402,8 @@ class FrameStreamingSoundStream(SoundStream):
             x,
             is_denoising = is_denoising,
             num_quantizers = num_quantizers,
-            freeze_codebook = freeze_codebook
+            freeze_codebook = freeze_codebook,
+            rvq_warm_in_alpha = rvq_warm_in_alpha,
         )
 
         context_samples = getattr(self, 'training_context_samples', 0) if self.training else 0

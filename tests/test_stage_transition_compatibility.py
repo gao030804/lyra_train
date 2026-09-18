@@ -197,23 +197,23 @@ def test_loss_gradient_diagnostic_default(monkeypatch):
     assert args.decoder_upsample_mode == "convtranspose"
 
 
-def test_stage2_uses_decoder_then_encoder_tail_150k_schedule():
+def test_stage2_uses_reconstruction_then_staged_gan_schedule():
     stage2 = STAGE_DEFAULTS["gan_pretrain"]
 
     assert stage2["steps"] == 150_000
     assert stage2["encoder_lr"] == pytest.approx(1e-7)
     assert stage2["patience"] is None
-    assert stage2["gan_start"] == 2_000
-    assert stage2["gan_ramp"] == 15_000
+    assert stage2["gan_start"] == 3_000
+    assert stage2["gan_ramp"] == 40_000
     assert stage2["waveform_discr_update_every"] == (2, 4, 4)
     assert stage2["waveform_discr_loss_weights"] == (1.0, 0.25, 0.25)
     assert stage2["stft_discr_loss_weight"] == pytest.approx(0.5)
-    assert stage2["gan_feature_max"] == pytest.approx(1.0)
-    assert stage2["stft_recon_loss_weight"] == pytest.approx(0.02)
-    assert stage2["spectral_envelope_loss_weight"] == pytest.approx(0.02)
+    assert stage2["gan_feature_max"] == pytest.approx(0.20)
+    assert stage2["stft_recon_loss_weight"] == pytest.approx(0.05)
+    assert stage2["spectral_envelope_loss_weight"] == pytest.approx(0.)
     assert stage2["formant_peak_loss_weight"] == pytest.approx(0.)
     assert stage2["voiced_highband_loss_weight"] == pytest.approx(0.)
-    assert stage2["voiced_hf_retention_loss_weight"] == pytest.approx(0.01)
+    assert stage2["voiced_hf_retention_loss_weight"] == pytest.approx(0.)
     assert stage2["upper_highband_loss_weight"] == pytest.approx(0.)
     assert stage2["active_spectral_detail_loss_weight"] == pytest.approx(0.)
 
@@ -319,6 +319,18 @@ def test_pipeline_inserts_joint_rvq_adaptation_and_shortens_b2():
     assert 'RVQ_B15_MAX_LATENT64_NMSE="${RVQ_B15_MAX_LATENT64_NMSE:-0.115}"' in launcher
     assert '--stage2-encoder-unfreeze-step -1' in launcher
     assert '--early-stopping-patience 20 --stage2-quality-hard-stop' in launcher
+    assert '--stage2-gan-start-step 3000' in launcher
+    assert '--stage2-gan-ramp-steps 40000' in launcher
+    assert '--stage2-phase2-start-step 3000' in launcher
+    assert '--stage2-phase3-start-step 15000' in launcher
+    assert '--stage2-teacher-retention-weight 0.10' in launcher
+    assert '--stage2-decoder-lr-multipliers 0.2 0.5 1.0' in launcher
+    assert '--stage2-adaptive-gan --stage2-max-gan-grad-ratio 0.05' in launcher
+    assert '--best-eval-batches "$RVQ_STAGE2_BEST_EVAL_BATCHES"' in launcher
+    assert 'pick_b2_best()' in launcher
+    assert 'RVQ_S2_CKPT="$(pick_b2_best "$RVQ_S2_DIR")"' in launcher
+    assert '--stream-frame-size' not in launcher
+    assert '--stream-tbptt-frames 20' in launcher
     assert launcher.index('B1 checkpoint=') < launcher.index(
         'B1.5a joint STE quantization adaptation'
     ) < launcher.index('B2 RVQ GAN decoder adaptation')
@@ -336,13 +348,22 @@ def test_pipeline_inserts_joint_rvq_adaptation_and_shortens_b2():
     )
     assert 'def capture_rvq_q0_teacher(self):' in trainer_source
     assert "object.__setattr__(self, '_rvq_q0_teacher', teacher)" in trainer_source
+    assert 'def capture_stage2_decoder_teacher(self):' in trainer_source
+    assert 'def stage2_decoder_teacher_loss(self, student_recon, latent64):' in trainer_source
+    assert 'def update_stage2_gan_quality_scale(self, metrics):' in trainer_source
+    assert "pkg.get('stage2_gan_quality_scale', 1.)" in trainer_source
+    assert "reduction='mean'" in trainer_source
+    assert "steps < self.stage2_phase3_start_step" in trainer_source
+    assert "model.generator_stft_discr_loss_weight = 0." in trainer_source
     assert 'def initialize_rvq_codebooks_from_residual_kmeans(self):' in trainer_source
     assert "rvq_joint_phase = 'decoder_only'" in trainer_source
     assert "rvq_joint_phase = 'rvq_ema'" in trainer_source
-    assert "rvq_joint_phase = 'decoder_polish'" in trainer_source
+    assert "else 'decoder_polish'" in trainer_source
     assert "'rvq_plateau_polish'" in trainer_source
     assert "RVQ lookup-NMSE plateau reached; freezing" in trainer_source
     assert "online_score.get('clean_validation_eligible', 0.) >= 0.5" in trainer_source
+    assert "averaged_metrics['reconstruction_min_perplexity']" in trainer_source
+    assert 'max(1., self.quality_retention_q00_min_perplexity)' in trainer_source
     assert "rvq_joint_phase = 'win_decoder'" not in trainer_source
     assert "rvq_joint_phase = 'rvq_recenter'" not in trainer_source
     assert 'train_output_projection = False' in trainer_source
@@ -374,22 +395,22 @@ def test_stage2_phase_boundaries_adjust_lr_and_gan_weights():
     trainer = object.__new__(SoundStreamTrainer)
     torch.nn.Module.__init__(trainer)
     trainer.enable_gan = True
-    trainer.gan_start_step = 2_000
-    trainer.gan_ramp_steps = 15_000
-    trainer.gan_adversarial_max = 2e-4
-    trainer.gan_feature_max = 1.0
-    trainer.stage2_phase2_start_step = 2_000
-    trainer.stage2_phase3_start_step = 10_000
-    trainer.stage2_phase2_generator_lr = 5e-7
-    trainer.stage2_phase3_generator_lr = 5e-7
+    trainer.gan_start_step = 3_000
+    trainer.gan_ramp_steps = 40_000
+    trainer.gan_adversarial_max = 1e-4
+    trainer.gan_feature_max = 0.20
+    trainer.stage2_phase2_start_step = 3_000
+    trainer.stage2_phase3_start_step = 15_000
+    trainer.stage2_phase2_generator_lr = 2e-7
+    trainer.stage2_phase3_generator_lr = 2.5e-7
     trainer.stage2_phase3_gan_adversarial_max = 1e-4
-    trainer.stage2_phase3_gan_feature_max = 1.0
-    trainer.generator_hold_steps = 5_000
+    trainer.stage2_phase3_gan_feature_max = 0.20
+    trainer.generator_hold_steps = 0
     trainer.generator_hold_lr = 1e-7
-    trainer.generator_freeze_steps = 2_000
-    trainer.generator_hold_base_lrs = (5e-7,)
+    trainer.generator_freeze_steps = 0
+    trainer.generator_hold_base_lrs = (2.5e-7,)
     trainer.optim = SimpleNamespace(
-        optimizer=SimpleNamespace(param_groups=[{"lr": 5e-7}]),
+        optimizer=SimpleNamespace(param_groups=[{"lr": 2.5e-7, "lr_scale": 1.0}]),
         sync_warmup_lrs_from_optimizer=lambda: None,
     )
     model = SimpleNamespace(
@@ -399,16 +420,17 @@ def test_stage2_phase_boundaries_adjust_lr_and_gan_weights():
     trainer.soundstream = model
     trainer.accelerator = SimpleNamespace(unwrap_model=lambda value: value)
 
-    trainer.update_gan_weights(9_999)
-    gan_progress = (9_999 - 2_000) / 15_000
-    assert model.adversarial_loss_weight == pytest.approx(2e-4 * gan_progress)
-    assert model.feature_loss_weight == pytest.approx(1.0 * gan_progress)
-    assert trainer.cap_generator_lr_for_retention(2_000) == pytest.approx(5e-7)
+    trainer.update_gan_weights(14_999)
+    gan_progress = (14_999 - 3_000) / 40_000
+    assert model.adversarial_loss_weight == pytest.approx(1e-4 * gan_progress)
+    assert model.feature_loss_weight == pytest.approx(0.20 * gan_progress)
+    assert trainer.cap_generator_lr_for_retention(3_000) == pytest.approx(2e-7)
 
-    trainer.update_gan_weights(10_000)
-    assert model.adversarial_loss_weight == pytest.approx(1e-4)
-    assert model.feature_loss_weight == pytest.approx(1.0)
-    assert trainer.cap_generator_lr_for_retention(10_000) == pytest.approx(5e-7)
+    trainer.update_gan_weights(15_000)
+    gan_progress = (15_000 - 3_000) / 40_000
+    assert model.adversarial_loss_weight == pytest.approx(1e-4 * gan_progress)
+    assert model.feature_loss_weight == pytest.approx(0.20 * gan_progress)
+    assert trainer.cap_generator_lr_for_retention(15_000) == pytest.approx(2.5e-7)
 
 
 @pytest.mark.parametrize(

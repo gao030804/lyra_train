@@ -334,6 +334,10 @@ class SoundStreamTrainer(nn.Module):
         stage2_phase3_generator_lr: float | None = None,
         stage2_phase3_gan_adversarial_max: float | None = None,
         stage2_phase3_gan_feature_max: float | None = None,
+        stage2_teacher_retention_weight: float = 0.,
+        stage2_adaptive_gan: bool = False,
+        stage2_max_gan_grad_ratio: float = 0.05,
+        decoder_lr_multipliers: tuple[float, float, float] = (1., 1., 1.),
         discriminator_hold_steps: int = 0,
         discriminator_hold_lr: float | None = None,
         discriminator_start_step: int | None = None,
@@ -793,6 +797,7 @@ class SoundStreamTrainer(nn.Module):
         )
         self._stage2_latent_reference_encoder = None
         object.__setattr__(self, '_rvq_q0_teacher', None)
+        object.__setattr__(self, '_stage2_decoder_teacher', None)
         self.first_decoder_block_excluded_from_generator_optimizer = bool(
             exclude_first_decoder_block_from_generator_optimizer
         )
@@ -931,7 +936,14 @@ class SoundStreamTrainer(nn.Module):
                 if id(parameter) not in first_decoder_parameter_ids
             ]
 
-        if exists(encoder_lr) or exists(projection_lr):
+        decoder_lr_multipliers = tuple(float(value) for value in decoder_lr_multipliers)
+        if len(decoder_lr_multipliers) != 3 or any(
+            value <= 0. for value in decoder_lr_multipliers
+        ):
+            raise ValueError('decoder_lr_multipliers must contain three positive values')
+        use_decoder_lr_groups = decoder_lr_multipliers != (1., 1., 1.)
+
+        if exists(encoder_lr) or exists(projection_lr) or use_decoder_lr_groups:
             if exists(encoder_lr) and encoder_lr <= 0.:
                 raise ValueError('encoder_lr must be positive when specified')
 
@@ -962,7 +974,43 @@ class SoundStreamTrainer(nn.Module):
                 raise RuntimeError('separate optimizer groups have no Decoder parameters')
 
             generator_parameter_groups = []
-            named_parameter_groups = [('decoder', decoder_parameters, lr)]
+            if use_decoder_lr_groups:
+                decoder = soundstream.decoder
+                if not isinstance(decoder, nn.Sequential) or len(decoder) < 6:
+                    raise RuntimeError(
+                        'Layer-wise Decoder LR requires input conv, four blocks, and output conv'
+                    )
+                early_ids = {
+                    id(parameter)
+                    for module in list(decoder.children())[:3]
+                    for parameter in module.parameters()
+                }
+                mid_ids = {
+                    id(parameter)
+                    for parameter in decoder[3].parameters()
+                }
+                early_parameters = [
+                    parameter for parameter in decoder_parameters
+                    if id(parameter) in early_ids
+                ]
+                mid_parameters = [
+                    parameter for parameter in decoder_parameters
+                    if id(parameter) in mid_ids
+                ]
+                late_parameters = [
+                    parameter for parameter in decoder_parameters
+                    if id(parameter) not in early_ids and id(parameter) not in mid_ids
+                ]
+                early_scale, mid_scale, late_scale = decoder_lr_multipliers
+                # Put the late/output group first so the public generator LR
+                # and phase LRs continue to mean the highest texture LR.
+                named_parameter_groups = [
+                    ('decoder_late', late_parameters, lr * late_scale),
+                    ('decoder_mid', mid_parameters, lr * mid_scale),
+                    ('decoder_early', early_parameters, lr * early_scale),
+                ]
+            else:
+                named_parameter_groups = [('decoder', decoder_parameters, lr)]
             if projection_parameters:
                 named_parameter_groups.append((
                     'projection',
@@ -981,6 +1029,7 @@ class SoundStreamTrainer(nn.Module):
                         lr = group_lr,
                         weight_decay = wd,
                         group_name = group_name,
+                        lr_scale = group_lr / lr,
                     ))
                 if no_wd_parameters:
                     generator_parameter_groups.append(dict(
@@ -988,6 +1037,7 @@ class SoundStreamTrainer(nn.Module):
                         lr = group_lr,
                         weight_decay = 0.,
                         group_name = group_name,
+                        lr_scale = group_lr / lr,
                     ))
             generator_optimizer = get_optimizer(
                 generator_parameter_groups,
@@ -1008,6 +1058,11 @@ class SoundStreamTrainer(nn.Module):
             # can address them deterministically.
             for parameter_group in generator_optimizer.param_groups:
                 parameter_group.setdefault('group_name', 'decoder')
+        for parameter_group in generator_optimizer.param_groups:
+            parameter_group.setdefault(
+                'lr_scale',
+                float(parameter_group['lr']) / max(float(lr), 1e-20),
+            )
 
         self.optim = OptimizerWithWarmupSchedule(
             self.accelerator,
@@ -1071,12 +1126,21 @@ class SoundStreamTrainer(nn.Module):
             assert stage2_phase3_gan_adversarial_max >= 0.
         if exists(stage2_phase3_gan_feature_max):
             assert stage2_phase3_gan_feature_max >= 0.
+        assert stage2_teacher_retention_weight >= 0.
+        assert stage2_max_gan_grad_ratio > 0.
         self.stage2_phase2_start_step = stage2_phase2_start_step
         self.stage2_phase3_start_step = stage2_phase3_start_step
         self.stage2_phase2_generator_lr = stage2_phase2_generator_lr
         self.stage2_phase3_generator_lr = stage2_phase3_generator_lr
         self.stage2_phase3_gan_adversarial_max = stage2_phase3_gan_adversarial_max
         self.stage2_phase3_gan_feature_max = stage2_phase3_gan_feature_max
+        self.stage2_teacher_retention_weight = float(
+            stage2_teacher_retention_weight
+        )
+        self.stage2_adaptive_gan = bool(stage2_adaptive_gan)
+        self.stage2_max_gan_grad_ratio = float(stage2_max_gan_grad_ratio)
+        self.stage2_gan_quality_scale = 1.
+        self.decoder_lr_multipliers = decoder_lr_multipliers
         assert discriminator_hold_steps >= 0
         if exists(discriminator_hold_lr):
             assert discriminator_hold_lr > 0.
@@ -1681,6 +1745,7 @@ class SoundStreamTrainer(nn.Module):
             quality_retention_baseline = self.quality_retention_baseline,
             quality_retention_bad_evals = self.quality_retention_bad_evals,
             quality_retention_rvq_bad_evals = self.quality_retention_rvq_bad_evals,
+            stage2_gan_quality_scale = self.stage2_gan_quality_scale,
             stage1_rvq_bad_evals = self.stage1_rvq_bad_evals,
             stage1_polarity_bad_evals = self.stage1_polarity_bad_evals,
             trainer_step = trainer_step,
@@ -3909,6 +3974,17 @@ class SoundStreamTrainer(nn.Module):
         ):
             # Preserve the healthy stage-2 RVQ utilization during streaming
             # adaptation instead of selecting a low-loss collapsed codebook.
+            # Use the configured q00 retention floor as the aggregate
+            # reconstruction floor as well, capped for any deliberately small
+            # codebook.  This value used to be referenced as an uninitialized
+            # local, which aborted stateful baseline validation before step 0.
+            reconstruction_min_perplexity = min(
+                codebook_size,
+                max(1., self.quality_retention_q00_min_perplexity),
+            )
+            averaged_metrics['reconstruction_min_perplexity'] = (
+                reconstruction_min_perplexity
+            )
             eligible = (
                 eligible and
                 averaged_metrics['active_code_ratio'] >= 0.15 and
@@ -4266,6 +4342,9 @@ class SoundStreamTrainer(nn.Module):
         self.plateau_lr_reduction_count = pkg.get('plateau_lr_reduction_count', 0)
         self.quality_retention_bad_evals = pkg.get('quality_retention_bad_evals', 0)
         self.quality_retention_rvq_bad_evals = pkg.get('quality_retention_rvq_bad_evals', 0)
+        self.stage2_gan_quality_scale = float(
+            pkg.get('stage2_gan_quality_scale', 1.)
+        )
         self.stage1_rvq_bad_evals = pkg.get('stage1_rvq_bad_evals', 0)
         self.stage1_polarity_bad_evals = pkg.get(
             'stage1_polarity_bad_evals', 0
@@ -4341,6 +4420,17 @@ class SoundStreamTrainer(nn.Module):
 
     def update_gan_weights(self, steps):
         model = self.unwrapped_soundstream
+        if not hasattr(self, '_stage2_full_generator_waveform_weights'):
+            object.__setattr__(
+                self,
+                '_stage2_full_generator_waveform_weights',
+                tuple(getattr(model, 'generator_waveform_discr_loss_weights', ())),
+            )
+            object.__setattr__(
+                self,
+                '_stage2_full_generator_stft_weight',
+                float(getattr(model, 'generator_stft_discr_loss_weight', 0.)),
+            )
         if not self.enable_gan:
             model.adversarial_loss_weight = 0.
             model.feature_loss_weight = 0.
@@ -4376,13 +4466,55 @@ class SoundStreamTrainer(nn.Module):
                 self.stage2_phase3_gan_feature_max,
                 feature_max,
             )
-            # Phase-3 weights are absolute retention-phase targets.  The
-            # preceding ramp belongs to phase 2 and must not attenuate them.
-            progress = 1.
+        if self._stage2_full_generator_waveform_weights:
+            if (
+                exists(self.stage2_phase3_start_step) and
+                steps < self.stage2_phase3_start_step
+            ):
+                full = self._stage2_full_generator_waveform_weights
+                model.generator_waveform_discr_loss_weights = (
+                    full[0], *(0. for _ in full[1:])
+                )
+                model.generator_stft_discr_loss_weight = 0.
+            else:
+                model.generator_waveform_discr_loss_weights = (
+                    self._stage2_full_generator_waveform_weights
+                )
+                model.generator_stft_discr_loss_weight = (
+                    self._stage2_full_generator_stft_weight
+                )
 
-        model.adversarial_loss_weight = adversarial_max * progress
-        model.feature_loss_weight = feature_max * progress
+        adaptive_scale = float(getattr(self, 'stage2_gan_quality_scale', 1.))
+        model.adversarial_loss_weight = adversarial_max * progress * adaptive_scale
+        model.feature_loss_weight = feature_max * progress * adaptive_scale
         return progress
+
+    def update_stage2_gan_quality_scale(self, metrics):
+        """Closed-loop GAN ceiling from validation reconstruction retention."""
+        if (
+            not self.stage2_adaptive_gan or
+            not self.has_quality_retention_baseline
+        ):
+            return None
+        delta = (
+            float(metrics['aligned_si_sdr']) -
+            float(self.quality_retention_baseline['aligned_si_sdr'])
+        )
+        previous = self.stage2_gan_quality_scale
+        if delta <= -0.15:
+            updated = max(0.125, previous * 0.5)
+            action = 'halve'
+        elif delta <= -0.08:
+            updated = min(previous, 0.5)
+            action = 'cap_half'
+        elif delta <= -0.03:
+            updated = previous
+            action = 'hold'
+        else:
+            updated = min(1., previous * 1.10)
+            action = 'release'
+        self.stage2_gan_quality_scale = updated
+        return delta, previous, updated, action
 
     def update_si_sdr_loss_weight(self, steps):
         model = self.unwrapped_soundstream
@@ -4677,10 +4809,9 @@ class SoundStreamTrainer(nn.Module):
         # phase-2 LR must take effect exactly when the frozen generator is
         # released, even if a longer legacy hold window was configured.
         if exists(phase_lr):
-            reference_lr = max(self.generator_hold_base_lrs[0], 1e-20)
             target_lrs = [
-                phase_lr * (base_lr / reference_lr)
-                for base_lr in self.generator_hold_base_lrs
+                phase_lr * float(group.get('lr_scale', 1.))
+                for group in self.optim.optimizer.param_groups
             ]
             for group, target_lr in zip(
                 self.optim.optimizer.param_groups,
@@ -4699,9 +4830,15 @@ class SoundStreamTrainer(nn.Module):
             ramp_span = max(self.generator_hold_steps - ramp_start, 1)
             progress = min(max((steps - ramp_start) / ramp_span, 0.), 1.)
             target_lrs = [
-                self.generator_hold_lr +
-                (base_lr - self.generator_hold_lr) * progress
-                for base_lr in self.generator_hold_base_lrs
+                self.generator_hold_lr * float(group.get('lr_scale', 1.)) +
+                (
+                    base_lr -
+                    self.generator_hold_lr * float(group.get('lr_scale', 1.))
+                ) * progress
+                for group, base_lr in zip(
+                    self.optim.optimizer.param_groups,
+                    self.generator_hold_base_lrs,
+                )
             ]
             for group, target_lr in zip(
                 self.optim.optimizer.param_groups,
@@ -4792,6 +4929,17 @@ class SoundStreamTrainer(nn.Module):
             for interval in self.waveform_discr_update_every
         )
         stft_active = not (steps % self.stft_discr_update_every)
+        if (
+            exists(self.stage2_phase3_start_step) and
+            steps < self.stage2_phase3_start_step
+        ):
+            # Safe-GAN phase: train only the full-resolution waveform branch.
+            # STFT and coarser waveform discriminators enter in phase 3.
+            waveform_active = tuple(
+                active if index == 0 else False
+                for index, active in enumerate(waveform_active)
+            )
+            stft_active = False
         active_waveform_scales = {
             float(scale)
             for scale, active in zip(model.discr_multi_scales, waveform_active)
@@ -4894,8 +5042,15 @@ class SoundStreamTrainer(nn.Module):
                 # does not jump when a different subset of discriminator
                 # branches is active on this global step.
                 configured_discriminator_weight = (
-                    sum(self.waveform_discr_loss_weights) +
-                    self.stft_discr_loss_weight
+                    sum(
+                        weight
+                        for weight, active in zip(
+                            self.waveform_discr_loss_weights,
+                            waveform_active,
+                        )
+                        if active
+                    ) +
+                    (self.stft_discr_loss_weight if stft_active else 0.)
                 )
                 total_discriminator_loss = (
                     torch.stack(optimization_losses).sum() /
@@ -5138,6 +5293,61 @@ class SoundStreamTrainer(nn.Module):
             frozen.eval()
             teacher[name] = frozen
         object.__setattr__(self, '_rvq_q0_teacher', teacher)
+
+    @torch.no_grad()
+    def capture_stage2_decoder_teacher(self):
+        """Snapshot the selected B1.5 Decoder without duplicating Encoder/RVQ."""
+        model = self.unwrapped_soundstream
+        teacher = {}
+        for name in ('decoder_attn', 'decoder'):
+            module = getattr(model, name, None)
+            if not isinstance(module, nn.Module):
+                teacher[name] = None
+                continue
+            frozen = copy.deepcopy(module).to(self.device)
+            frozen.requires_grad_(False)
+            frozen.eval()
+            teacher[name] = frozen
+        object.__setattr__(self, '_stage2_decoder_teacher', teacher)
+
+    @torch.no_grad()
+    def stage2_decoder_teacher_reconstruction(self, latent64):
+        teacher = self._stage2_decoder_teacher
+        if teacher is None:
+            raise RuntimeError('Stage-2 retention requires a captured B1.5 Decoder teacher')
+        latent = latent64.detach()
+        if teacher['decoder_attn'] is not None:
+            latent = teacher['decoder_attn'](latent)
+        return teacher['decoder'](rearrange(latent, 'b n c -> b c n'))
+
+    def stage2_decoder_teacher_loss(self, student_recon, latent64):
+        teacher_recon = self.stage2_decoder_teacher_reconstruction(latent64)
+        context_samples = int(
+            getattr(self.unwrapped_soundstream, 'training_context_samples', 0)
+        )
+        if context_samples:
+            teacher_recon = teacher_recon[..., context_samples:]
+        student_recon, teacher_recon = canonicalize_waveform_pair(
+            student_recon, teacher_recon.detach()
+        )
+        teacher_wave = F.l1_loss(student_recon, teacher_recon)
+        teacher_spectral = student_recon.new_zeros(())
+        for n_fft in (512, 1024):
+            window = torch.hann_window(
+                n_fft, device=student_recon.device, dtype=student_recon.dtype
+            )
+            student_spec = torch.stft(
+                student_recon.flatten(0, 1), n_fft,
+                hop_length=n_fft // 4, window=window, return_complex=True
+            ).abs().clamp_min(1e-5)
+            teacher_spec = torch.stft(
+                teacher_recon.flatten(0, 1), n_fft,
+                hop_length=n_fft // 4, window=window, return_complex=True
+            ).abs().clamp_min(1e-5)
+            teacher_spectral = teacher_spectral + F.l1_loss(
+                student_spec.log(), teacher_spec.log()
+            )
+        return teacher_wave + 0.5 * teacher_spectral
 
     @torch.no_grad()
     def rvq_q0_teacher_reconstruction(self, wave):
@@ -5836,6 +6046,25 @@ class SoundStreamTrainer(nn.Module):
                     runtime_model._last_rvq_joint_losses[
                         'continuous_teacher'
                     ] = continuous_teacher_loss.detach()
+                stage2_teacher_loss = loss.new_zeros(())
+                if self.stage2_teacher_retention_weight > 0.:
+                    student_recon = getattr(
+                        runtime_model, '_last_student_recon_for_teacher', None
+                    )
+                    student_latent = getattr(
+                        runtime_model, '_last_student_latent64_for_teacher', None
+                    )
+                    if student_recon is None or student_latent is None:
+                        raise RuntimeError(
+                            'Stage-2 teacher retention requires cached Decoder input/output'
+                        )
+                    stage2_teacher_loss = self.stage2_decoder_teacher_loss(
+                        student_recon, student_latent
+                    )
+                    loss = (
+                        loss +
+                        self.stage2_teacher_retention_weight * stage2_teacher_loss
+                    )
                 if rvq_joint_curriculum:
                     student_latent = getattr(
                         runtime_model, '_last_student_latent64_for_teacher', None
@@ -6021,9 +6250,26 @@ class SoundStreamTrainer(nn.Module):
                     logs['g_adversarial_grad_norm'] = adversarial_grad_norm
                     logs['g_feature_grad_norm'] = feature_grad_norm
                     logs['g_gan_grad_norm'] = gan_grad_norm
-                    logs['g_gan_to_reconstruction_grad_ratio'] = (
+                    local_gan_grad_ratio = (
                         gan_grad_norm / max(reconstruction_grad_norm, 1e-12)
                     )
+                    synchronized_ratio = self.accelerator.reduce(
+                        torch.tensor(local_gan_grad_ratio, device=device),
+                        reduction='mean',
+                    )
+                    logs['g_gan_to_reconstruction_grad_ratio'] = float(
+                        synchronized_ratio.detach().cpu()
+                    )
+                    if (
+                        self.stage2_adaptive_gan and
+                        logs['g_gan_to_reconstruction_grad_ratio'] >
+                        self.stage2_max_gan_grad_ratio
+                    ):
+                        self.stage2_gan_quality_scale = max(
+                            0.125,
+                            self.stage2_gan_quality_scale * 0.5,
+                        )
+                        logs['stage2_gan_grad_limited'] = 1.
                     for branch_name, branch_loss in perceptual_branch_losses.items():
                         global_weight = (
                             runtime_model.adversarial_loss_weight
@@ -6070,6 +6316,9 @@ class SoundStreamTrainer(nn.Module):
                 rvq_continuous_teacher_loss = float(
                     rvq_joint_losses.get('continuous_teacher', 0.)
                 ) / self.grad_accum_every,
+                stage2_teacher_loss = (
+                    stage2_teacher_loss.detach().item() / self.grad_accum_every
+                ),
                 si_sdr_loss = si_sdr_loss.item() / self.grad_accum_every,
                 correlation_loss = correlation_loss.item() / self.grad_accum_every,
                 click_loss = click_loss.item() / self.grad_accum_every,
@@ -6152,6 +6401,10 @@ class SoundStreamTrainer(nn.Module):
         )
         logs['lr_g'] = generator_lr
         logs['lr_g_encoder'] = encoder_generator_lr
+        for group in self.optim.optimizer.param_groups:
+            group_name = group.get('group_name', '')
+            if group_name in {'decoder_early', 'decoder_mid', 'decoder_late'}:
+                logs[f'lr_g_{group_name}'] = float(group['lr'])
         logs['lr_g_projection'] = next((
             group['lr']
             for group in self.optim.optimizer.param_groups
@@ -6215,6 +6468,8 @@ class SoundStreamTrainer(nn.Module):
             f"(w={getattr(model, 'rq_quantization_error_loss_weight', 0.):.4g})"
             f" | continuous_teacher={logs.get('rvq_continuous_teacher_loss', 0.):.6f}"
             f"(w={getattr(model, 'rq_continuous_teacher_loss_weight', 0.):.4g})"
+            f" | stage2_teacher={logs.get('stage2_teacher_loss', 0.):.6f}"
+            f"(w={self.stage2_teacher_retention_weight:.4g})"
             f" | latent64_teacher={float(getattr(model, '_last_rvq_joint_losses', {}).get('latent64_teacher', 0.)):.6f}"
             f"(w={self.rvq_joint_latent64_teacher_loss_weight if self._rvq_q0_teacher is not None else 0.:.4g})"
             f" | projection_orth={float(getattr(model, '_last_rvq_joint_losses', {}).get('projection_orth', 0.)):.6f}"
@@ -6308,7 +6563,8 @@ class SoundStreamTrainer(nn.Module):
             f"gan_weighted={logs['weighted_gan_loss']:.6f} | "
             f"recon_weighted={logs['weighted_reconstruction_loss']:.6f} | "
             f"gan_value_ratio={abs(logs['weighted_gan_loss']) / max(abs(logs['weighted_reconstruction_loss']), 1e-12):.6f} | "
-            f"gan_ramp={gan_progress:.4f} | "
+            f"gan_ramp={gan_progress:.4f}"
+            f"(quality_scale={self.stage2_gan_quality_scale:.4f}) | "
             f"lr_g_update={generator_update_lr:.3e} | "
             f"lr_g_next={generator_lr:.3e} | "
             f"lr_g_encoder_next={encoder_generator_lr:.3e} | "
@@ -6355,6 +6611,13 @@ class SoundStreamTrainer(nn.Module):
                 else 1
             )
             losses_str += f" | stage2_phase={stage2_phase}"
+            if 'lr_g_decoder_early' in logs:
+                losses_str += (
+                    " | decoder_lrs="
+                    f"{logs['lr_g_decoder_early']:.3e}/"
+                    f"{logs['lr_g_decoder_mid']:.3e}/"
+                    f"{logs['lr_g_decoder_late']:.3e}"
+                )
 
         if 'g_gan_to_reconstruction_grad_ratio' in logs:
             losses_str += (
@@ -7094,6 +7357,14 @@ class SoundStreamTrainer(nn.Module):
                     f"discriminator_warmup={int(steps < self.gan_start_step and steps >= self.discriminator_start_step)}, "
                     f"gan_ramp={gan_progress:.4f}"
                 )
+                gan_feedback = self.update_stage2_gan_quality_scale(online_score)
+                if gan_feedback is not None:
+                    delta, previous_scale, updated_scale, action = gan_feedback
+                    self.print(
+                        f"{steps}: Stage-2 adaptive GAN action={action}, "
+                        f"aligned_si_sdr_delta={delta:+.3f} dB, "
+                        f"quality_scale={previous_scale:.4f}->{updated_scale:.4f}"
+                    )
             self.print(
                 f"{steps}: codebook online "
                 f"{self.format_codebook_diagnostics(online_score)}"
