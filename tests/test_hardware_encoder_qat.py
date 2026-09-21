@@ -151,8 +151,10 @@ def test_hardware_qat_supports_current_lowrank_dscnn_encoder_and_keeps_shape():
         hardware_encoder_qat=True,
         hardware_qat_observer_start_step=0,
         hardware_qat_start_step=1,
+        hardware_qat_activation_start_step=2,
         hardware_qat_warm_in_steps=2,
-        hardware_qat_observer_freeze_step=3,
+        hardware_qat_block_interval_steps=0,
+        hardware_qat_observer_freeze_step=1,
         pad_mode="constant",
     ).eval()
 
@@ -168,10 +170,15 @@ def test_hardware_qat_supports_current_lowrank_dscnn_encoder_and_keeps_shape():
 
     assert model.update_hardware_qat(0) == (False, True)
     assert model.hardware_qat_blend_alpha == 0.
-    assert model.update_hardware_qat(1) == (True, True)
+    assert model.update_hardware_qat(1) == (True, False)
+    assert model.hardware_qat_blend_alpha == 0.
+    assert model.encoder[0].hardware_weight_qat_enabled
+    assert not model.encoder[0].hardware_activation_qat_enabled
+    assert model.update_hardware_qat(2) == (True, False)
     assert model.hardware_qat_blend_alpha == 0.5
     assert model.update_hardware_qat(3) == (True, False)
     assert model.hardware_qat_blend_alpha == 1.
+    assert model.hardware_qat_is_full()
     assert (
         model.encoder[0].hardware_output_fake_quant is
         hardware_input_fake_quant(model.encoder[1])
@@ -207,6 +214,17 @@ def test_hardware_qat_disabled_stage_rebuild_starts_in_float_mode():
     assert torch.count_nonzero(encoded).item() > 0
     assert torch.isfinite(encoded).all()
     torch.testing.assert_close(rebuilt_encoded, encoded)
+
+
+def test_hardware_qat_runtime_state_survives_model_only_state_dict():
+    fake_quant = SymmetricActivationFakeQuant()
+    fake_quant.set_state(enabled=True, observer_enabled=False, blend_alpha=1.)
+    state = fake_quant.state_dict()
+    rebuilt = SymmetricActivationFakeQuant()
+    rebuilt.load_state_dict(state, strict=True)
+    assert rebuilt.enabled
+    assert not rebuilt.observer_enabled
+    assert rebuilt.blend_alpha == 1.
 
 
 def test_hardware_qat_causal_conv_quantizes_bias_and_backpropagates():

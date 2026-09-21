@@ -300,6 +300,8 @@ class SoundStreamTrainer(nn.Module):
         encoder_only_training: bool = False,
         hardware_qat_latent64_weight: float = 0.25,
         hardware_qat_latent32_weight: float = 0.75,
+        hardware_qat_rvq_margin_weight: float = 0.25,
+        hardware_qat_rvq_margin: float = 0.05,
         hardware_qat_fixed_scale_step: int = 1500,
         hardware_qat_fixed_scale_lr: float = 1e-7,
         hardware_qat_final_polish_step: int = 5000,
@@ -806,6 +808,9 @@ class SoundStreamTrainer(nn.Module):
         self.encoder_only_training = bool(encoder_only_training)
         self.hardware_qat_latent64_weight = float(hardware_qat_latent64_weight)
         self.hardware_qat_latent32_weight = float(hardware_qat_latent32_weight)
+        self.hardware_qat_rvq_margin_weight = float(hardware_qat_rvq_margin_weight)
+        self.hardware_qat_rvq_margin = float(hardware_qat_rvq_margin)
+        self.best_full_qat_score = float('-inf')
         self.hardware_qat_fixed_scale_step = int(hardware_qat_fixed_scale_step)
         self.hardware_qat_fixed_scale_lr = float(hardware_qat_fixed_scale_lr)
         self.hardware_qat_final_polish_step = int(hardware_qat_final_polish_step)
@@ -1783,6 +1788,7 @@ class SoundStreamTrainer(nn.Module):
             early_stopping_best_score = self.early_stopping_best_score,
             early_stopping_metric = self.early_stopping_metric,
             best_aligned_si_sdr = self.best_aligned_si_sdr,
+            best_full_qat_score = self.best_full_qat_score,
             best_rvq_fidelity_score = self.best_rvq_fidelity_score,
             rvq_plateau_best_lookup_nmse = self.rvq_plateau_best_lookup_nmse,
             rvq_plateau_bad_evals = self.rvq_plateau_bad_evals,
@@ -3580,9 +3586,12 @@ class SoundStreamTrainer(nn.Module):
         """Use a baseline-relative polarity gate during final state calibration."""
         allowed = self.clean_gate_max_negative_fraction
         if (
-            self.best_checkpoint_metric in (
-                'stream_finetune',
-                'stream_finetune_long',
+            (
+                self.best_checkpoint_metric in (
+                    'stream_finetune',
+                    'stream_finetune_long',
+                ) or
+                self.encoder_only_training
             ) and
             self.quality_retention_gate and
             self.has_quality_retention_baseline and
@@ -4381,6 +4390,7 @@ class SoundStreamTrainer(nn.Module):
             self.discr_optim.load_state_dict(pkg['discr_optim'])
         self.best_valid_score = pkg.get('best_valid_score', float('inf'))
         self.best_aligned_si_sdr = pkg.get('best_aligned_si_sdr', float('-inf'))
+        self.best_full_qat_score = pkg.get('best_full_qat_score', float('-inf'))
         self.best_rvq_fidelity_score = pkg.get(
             'best_rvq_fidelity_score',
             float('-inf'),
@@ -5577,6 +5587,31 @@ class SoundStreamTrainer(nn.Module):
             teacher32.square().mean().clamp_min(1e-8)
         )
 
+        rvq_margin_loss = student32.new_zeros(())
+        residual_student = student32
+        residual_teacher = teacher32.detach()
+        residual_vq = model.rq.rvqs[0]
+        margin_weights = (1., .5, .25)
+        for level, level_weight in zip(residual_vq.layers[:3], margin_weights):
+            embed = level._codebook.embed.detach()
+            if embed.ndim == 3:
+                embed = embed[0]
+            teacher_distances = torch.cdist(
+                residual_teacher.reshape(-1, residual_teacher.shape[-1]),
+                embed.float(),
+            ).square()
+            nearest = teacher_distances.topk(2, largest=False).indices
+            best = F.embedding(nearest[:, 0], embed.float()).view_as(residual_teacher)
+            runner = F.embedding(nearest[:, 1], embed.float()).view_as(residual_teacher)
+            energy = residual_teacher.square().mean(dim=-1).clamp_min(1e-8)
+            best_distance = (residual_student - best).square().mean(dim=-1) / energy
+            runner_distance = (residual_student - runner).square().mean(dim=-1) / energy
+            rvq_margin_loss = rvq_margin_loss + float(level_weight) * F.relu(
+                self.hardware_qat_rvq_margin + best_distance - runner_distance
+            ).mean()
+            residual_student = residual_student - best
+            residual_teacher = residual_teacher - best
+
         with torch.no_grad():
             _, student_indices, _ = model.rq(student32, freeze_codebook=True)
             _, teacher_indices, _ = model.rq(teacher32, freeze_codebook=True)
@@ -5588,8 +5623,10 @@ class SoundStreamTrainer(nn.Module):
             }
         weighted = (
             self.hardware_qat_latent64_weight * latent64_nmse +
-            self.hardware_qat_latent32_weight * latent32_nmse
+            self.hardware_qat_latent32_weight * latent32_nmse +
+            self.hardware_qat_rvq_margin_weight * rvq_margin_loss
         )
+        model._last_hardware_qat_rvq_margin = rvq_margin_loss.detach()
         return weighted, latent64_nmse, latent32_nmse
 
     @torch.no_grad()
@@ -5627,6 +5664,24 @@ class SoundStreamTrainer(nn.Module):
             f'qat_index_flip_q{index:02d}': float(value.cpu())
             for index, value in enumerate(per_level)
         })
+        layer_diagnostics = model.hardware_encoder_quantization_diagnostics()
+        if layer_diagnostics:
+            output['qat_int32_overflow_max'] = max(
+                float(values.get('accumulator_overflow_rate', 0.))
+                for values in layer_diagnostics.values()
+            )
+            for percentile in ('p99', 'p999', 'p9999'):
+                values = [
+                    float(layer.get(f'activation_utilization_{percentile}', 0.))
+                    for layer in layer_diagnostics.values()
+                    if f'activation_utilization_{percentile}' in layer
+                ]
+                output[f'qat_activation_utilization_{percentile}_mean'] = (
+                    sum(values) / len(values) if values else 0.
+                )
+                output[f'qat_activation_utilization_{percentile}_min'] = (
+                    min(values) if values else 0.
+                )
         return output
 
     def update_hardware_qat_lr(self, steps):
@@ -6408,7 +6463,14 @@ class SoundStreamTrainer(nn.Module):
                     i == 0
                 )
                 if run_loss_grad_diagnostic:
-                    decoder_parameters = tuple(runtime_model.decoder.parameters())
+                    diagnostic_parameters = tuple(
+                        runtime_model.encoder.parameters()
+                        if self.encoder_only_training
+                        else runtime_model.decoder.parameters()
+                    )
+                    diagnostic_prefix = (
+                        'encoder_grad_' if self.encoder_only_training else 'grad_'
+                    )
                     weighted_objectives = {
                         'wave': recon_loss * runtime_model.recon_loss_weight,
                         'mel': (
@@ -6449,6 +6511,8 @@ class SoundStreamTrainer(nn.Module):
                         weighted_objectives['teacher'] = (
                             stage2_teacher_loss * self.stage2_teacher_retention_weight
                         )
+                    if self.encoder_only_training:
+                        weighted_objectives['latent_teacher_and_vq'] = qat_teacher_loss
                     for formant_name in ('f1', 'f2', 'f3'):
                         component = formant_diagnostics.get(
                             f'{formant_name}_weighted_loss'
@@ -6458,12 +6522,16 @@ class SoundStreamTrainer(nn.Module):
                                 component * runtime_model.formant_peak_loss_weight
                             )
                     for objective_name, objective in weighted_objectives.items():
-                        logs[f'grad_{objective_name}'] = self.objective_grad_norm(
-                            objective, decoder_parameters
+                        logs[f'{diagnostic_prefix}{objective_name}'] = self.objective_grad_norm(
+                            objective, diagnostic_parameters
                         )
-                    logs['grad_reconstruction_total'] = self.objective_grad_norm(
-                        weighted_reconstruction_loss, decoder_parameters
+                    logs[f'{diagnostic_prefix}reconstruction_total'] = self.objective_grad_norm(
+                        weighted_reconstruction_loss, diagnostic_parameters
                     )
+                    if self.encoder_only_training:
+                        logs['encoder_grad_total'] = self.objective_grad_norm(
+                            loss, diagnostic_parameters
+                        )
 
                 run_gan_grad_diagnostic = (
                     not generator_frozen and
@@ -6752,6 +6820,7 @@ class SoundStreamTrainer(nn.Module):
             )
         if 'qat_latent64_nmse' in logs:
             qat_enabled, qat_observer = hardware_qat_state or (False, False)
+            qat_group_alphas = getattr(model, 'hardware_qat_group_alphas', ())
             flip_parts = [
                 f"{name.removeprefix('qat_index_flip_')}={value:.4f}"
                 for name, value in sorted(logs.items())
@@ -6772,14 +6841,24 @@ class SoundStreamTrainer(nn.Module):
                 ),
                 default=0.,
             )
+            utilization_p999 = [
+                float(values['activation_utilization_p999'])
+                for values in layer_diagnostics.values()
+                if 'activation_utilization_p999' in values
+            ]
             losses_str += (
                 f" | hardware_qat=enabled{int(qat_enabled)}/observer{int(qat_observer)}"
                 f"/alpha{float(getattr(model, 'hardware_qat_blend_alpha', 0.)):.4f}"
+                f"/groups[{','.join(f'{value:.2f}' for value in qat_group_alphas)}]"
                 f" | qat_lr={hardware_qat_lr:.3e}"
+                f" | qat_rvq_margin={float(getattr(model, '_last_hardware_qat_rvq_margin', 0.)):.6f}"
                 f" | qat_latent64_nmse={logs['qat_latent64_nmse']:.6f}"
                 f" | qat_latent32_nmse={logs['qat_latent32_nmse']:.6f}"
                 f" | qat_int32_overflow_max={accumulator_overflow:.6e}"
                 f" | qat_int8_saturation_max={output_saturation:.6f}"
+                f" | qat_u999_mean="
+                f"{(sum(utilization_p999) / len(utilization_p999) if utilization_p999 else 0.):.4f}"
+                f"/min{(min(utilization_p999) if utilization_p999 else 0.):.4f}"
             )
             if flip_parts:
                 losses_str += ' | qat_index_flip[' + ','.join(flip_parts) + ']'
@@ -7204,6 +7283,23 @@ class SoundStreamTrainer(nn.Module):
                 name: self.quality_retention_failure_reasons(metrics)
                 for name, _, metrics in candidate_models
             }
+            full_qat_eligible = bool(
+                self.encoder_only_training and
+                getattr(online_model, 'hardware_qat_is_full', lambda: False)() and
+                not quality_reasons['online'] and
+                online_score.get('qat_int32_overflow_max', float('inf')) <= 0. and
+                online_score.get('qat_latent32_nmse', float('inf')) <=
+                self.hardware_qat_max_latent32_nmse and
+                online_score.get('qat_index_flip_q00', float('inf')) <=
+                self.hardware_qat_max_q00_index_flip and
+                online_score.get('qat_index_flip_q01', float('inf')) <=
+                self.hardware_qat_max_q01_index_flip
+            )
+            full_qat_improved = bool(
+                full_qat_eligible and
+                online_score.get('aligned_si_sdr', float('-inf')) >
+                self.best_full_qat_score
+            )
             eligible_candidates = [
                 (name, model, metrics)
                 for name, model, metrics in candidate_models
@@ -8005,6 +8101,25 @@ class SoundStreamTrainer(nn.Module):
                     f"{steps}: saving best_rvq_projection.pt "
                     f"(aligned_si_sdr={self.best_rvq_projection_aligned_si_sdr:.3f}; "
                     "Q0 clean gate passed)"
+                )
+
+            if full_qat_improved:
+                self.best_full_qat_score = online_score['aligned_si_sdr']
+                self.save_model_only(
+                    self.results_folder / 'best_full_qat.pt',
+                    online_model,
+                    score=self.best_full_qat_score,
+                    step=steps,
+                    weight_source='online_full_int8_qat_gated',
+                )
+                self.save(str(self.results_folder / 'latest.pt'))
+                self.print(
+                    f"{steps}: saving best_full_qat.pt "
+                    f"(aligned_si_sdr={self.best_full_qat_score:.3f}, "
+                    f"nmse32={online_score.get('qat_latent32_nmse', float('inf')):.4f}, "
+                    f"q00/q01_flip={online_score.get('qat_index_flip_q00', float('inf')):.3f}/"
+                    f"{online_score.get('qat_index_flip_q01', float('inf')):.3f}, "
+                    f"overflow={online_score.get('qat_int32_overflow_max', float('inf')):.3e})"
                 )
 
             if rvq_fidelity_improved:

@@ -299,9 +299,9 @@ STAGE_DEFAULTS = {
         preemph_loss_weight=0., noise_floor_loss_weight=0.,
         transient_loss_warmup_steps=0,
         spectral_envelope_loss_weight=0., voiced_highband_loss_weight=0.,
-        stft_recon_loss_weight=0.05, si_sdr_loss_weight=0.07,
-        waveform_recon_loss_weight=0.75,
-        multi_spectral_recon_loss_weight=0.25,
+        stft_recon_loss_weight=0.025, si_sdr_loss_weight=0.05,
+        waveform_recon_loss_weight=0.5,
+        multi_spectral_recon_loss_weight=0.15,
         correlation_loss_weight=0.02,
         gan_start=0, gan_ramp=0,
         gan_adversarial_max=0., gan_feature_max=0.,
@@ -434,14 +434,19 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument('--hardware-qat-observer-start-step', type=int, default=0)
-    parser.add_argument('--hardware-qat-start-step', type=int, default=500)
-    parser.add_argument('--hardware-qat-warm-in-steps', type=int, default=1000)
+    parser.add_argument('--hardware-qat-start-step', type=int, default=1000,
+                        help='First step of weight-only INT8 QAT.')
+    parser.add_argument('--hardware-qat-activation-start-step', type=int, default=2000)
+    parser.add_argument('--hardware-qat-warm-in-steps', type=int, default=600)
+    parser.add_argument('--hardware-qat-block-interval-steps', type=int, default=600)
     parser.add_argument(
-        '--hardware-qat-observer-freeze-step', type=int, default=1500
+        '--hardware-qat-observer-freeze-step', type=int, default=1000
     )
     parser.add_argument('--hardware-qat-ema-decay', type=float, default=0.99)
-    parser.add_argument('--hardware-qat-latent64-weight', type=float, default=0.25)
-    parser.add_argument('--hardware-qat-latent32-weight', type=float, default=0.75)
+    parser.add_argument('--hardware-qat-latent64-weight', type=float, default=0.5)
+    parser.add_argument('--hardware-qat-latent32-weight', type=float, default=1.5)
+    parser.add_argument('--hardware-qat-rvq-margin-weight', type=float, default=0.25)
+    parser.add_argument('--hardware-qat-rvq-margin', type=float, default=0.05)
     parser.add_argument('--hardware-qat-fixed-scale-lr', type=float, default=1e-7)
     parser.add_argument('--hardware-qat-final-polish-step', type=int, default=5000)
     parser.add_argument('--hardware-qat-final-polish-lr', type=float, default=5e-8)
@@ -2334,9 +2339,11 @@ def build_model(
     correlation_loss_weight_override: float | None = None,
     hardware_encoder_qat: bool = False,
     hardware_qat_observer_start_step: int = 0,
-    hardware_qat_start_step: int = 500,
-    hardware_qat_warm_in_steps: int = 1000,
-    hardware_qat_observer_freeze_step: int = 1500,
+    hardware_qat_start_step: int = 1000,
+    hardware_qat_activation_start_step: int = 2000,
+    hardware_qat_warm_in_steps: int = 600,
+    hardware_qat_block_interval_steps: int = 600,
+    hardware_qat_observer_freeze_step: int = 1000,
     hardware_qat_ema_decay: float = 0.99,
 ) -> SoundStream:
     if sync_codebook is None:
@@ -2462,7 +2469,9 @@ def build_model(
         hardware_encoder_qat=hardware_encoder_qat,
         hardware_qat_observer_start_step=hardware_qat_observer_start_step,
         hardware_qat_start_step=hardware_qat_start_step,
+        hardware_qat_activation_start_step=hardware_qat_activation_start_step,
         hardware_qat_warm_in_steps=hardware_qat_warm_in_steps,
+        hardware_qat_block_interval_steps=hardware_qat_block_interval_steps,
         hardware_qat_observer_freeze_step=(
             hardware_qat_observer_freeze_step
         ),
@@ -2495,16 +2504,22 @@ def main() -> None:
             '--hardware-qat-start-step must be >= '
             '--hardware-qat-observer-start-step'
         )
-    if args.hardware_qat_observer_freeze_step < args.hardware_qat_start_step:
+    if args.hardware_qat_observer_freeze_step > args.hardware_qat_start_step:
         raise ValueError(
-            '--hardware-qat-observer-freeze-step must be >= '
+            '--hardware-qat-observer-freeze-step must be <= '
             '--hardware-qat-start-step'
         )
+    if args.hardware_qat_activation_start_step < args.hardware_qat_start_step:
+        raise ValueError('--hardware-qat-activation-start-step must be >= --hardware-qat-start-step')
+    if args.hardware_qat_block_interval_steps < 0:
+        raise ValueError('--hardware-qat-block-interval-steps cannot be negative')
     if args.hardware_qat_warm_in_steps < 0:
         raise ValueError('--hardware-qat-warm-in-steps cannot be negative')
     for name in (
         'hardware_qat_latent64_weight',
         'hardware_qat_latent32_weight',
+        'hardware_qat_rvq_margin_weight',
+        'hardware_qat_rvq_margin',
         'hardware_qat_fixed_scale_lr',
         'hardware_qat_final_polish_lr',
         'hardware_qat_max_latent32_nmse',
@@ -4278,7 +4293,9 @@ def main() -> None:
         hardware_encoder_qat=(args.stage == 'hardware_qat_finetune'),
         hardware_qat_observer_start_step=args.hardware_qat_observer_start_step,
         hardware_qat_start_step=args.hardware_qat_start_step,
+        hardware_qat_activation_start_step=args.hardware_qat_activation_start_step,
         hardware_qat_warm_in_steps=args.hardware_qat_warm_in_steps,
+        hardware_qat_block_interval_steps=args.hardware_qat_block_interval_steps,
         hardware_qat_observer_freeze_step=(
             args.hardware_qat_observer_freeze_step
         ),
@@ -4617,7 +4634,7 @@ def main() -> None:
             else (
                 stage_defaults.get("min_steps", 0)
                 if args.stage in ("stream_finetune", "stream_finetune_long")
-                else args.hardware_qat_observer_freeze_step
+                else args.hardware_qat_final_polish_step
                 if args.stage == 'hardware_qat_finetune'
                 else 0
             )
@@ -4893,6 +4910,8 @@ def main() -> None:
         encoder_only_training=(args.stage == 'hardware_qat_finetune'),
         hardware_qat_latent64_weight=args.hardware_qat_latent64_weight,
         hardware_qat_latent32_weight=args.hardware_qat_latent32_weight,
+        hardware_qat_rvq_margin_weight=args.hardware_qat_rvq_margin_weight,
+        hardware_qat_rvq_margin=args.hardware_qat_rvq_margin,
         hardware_qat_fixed_scale_step=args.hardware_qat_observer_freeze_step,
         hardware_qat_fixed_scale_lr=args.hardware_qat_fixed_scale_lr,
         hardware_qat_final_polish_step=args.hardware_qat_final_polish_step,
@@ -5198,14 +5217,17 @@ def main() -> None:
                     'Hardware QAT schedule: '
                     f'observer-only={args.hardware_qat_observer_start_step}..'
                     f'{args.hardware_qat_start_step - 1}; '
-                    f'fake-quant warm-in starts={args.hardware_qat_start_step}, '
-                    f'blend_steps={args.hardware_qat_warm_in_steps}; '
+                    f'weight-only starts={args.hardware_qat_start_step}; '
+                    f'blockwise activation starts={args.hardware_qat_activation_start_step}, '
+                    f'per-block blend={args.hardware_qat_warm_in_steps}, '
+                    f'block interval={args.hardware_qat_block_interval_steps}; '
                     f'observer_freeze={args.hardware_qat_observer_freeze_step}; '
                     f'fixed_scale_lr={args.hardware_qat_fixed_scale_lr:g}; '
                     f'final_polish={args.hardware_qat_final_polish_step} '
                     f'at lr={args.hardware_qat_final_polish_lr:g}; '
                     f'teacher_weights=64D:{args.hardware_qat_latent64_weight:g}/'
-                    f'32D:{args.hardware_qat_latent32_weight:g}; '
+                    f'32D:{args.hardware_qat_latent32_weight:g}/'
+                    f'RVQ-margin:{args.hardware_qat_rvq_margin_weight:g}; '
                     f'gates=NMSE32<={args.hardware_qat_max_latent32_nmse:g}, '
                     f'q00<={args.hardware_qat_max_q00_index_flip:g}, '
                     f'q01<={args.hardware_qat_max_q01_index_flip:g}.'
@@ -5464,6 +5486,7 @@ def main() -> None:
     best_by_clarity = results_dir / "best_by_clarity.pt"
     best_raw_clarity = results_dir / "best_raw_online_by_clarity.pt"
     best_raw_online = results_dir / "best_raw_online_by_aligned_si_sdr.pt"
+    best_full_qat = results_dir / "best_full_qat.pt"
     if args.test_only:
         best_checkpoint = args.test_checkpoint
     elif args.stage == "gan_pretrain":
@@ -5516,11 +5539,11 @@ def main() -> None:
             )
             if checkpoint.exists()
         ), None)
-    elif args.stage in (
-        "stream_finetune",
-        "stream_finetune_long",
-        "hardware_qat_finetune",
-    ):
+    elif args.stage == "hardware_qat_finetune":
+        # Partial-QAT best files are diagnostics only.  Final test/export must
+        # use a checkpoint saved with all blocks at alpha=1 and observers off.
+        best_checkpoint = best_full_qat if best_full_qat.exists() else None
+    elif args.stage in ("stream_finetune", "stream_finetune_long"):
         # Streaming adaptation is ranked by the gated reconstruction +
         # boundary + offline/stateful consistency score.
         best_checkpoint = next((
@@ -5563,6 +5586,18 @@ def main() -> None:
                 "checkpoint was produced. baseline_init.pt remains an initialization "
                 "reference, not a Stage-2 result."
             )
+
+    if (
+        is_main and not args.test_only and
+        args.stage == 'hardware_qat_finetune' and
+        best_checkpoint is None
+    ):
+        print(
+            'Hardware QAT run FAILED deployment eligibility: no '
+            'best_full_qat.pt satisfied full INT8, fixed observer, NMSE32, '
+            'q00/q01 index-flip, and INT32 overflow gates. Final held-out '
+            'test/export is intentionally skipped.'
+        )
 
     if best_checkpoint is not None and best_checkpoint.exists() and trainer.test_files:
         if is_main and best_checkpoint in (best_raw_clarity, best_raw_online):
@@ -5754,6 +5789,7 @@ def main() -> None:
                 max(codebook_sizes),
                 dtype=torch.float64
             )
+
         ).to(trainer.device)
         global_code_counts = trainer.accelerator.reduce(
             local_code_counts,

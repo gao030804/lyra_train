@@ -51,9 +51,24 @@ class SymmetricActivationFakeQuant(nn.Module):
         # zero_point remains fixed at 0 to match the MAC datapath.
         self.register_buffer("scale", torch.tensor(1.))
         self.register_buffer("num_observations", torch.tensor(0, dtype=torch.long))
-        self.enabled = False
-        self.observer_enabled = False
-        self.blend_alpha = 1.
+        # Runtime QAT state is persistent.  A model-only best checkpoint must
+        # not silently come back in observer/FP32 mode when it is evaluated or
+        # exported in a fresh process.
+        self.register_buffer("enabled_state", torch.tensor(False))
+        self.register_buffer("observer_enabled_state", torch.tensor(False))
+        self.register_buffer("blend_alpha_state", torch.tensor(1.))
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.enabled_state.item())
+
+    @property
+    def observer_enabled(self) -> bool:
+        return bool(self.observer_enabled_state.item())
+
+    @property
+    def blend_alpha(self) -> float:
+        return float(self.blend_alpha_state.item())
 
     def set_state(
         self,
@@ -64,9 +79,9 @@ class SymmetricActivationFakeQuant(nn.Module):
     ) -> None:
         if not 0. <= blend_alpha <= 1.:
             raise ValueError("blend_alpha must be in [0, 1]")
-        self.enabled = bool(enabled)
-        self.observer_enabled = bool(observer_enabled)
-        self.blend_alpha = float(blend_alpha)
+        self.enabled_state.fill_(bool(enabled))
+        self.observer_enabled_state.fill_(bool(observer_enabled))
+        self.blend_alpha_state.fill_(float(blend_alpha))
 
     @torch.no_grad()
     def observe(self, x: torch.Tensor) -> None:

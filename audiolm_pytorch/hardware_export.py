@@ -155,6 +155,10 @@ def export_hardware_encoder_package(
             continue
         if module.hardware_input_fake_quant is None or module.hardware_output_fake_quant is None:
             continue
+        if not getattr(module, 'hardware_weight_qat_enabled', False):
+            raise RuntimeError(f"{name}: weight fake quant is not enabled")
+        if not getattr(module, 'hardware_activation_qat_enabled', False):
+            raise RuntimeError(f"{name}: activation fake quant is not enabled")
         for label, quantizer in (
             ("input", module.hardware_input_fake_quant),
             ("output", module.hardware_output_fake_quant),
@@ -163,6 +167,12 @@ def export_hardware_encoder_package(
                 raise RuntimeError(f"{name}: {label} activation scale was never calibrated")
             if quantizer.observer_enabled:
                 raise RuntimeError(f"{name}: freeze observers before exporting")
+            if not quantizer.enabled:
+                raise RuntimeError(f"{name}: {label} fake quant is not enabled")
+            if quantizer.blend_alpha < 1.:
+                raise RuntimeError(
+                    f"{name}: {label} blend_alpha={quantizer.blend_alpha:g}, expected 1"
+                )
 
         conv = module.conv
         input_scale = module.hardware_input_fake_quant.scale.detach().float()
