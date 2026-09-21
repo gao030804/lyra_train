@@ -149,7 +149,9 @@ def test_hardware_qat_supports_current_lowrank_dscnn_encoder_and_keeps_shape():
         encoder_low_rank_pointwise_ranks=((0, 0), (8, 16), (16, 32), (32, 64)),
         hardware_compatible_encoder=True,
         hardware_encoder_qat=True,
+        hardware_qat_observer_start_step=0,
         hardware_qat_start_step=1,
+        hardware_qat_warm_in_steps=2,
         hardware_qat_observer_freeze_step=3,
         pad_mode="constant",
     ).eval()
@@ -164,9 +166,12 @@ def test_hardware_qat_supports_current_lowrank_dscnn_encoder_and_keeps_shape():
         encoded = model.encoder(torch.randn(1, 1, 320))
     assert encoded.shape == (1, 64, 1)
 
-    assert model.update_hardware_qat(0) == (False, False)
+    assert model.update_hardware_qat(0) == (False, True)
+    assert model.hardware_qat_blend_alpha == 0.
     assert model.update_hardware_qat(1) == (True, True)
+    assert model.hardware_qat_blend_alpha == 0.5
     assert model.update_hardware_qat(3) == (True, False)
+    assert model.hardware_qat_blend_alpha == 1.
     assert (
         model.encoder[0].hardware_output_fake_quant is
         hardware_input_fake_quant(model.encoder[1])
@@ -224,6 +229,23 @@ def test_hardware_qat_causal_conv_quantizes_bias_and_backpropagates():
     assert 0. <= report["output_saturation_rate"] <= 1.
     assert len(report["requant_multiplier"]) == 8
     assert len(report["requant_shift"]) == 8
+
+
+def test_observer_only_calibrates_conv_output_without_changing_float_forward():
+    layer = CausalConv1d(1, 2, 3, pad_mode="constant")
+    layer.configure_hardware_qat(ema_decay=0.)
+    layer.train()
+    layer.set_hardware_qat_state(
+        enabled=False,
+        observer_enabled=True,
+        blend_alpha=0.,
+    )
+    x = torch.randn(2, 1, 32)
+    expected = layer.conv(torch.nn.functional.pad(x, (2, 0)))
+    actual = layer(x)
+    torch.testing.assert_close(actual, expected)
+    assert layer.hardware_input_fake_quant.num_observations.item() == 1
+    assert layer.hardware_output_fake_quant.num_observations.item() == 1
 
 
 def test_weight_packing_matches_rtl_4x8_byte_order():

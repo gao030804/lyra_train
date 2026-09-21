@@ -506,11 +506,14 @@ class Residual(Module):
     def configure_hardware_qat(self, ema_decay = 0.99):
         self.hardware_residual_add = HardwareResidualAdd(ema_decay=ema_decay)
 
-    def set_hardware_qat_state(self, *, enabled, observer_enabled):
+    def set_hardware_qat_state(
+        self, *, enabled, observer_enabled, blend_alpha=1.
+    ):
         if exists(self.hardware_residual_add):
             self.hardware_residual_add.set_hardware_qat_state(
                 enabled=enabled,
                 observer_enabled=observer_enabled,
+                blend_alpha=blend_alpha,
             )
 
     def set_residual_scale(self, scale: float):
@@ -549,6 +552,7 @@ class CausalConv1d(Module):
         self.hardware_weight_fake_quant = None
         self.hardware_input_observer_owned_by_producer = False
         self._hardware_diagnostics = {}
+        self.hardware_qat_blend_alpha = 1.
 
     def configure_hardware_qat(self, ema_decay = 0.99):
         self.hardware_input_fake_quant = SymmetricActivationFakeQuant(ema_decay)
@@ -562,7 +566,10 @@ class CausalConv1d(Module):
         self.hardware_input_fake_quant = producer
         self.hardware_input_observer_owned_by_producer = True
 
-    def set_hardware_qat_state(self, *, enabled, observer_enabled):
+    def set_hardware_qat_state(
+        self, *, enabled, observer_enabled, blend_alpha=1.
+    ):
+        self.hardware_qat_blend_alpha = float(blend_alpha)
         for fake_quant in (
             self.hardware_input_fake_quant,
             self.hardware_output_fake_quant,
@@ -571,6 +578,7 @@ class CausalConv1d(Module):
                 fake_quant.set_state(
                     enabled=enabled,
                     observer_enabled=observer_enabled,
+                    blend_alpha=blend_alpha,
                 )
 
     def hardware_quantization_diagnostics(self):
@@ -592,18 +600,34 @@ class CausalConv1d(Module):
         if self.hardware_input_observer_owned_by_producer:
             if self.hardware_input_fake_quant.enabled:
                 input_scale = self.hardware_input_fake_quant.effective_scale(x)
-                x = self.hardware_input_fake_quant.quantize(
+                quantized_input = self.hardware_input_fake_quant.quantize(
                     x, scale=input_scale
                 ) * input_scale
+                x = x + self.hardware_qat_blend_alpha * (
+                    quantized_input - x
+                )
         else:
             x = self.hardware_input_fake_quant(x)
         if not self.hardware_input_fake_quant.enabled:
-            return self.conv(x)
+            output = self.conv(x)
+            if self.training and self.hardware_output_fake_quant.observer_enabled:
+                self.hardware_output_fake_quant.observe(output)
+            return output
 
-        weight, weight_scale = self.hardware_weight_fake_quant(self.conv.weight)
+        weight, weight_scale = self.hardware_weight_fake_quant(
+            self.conv.weight,
+            blend_alpha=self.hardware_qat_blend_alpha,
+        )
         input_scale = self.hardware_input_fake_quant.effective_scale(x)
-        bias = quantize_bias_dequantized(
+        quantized_bias = quantize_bias_dequantized(
             self.conv.bias, input_scale, weight_scale
+        )
+        bias = (
+            None
+            if self.conv.bias is None
+            else self.conv.bias + self.hardware_qat_blend_alpha * (
+                quantized_bias - self.conv.bias
+            )
         )
         output = F.conv1d(
             x, weight, bias, self.conv.stride, self.conv.padding,
@@ -1230,8 +1254,10 @@ class SoundStream(Module):
         pad_mode = 'reflect',
         hardware_compatible_encoder = False,
         hardware_encoder_qat = False,
-        hardware_qat_start_step = 1000,
-        hardware_qat_observer_freeze_step = 4000,
+        hardware_qat_observer_start_step = 0,
+        hardware_qat_start_step = 500,
+        hardware_qat_warm_in_steps = 1000,
+        hardware_qat_observer_freeze_step = 1500,
         hardware_qat_ema_decay = 0.99,
         stft_discriminator: Module | None = None,  # can pass in own stft discriminator
         complex_stft_discr_kwargs: dict = dict()
@@ -1263,15 +1289,26 @@ class SoundStream(Module):
             raise ValueError(
                 'hardware-compatible Encoder requires zero/constant padding'
             )
-        if hardware_qat_start_step < 0:
-            raise ValueError('hardware_qat_start_step must be non-negative')
+        if hardware_qat_observer_start_step < 0:
+            raise ValueError('hardware_qat_observer_start_step must be non-negative')
+        if hardware_qat_start_step < hardware_qat_observer_start_step:
+            raise ValueError(
+                'hardware_qat_start_step must be >= '
+                'hardware_qat_observer_start_step'
+            )
+        if hardware_qat_warm_in_steps < 0:
+            raise ValueError('hardware_qat_warm_in_steps must be non-negative')
         if hardware_qat_observer_freeze_step < hardware_qat_start_step:
             raise ValueError(
                 'hardware_qat_observer_freeze_step must be >= hardware_qat_start_step'
             )
         self.hardware_compatible_encoder = bool(hardware_compatible_encoder)
         self.hardware_encoder_qat = bool(hardware_encoder_qat)
+        self.hardware_qat_observer_start_step = int(
+            hardware_qat_observer_start_step
+        )
         self.hardware_qat_start_step = int(hardware_qat_start_step)
+        self.hardware_qat_warm_in_steps = int(hardware_qat_warm_in_steps)
         self.hardware_qat_observer_freeze_step = int(
             hardware_qat_observer_freeze_step
         )
@@ -3673,14 +3710,25 @@ class SoundStream(Module):
         step = int(step)
         enabled = step >= self.hardware_qat_start_step
         observer_enabled = (
-            enabled and step < self.hardware_qat_observer_freeze_step
+            self.hardware_qat_observer_start_step <= step <
+            self.hardware_qat_observer_freeze_step
         )
+        blend_alpha = (
+            min(
+                1.,
+                float(step - self.hardware_qat_start_step + 1) /
+                float(max(1, self.hardware_qat_warm_in_steps)),
+            )
+            if enabled else 0.
+        )
+        self.hardware_qat_blend_alpha = blend_alpha
         for module in self.encoder.modules():
             setter = getattr(module, 'set_hardware_qat_state', None)
             if callable(setter):
                 setter(
                     enabled=enabled,
                     observer_enabled=observer_enabled,
+                    blend_alpha=blend_alpha,
                 )
         return enabled, observer_enabled
 

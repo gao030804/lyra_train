@@ -298,8 +298,15 @@ class SoundStreamTrainer(nn.Module):
         exclude_rq_from_generator_optimizer: bool = False,
         exclude_encoder_from_generator_optimizer: bool = False,
         encoder_only_training: bool = False,
-        hardware_qat_latent64_weight: float = 0.10,
-        hardware_qat_latent32_weight: float = 0.05,
+        hardware_qat_latent64_weight: float = 0.25,
+        hardware_qat_latent32_weight: float = 0.75,
+        hardware_qat_fixed_scale_step: int = 1500,
+        hardware_qat_fixed_scale_lr: float = 1e-7,
+        hardware_qat_final_polish_step: int = 5000,
+        hardware_qat_final_polish_lr: float = 5e-8,
+        hardware_qat_max_latent32_nmse: float = 0.03,
+        hardware_qat_max_q00_index_flip: float = 0.10,
+        hardware_qat_max_q01_index_flip: float = 0.15,
         exclude_first_decoder_block_from_generator_optimizer: bool = False,
         discr_lr: float | None = None,
         stft_discr_lr: float | None = None,
@@ -799,6 +806,13 @@ class SoundStreamTrainer(nn.Module):
         self.encoder_only_training = bool(encoder_only_training)
         self.hardware_qat_latent64_weight = float(hardware_qat_latent64_weight)
         self.hardware_qat_latent32_weight = float(hardware_qat_latent32_weight)
+        self.hardware_qat_fixed_scale_step = int(hardware_qat_fixed_scale_step)
+        self.hardware_qat_fixed_scale_lr = float(hardware_qat_fixed_scale_lr)
+        self.hardware_qat_final_polish_step = int(hardware_qat_final_polish_step)
+        self.hardware_qat_final_polish_lr = float(hardware_qat_final_polish_lr)
+        self.hardware_qat_max_latent32_nmse = float(hardware_qat_max_latent32_nmse)
+        self.hardware_qat_max_q00_index_flip = float(hardware_qat_max_q00_index_flip)
+        self.hardware_qat_max_q01_index_flip = float(hardware_qat_max_q01_index_flip)
         self.rq_excluded_from_generator_optimizer = bool(
             exclude_rq_from_generator_optimizer
         )
@@ -2256,6 +2270,8 @@ class SoundStreamTrainer(nn.Module):
         metric_wave = wave[..., context_samples:] if context_samples else wave
         metric_recon = recon[..., context_samples:] if context_samples else recon
         metrics = self.reconstruction_metrics(model, metric_wave, metric_recon)
+        if self.encoder_only_training and model is self.unwrapped_soundstream:
+            metrics.update(self.hardware_qat_validation_metrics(wave))
         if not (
             bool(getattr(model, 'bypass_rvq', False)) or
             bool(getattr(model, 'rq_projection_only', False))
@@ -3847,6 +3863,19 @@ class SoundStreamTrainer(nn.Module):
         # the quantizer satisfies the explicit collapse definition above.
         if not bypass_rvq and metrics.get('q01_validation_eligible', 0.) < 0.5:
             reasons.append('q01')
+        if self.encoder_only_training:
+            if metrics.get('qat_latent32_nmse', float('inf')) > (
+                self.hardware_qat_max_latent32_nmse + tolerance
+            ):
+                reasons.append('qat_latent32_nmse')
+            if metrics.get('qat_index_flip_q00', float('inf')) > (
+                self.hardware_qat_max_q00_index_flip + tolerance
+            ):
+                reasons.append('qat_q00_flip')
+            if metrics.get('qat_index_flip_q01', float('inf')) > (
+                self.hardware_qat_max_q01_index_flip + tolerance
+            ):
+                reasons.append('qat_q01_flip')
         return reasons
 
     def evaluate_fixed_validation_score(self, model):
@@ -5563,6 +5592,59 @@ class SoundStreamTrainer(nn.Module):
         )
         return weighted, latent64_nmse, latent32_nmse
 
+    @torch.no_grad()
+    def hardware_qat_validation_metrics(self, wave):
+        """Measure fixed-validation latent fidelity against the immutable B2 Encoder."""
+        reference = self._stage2_latent_reference_encoder
+        if reference is None:
+            return {}
+        model = self.unwrapped_soundstream
+        encoder_input, _ = model.process_input(wave)
+        student64 = rearrange(
+            model.encoder(encoder_input), 'b c n -> b n c'
+        ).float()
+        teacher64 = rearrange(
+            reference(encoder_input), 'b c n -> b n c'
+        ).float()
+        student32 = model.rq_input_projection(student64)
+        teacher32 = model.rq_input_projection(teacher64)
+        latent64_nmse = F.mse_loss(student64, teacher64) / (
+            teacher64.square().mean().clamp_min(1e-8)
+        )
+        latent32_nmse = F.mse_loss(student32, teacher32) / (
+            teacher32.square().mean().clamp_min(1e-8)
+        )
+        _, student_indices, _ = model.rq(student32, freeze_codebook=True)
+        _, teacher_indices, _ = model.rq(teacher32, freeze_codebook=True)
+        per_level = (
+            (student_indices != teacher_indices).float().mean(dim=(0, 1, 2))
+        )
+        output = {
+            'qat_latent64_nmse': float(latent64_nmse.cpu()),
+            'qat_latent32_nmse': float(latent32_nmse.cpu()),
+        }
+        output.update({
+            f'qat_index_flip_q{index:02d}': float(value.cpu())
+            for index, value in enumerate(per_level)
+        })
+        return output
+
+    def update_hardware_qat_lr(self, steps):
+        """Apply the conservative fixed-scale and final-polish QAT LR phases."""
+        if not self.encoder_only_training:
+            return self.optim.optimizer.param_groups[0]['lr']
+        target_lr = None
+        if steps >= self.hardware_qat_final_polish_step:
+            target_lr = self.hardware_qat_final_polish_lr
+        elif steps >= self.hardware_qat_fixed_scale_step:
+            target_lr = self.hardware_qat_fixed_scale_lr
+        if target_lr is None:
+            return self.optim.optimizer.param_groups[0]['lr']
+        for group in self.optim.optimizer.param_groups:
+            group['lr'] = target_lr * float(group.get('lr_scale', 1.))
+        self.optim.sync_warmup_lrs_from_optimizer()
+        return target_lr
+
     @contextmanager
     def frozen_decoder_stack(self):
         """Temporarily update Encoder/RVQ while keeping all Decoder modules fixed."""
@@ -5952,6 +6034,7 @@ class SoundStreamTrainer(nn.Module):
             hardware_qat_state = self.unwrapped_soundstream.update_hardware_qat(
                 steps
             )
+        hardware_qat_lr = self.update_hardware_qat_lr(steps)
         log_losses = self.log_losses_every > 0 and not (steps % self.log_losses_every)
         if self.best_checkpoint_metric == 'recon_pretrain':
             self.unwrapped_soundstream.correlation_loss_weight = (
@@ -6058,7 +6141,10 @@ class SoundStreamTrainer(nn.Module):
             exists(self.freeze_decoder_before_step) and
             steps < self.freeze_decoder_before_step
         )
-        generator_frozen = steps < self.generator_freeze_steps
+        generator_frozen = (
+            steps < self.generator_freeze_steps or
+            (self.encoder_only_training and freeze_encoder)
+        )
         generator_released = self.release_generator_freeze(steps)
         decoder_residual_scale = self.update_decoder_residual_scale(steps)
         stream_loss_weights = None
@@ -6688,6 +6774,8 @@ class SoundStreamTrainer(nn.Module):
             )
             losses_str += (
                 f" | hardware_qat=enabled{int(qat_enabled)}/observer{int(qat_observer)}"
+                f"/alpha{float(getattr(model, 'hardware_qat_blend_alpha', 0.)):.4f}"
+                f" | qat_lr={hardware_qat_lr:.3e}"
                 f" | qat_latent64_nmse={logs['qat_latent64_nmse']:.6f}"
                 f" | qat_latent32_nmse={logs['qat_latent32_nmse']:.6f}"
                 f" | qat_int32_overflow_max={accumulator_overflow:.6e}"
@@ -7671,7 +7759,7 @@ class SoundStreamTrainer(nn.Module):
                     rvq_bad = all(
                         (
                             any(
-                                reason.startswith('q00')
+                                reason.startswith(('q00', 'qat_q00', 'qat_q01'))
                                 for reason in quality_reasons[name]
                             ) or
                             'q01' in quality_reasons[name]

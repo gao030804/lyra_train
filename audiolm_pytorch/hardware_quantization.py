@@ -53,10 +53,20 @@ class SymmetricActivationFakeQuant(nn.Module):
         self.register_buffer("num_observations", torch.tensor(0, dtype=torch.long))
         self.enabled = False
         self.observer_enabled = False
+        self.blend_alpha = 1.
 
-    def set_state(self, *, enabled: bool, observer_enabled: bool) -> None:
+    def set_state(
+        self,
+        *,
+        enabled: bool,
+        observer_enabled: bool,
+        blend_alpha: float = 1.,
+    ) -> None:
+        if not 0. <= blend_alpha <= 1.:
+            raise ValueError("blend_alpha must be in [0, 1]")
         self.enabled = bool(enabled)
         self.observer_enabled = bool(observer_enabled)
+        self.blend_alpha = float(blend_alpha)
 
     @torch.no_grad()
     def observe(self, x: torch.Tensor) -> None:
@@ -98,7 +108,8 @@ class SymmetricActivationFakeQuant(nn.Module):
         if not self.enabled:
             return x
         scale = self.effective_scale(x)
-        return self.quantize(x, scale=scale) * scale
+        quantized = self.quantize(x, scale=scale) * scale
+        return x + self.blend_alpha * (quantized - x)
 
 
 class PerOutputChannelWeightFakeQuant(nn.Module):
@@ -112,9 +123,15 @@ class PerOutputChannelWeightFakeQuant(nn.Module):
         qweight = round_ste(weight / scale).clamp(INT8_QMIN, INT8_QMAX)
         return qweight, scale
 
-    def forward(self, weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        weight: torch.Tensor,
+        blend_alpha: float = 1.,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         qweight, scale = self.quantize(weight)
-        return qweight * scale, scale
+        quantized = qweight * scale
+        blended = weight + float(blend_alpha) * (quantized - weight)
+        return blended, scale
 
 
 def approximate_requant_multiplier(
@@ -183,8 +200,14 @@ class HardwareReLU(nn.Module):
         self.fake_quant = fake_quant
         self.observer_owned_by_producer = True
 
-    def set_hardware_qat_state(self, *, enabled: bool, observer_enabled: bool) -> None:
-        self.fake_quant.set_state(enabled=enabled, observer_enabled=observer_enabled)
+    def set_hardware_qat_state(
+        self, *, enabled: bool, observer_enabled: bool, blend_alpha: float = 1.
+    ) -> None:
+        self.fake_quant.set_state(
+            enabled=enabled,
+            observer_enabled=observer_enabled,
+            blend_alpha=blend_alpha,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         float_output = F.relu(x)
@@ -201,7 +224,10 @@ class HardwareReLU(nn.Module):
         scale = self.fake_quant.effective_scale(x)
         qinput = self.fake_quant.quantize(x, scale=scale)
         qoutput = qinput.clamp_min(0.)
-        return qoutput * scale
+        quantized = qoutput * scale
+        return float_output + self.fake_quant.blend_alpha * (
+            quantized - float_output
+        )
 
 
 class HardwareResidualAdd(nn.Module):
@@ -211,8 +237,14 @@ class HardwareResidualAdd(nn.Module):
         super().__init__()
         self.fake_quant = SymmetricActivationFakeQuant(ema_decay=ema_decay)
 
-    def set_hardware_qat_state(self, *, enabled: bool, observer_enabled: bool) -> None:
-        self.fake_quant.set_state(enabled=enabled, observer_enabled=observer_enabled)
+    def set_hardware_qat_state(
+        self, *, enabled: bool, observer_enabled: bool, blend_alpha: float = 1.
+    ) -> None:
+        self.fake_quant.set_state(
+            enabled=enabled,
+            observer_enabled=observer_enabled,
+            blend_alpha=blend_alpha,
+        )
 
     def forward(
         self,
@@ -263,7 +295,10 @@ class HardwareResidualAdd(nn.Module):
             INT8_QMIN,
             INT8_QMAX,
         )
-        return qoutput * scale
+        quantized = qoutput * scale
+        return float_output + self.fake_quant.blend_alpha * (
+            quantized - float_output
+        )
 
     def integer_parameters(
         self,
