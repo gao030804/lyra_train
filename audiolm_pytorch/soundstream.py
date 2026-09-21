@@ -4090,18 +4090,25 @@ class FrameStreamingSoundStream(SoundStream):
             offline_recon,
             stream_recon,
         )
-        # This objective measures implementation consistency, not perceptual
-        # reconstruction quality.  The previous reuse of reconstruction_losses
-        # included a multi-scale log-Mel L2 term.  Tiny near-silence differences
-        # between the offline and stateful paths could therefore produce raw
-        # training losses around 5-15 while validation stayed near 0.04.  A
-        # direct waveform Smooth-L1 is deterministic, robust to isolated
-        # outliers, and keeps train / validation values in the same units.
-        return F.smooth_l1_loss(
-            stream_recon,
-            offline_recon,
-            beta = 0.01,
+        difference = stream_recon - offline_recon
+        absolute_l1 = difference.abs().mean()
+        reference_l1 = offline_recon.abs().mean().clamp_min(1e-4)
+        relative_l1 = absolute_l1 / reference_l1
+        relative_nmse = (
+            difference.float().square().mean() /
+            offline_recon.float().square().mean().clamp_min(1e-8)
         )
+        # A dimensionless relative objective keeps quiet and loud batches on a
+        # comparable scale.  The small NMSE term exposes isolated seam energy
+        # without returning to the unstable log-Mel consistency objective.
+        loss = relative_l1 + 0.25 * relative_nmse
+        self._last_stream_consistency_metrics = {
+            'relative': loss.detach(),
+            'l1': absolute_l1.detach(),
+            'nmse': relative_nmse.detach(),
+            'maxerr': difference.detach().abs().amax(),
+        }
+        return loss
 
     def frame_boundary_loss(self, recon_x):
         weight = self.boundary_loss_weight
@@ -4116,7 +4123,9 @@ class FrameStreamingSoundStream(SoundStream):
         if seq_len <= frame_size:
             return self.zero
 
-        losses = []
+        value_losses = []
+        first_difference_losses = []
+        second_difference_losses = []
 
         for boundary in range(frame_size, seq_len, frame_size):
             if boundary < 2 or boundary + 1 >= seq_len:
@@ -4135,8 +4144,8 @@ class FrameStreamingSoundStream(SoundStream):
                 recon_x[..., boundary - 1]
             )
             expected_slope = 0.5 * (left_slope + right_slope)
-            losses.append(F.l1_loss(seam_slope, expected_slope))
-            losses.append(F.l1_loss(right_slope, left_slope))
+            first_difference_losses.append(F.l1_loss(seam_slope, expected_slope))
+            first_difference_losses.append(F.l1_loss(right_slope, left_slope))
 
             left = recon_x[..., max(0, boundary - radius):boundary]
             right = recon_x[..., boundary:min(seq_len, boundary + radius)]
@@ -4147,12 +4156,39 @@ class FrameStreamingSoundStream(SoundStream):
                 right_delta_rms = (
                     right.diff(dim=-1).square().mean(dim=-1).clamp_min(1e-8).sqrt()
                 )
-                losses.append(F.l1_loss(right_delta_rms, left_delta_rms))
+                value_losses.append(F.l1_loss(right_delta_rms, left_delta_rms))
+            for local_radius in (4, 8, 16, 32):
+                if boundary < local_radius or boundary + local_radius > seq_len:
+                    continue
+                left_local = recon_x[..., boundary-local_radius:boundary]
+                right_local = recon_x[..., boundary:boundary+local_radius]
+                value_losses.append(F.l1_loss(
+                    right_local.mean(dim=-1), left_local.mean(dim=-1)
+                ))
+                if local_radius >= 3:
+                    second_difference_losses.append(F.l1_loss(
+                        right_local.diff(n=2, dim=-1).abs().mean(dim=-1),
+                        left_local.diff(n=2, dim=-1).abs().mean(dim=-1),
+                    ))
 
+        losses = [*value_losses, *first_difference_losses, *second_difference_losses]
         if not losses:
             return self.zero
-
-        return torch.stack(losses).mean()
+        value = torch.stack(value_losses).mean() if value_losses else self.zero
+        first = (
+            torch.stack(first_difference_losses).mean()
+            if first_difference_losses else self.zero
+        )
+        second = (
+            torch.stack(second_difference_losses).mean()
+            if second_difference_losses else self.zero
+        )
+        self._last_boundary_metrics = {
+            'value': value.detach(),
+            'first': first.detach(),
+            'second': second.detach(),
+        }
+        return value + 0.5 * first + 0.25 * second
 
     def encode_frame(
         self,
@@ -4414,6 +4450,13 @@ class FrameStreamingSoundStream(SoundStream):
             recon_x = recon_x[..., context_samples:]
             if exists(target):
                 target = target[..., context_samples:]
+
+        # Match the ordinary SoundStream teacher-retention contract.  The
+        # stateful student reconstruction has already dropped burn-in audio,
+        # while quantized intentionally retains it so the frozen offline B2
+        # Decoder can reconstruct the same context and crop it in the trainer.
+        self._last_student_latent64_for_teacher = quantized
+        self._last_student_recon_for_teacher = recon_x
 
         if return_codes_only:
             return indices

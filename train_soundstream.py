@@ -257,25 +257,32 @@ STAGE_DEFAULTS = {
         gan_adversarial_max=0., gan_feature_max=0.,
     ),
     "stream_finetune_long": dict(
-        steps=10_000, batch_size=2, segment_seconds=4.,
-        save_every=1_000, eval_every=250, min_steps=5_000, patience=20,
-        lr=2e-7, discr_lr=None, stft_discr_lr=None, ema_beta=0.999,
+        # Final state alignment is a short calibration from an already-good
+        # B2 checkpoint, not another spectral reconstruction stage.
+        steps=3_000, batch_size=2, segment_seconds=4.,
+        save_every=500, eval_every=250, min_steps=500, patience=3,
+        lr=5e-8, discr_lr=None, stft_discr_lr=None, ema_beta=0.999,
         ema_update_after_step=0, ema_update_every=1,
         use_ema=False,
         click_loss_weight=0., jump_loss_weight=0.,
-        preemph_loss_weight=0., noise_floor_loss_weight=0.03,
+        preemph_loss_weight=0., noise_floor_loss_weight=0.005,
         transient_loss_warmup_steps=0,
-        spectral_envelope_loss_weight=0.05,
-        voiced_highband_loss_weight=0.07,
-        voiced_hf_retention_loss_weight=0.02,
+        spectral_envelope_loss_weight=0.005,
+        voiced_highband_loss_weight=0.005,
+        voiced_hf_retention_loss_weight=0.002,
         stft_recon_loss_weight=0.,
-        si_sdr_loss_weight=0.07,
-        boundary_loss_weight=0.02,
+        si_sdr_loss_weight=0.12,
+        boundary_loss_weight=0.15,
         boundary_loss_start_steps=0,
         boundary_loss_warmup_steps=0,
-        stream_consistency_loss_weight=0.10,
+        stream_consistency_loss_weight=0.75,
         stream_consistency_loss_start_steps=0,
         stream_consistency_loss_warmup_steps=0,
+        waveform_recon_loss_weight=0.75,
+        multi_spectral_recon_loss_weight=0.15,
+        correlation_loss_weight=0.02,
+        teacher_retention_weight=0.75,
+        decoder_trainable_from_block=2,
         gan_start=0, gan_ramp=0,
         gan_adversarial_max=0., gan_feature_max=0.,
     ),
@@ -1766,6 +1773,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
     )
     parser.add_argument(
+        "--state-teacher-retention-weight",
+        type=float,
+        default=None,
+        help="Frozen B2 Decoder waveform/log-STFT retention weight for final state calibration.",
+    )
+    parser.add_argument(
+        "--state-decoder-trainable-from-block",
+        type=int,
+        default=None,
+        help="First Decoder upsampling block trained by final state calibration (0-based).",
+    )
+    parser.add_argument(
         "--valid-frac",
         type=float,
         default=0.05,
@@ -2277,6 +2296,7 @@ def build_model(
     rq_projection_only: bool = False,
     recon_loss_weight_override: float | None = None,
     multi_spectral_recon_loss_weight_override: float | None = None,
+    correlation_loss_weight_override: float | None = None,
 ) -> SoundStream:
     if sync_codebook is None:
         sync_codebook = int(os.environ.get("WORLD_SIZE", "1")) > 1
@@ -2306,6 +2326,8 @@ def build_model(
         multi_spectral_recon_loss_weight = float(
             multi_spectral_recon_loss_weight_override
         )
+    if correlation_loss_weight_override is not None:
+        correlation_loss_weight = float(correlation_loss_weight_override)
 
     model_kwargs = dict(
         channels=16,
@@ -2685,6 +2707,18 @@ def main() -> None:
         raise ValueError("--rvq-projection-freeze-input-steps cannot be negative")
     if args.rvq_joint_latent64_teacher_loss_weight < 0.:
         raise ValueError("--rvq-joint-latent64-teacher-loss-weight cannot be negative")
+    if (
+        args.state_teacher_retention_weight is not None and
+        args.state_teacher_retention_weight < 0.
+    ):
+        raise ValueError("--state-teacher-retention-weight cannot be negative")
+    if (
+        args.state_decoder_trainable_from_block is not None and
+        not 0 <= args.state_decoder_trainable_from_block <= 3
+    ):
+        raise ValueError(
+            "--state-decoder-trainable-from-block must be between 0 and 3"
+        )
     if args.rvq_joint_polish_decoder_lr <= 0.:
         raise ValueError("--rvq-joint-polish-decoder-lr must be positive")
     rvq_joint_boundaries = (
@@ -3480,7 +3514,7 @@ def main() -> None:
         else 7.5 if rvq_joint_adapt
         else 10.0 if args.stage in ("overfit", "recon_pretrain")
         else 5.0 if args.stage in ("spectral_refine", "gan_pretrain")
-        else 1.0
+        else stage_defaults.get("waveform_recon_loss_weight", 1.0)
     )
     multi_spectral_recon_loss_weight = (
         args.multi_spectral_recon_loss_weight
@@ -3488,10 +3522,13 @@ def main() -> None:
         else 0.6 if rvq_joint_adapt
         else 1.1 if args.stage == "recon_pretrain"
         else 0.8 if args.stage == "spectral_refine"
-        else 0.7
+        else stage_defaults.get("multi_spectral_recon_loss_weight", 0.7)
     )
     correlation_loss_weight = (
-        0.02 if args.stage in (*RECONSTRUCTION_STAGES, "gan_pretrain") else 0.0
+        stage_defaults.get(
+            "correlation_loss_weight",
+            0.02 if args.stage in (*RECONSTRUCTION_STAGES, "gan_pretrain") else 0.0,
+        )
     )
     decoder_residual_scale_start = args.decoder_residual_scale_start
     decoder_residual_scale_end = args.decoder_residual_scale_end
@@ -4162,6 +4199,7 @@ def main() -> None:
         multi_spectral_recon_loss_weight_override=(
             multi_spectral_recon_loss_weight
         ),
+        correlation_loss_weight_override=correlation_loss_weight,
     )
     if rvq_joint_adapt:
         if soundstream.recon_loss_weight != 7.5:
@@ -4251,7 +4289,14 @@ def main() -> None:
         stage2_teacher_retention_weight=(
             args.stage2_teacher_retention_weight
             if args.stage == "gan_pretrain" and not rvq_joint_adapt
-            else 0.
+            else (
+                args.state_teacher_retention_weight
+                if args.stage == "stream_finetune_long" and
+                args.state_teacher_retention_weight is not None
+                else stage_defaults.get("teacher_retention_weight", 0.)
+                if args.stage == "stream_finetune_long"
+                else 0.
+            )
         ),
         stage2_adaptive_gan=(
             args.stage2_adaptive_gan
@@ -4263,6 +4308,14 @@ def main() -> None:
             tuple(args.stage2_decoder_lr_multipliers)
             if args.stage == "gan_pretrain" and not rvq_joint_adapt
             else (1., 1., 1.)
+        ),
+        decoder_trainable_from_block=(
+            args.state_decoder_trainable_from_block
+            if args.stage == "stream_finetune_long" and
+            args.state_decoder_trainable_from_block is not None
+            else stage_defaults.get("decoder_trainable_from_block")
+            if args.stage == "stream_finetune_long"
+            else None
         ),
         # B1.5 keeps both 64<->lookup projections immutable. RVQ codebooks are
         # EMA-managed and excluded from Adam; only Decoder parameters optimize.
@@ -5024,6 +5077,15 @@ def main() -> None:
                         "Captured immutable B1.5 Decoder teacher for Stage-2 "
                         "waveform/log-STFT retention."
                     )
+            if (
+                args.stage == "stream_finetune_long" and
+                trainer.stage2_teacher_retention_weight > 0.
+            ):
+                trainer.capture_stage2_decoder_teacher()
+                print(
+                    "Captured immutable B2 Decoder teacher for final state "
+                    "waveform/log-STFT retention."
+                )
 
         print("Starting a new training run.")
 
@@ -5040,6 +5102,7 @@ def main() -> None:
             "reconstruction_score",
             "aligned_si_sdr",
             "aligned_correlation",
+            "alignment_negative_fraction",
             "quiet_hf_excess_db",
             "voiced_hf_energy_ratio_db",
             "voiced_7k_7p8k_ratio_db",

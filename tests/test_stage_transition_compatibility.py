@@ -242,8 +242,14 @@ def test_stateful_stages_have_distinct_pre_and_post_rvq_roles():
 
     assert pre_rvq["encoder_lr"] == pytest.approx(1e-7)
     assert pre_rvq["lr"] == pytest.approx(5e-7)
-    assert final["steps"] == 10_000
-    assert final["lr"] == pytest.approx(2e-7)
+    assert final["steps"] == 3_000
+    assert final["lr"] == pytest.approx(5e-8)
+    assert final["multi_spectral_recon_loss_weight"] == pytest.approx(0.15)
+    assert final["stream_consistency_loss_weight"] == pytest.approx(0.75)
+    assert final["boundary_loss_weight"] == pytest.approx(0.15)
+    assert final["teacher_retention_weight"] == pytest.approx(0.75)
+    assert final["decoder_trainable_from_block"] == 2
+    assert final["correlation_loss_weight"] == pytest.approx(0.02)
     assert final["gan_adversarial_max"] == pytest.approx(0.)
     assert final["gan_feature_max"] == pytest.approx(0.)
 
@@ -251,9 +257,9 @@ def test_stateful_stages_have_distinct_pre_and_post_rvq_roles():
         encoding="utf-8"
     )
     assert 'ENABLE_PRE_RVQ_STATE_FT="${ENABLE_PRE_RVQ_STATE_FT:-0}"' in launcher
-    assert 'FINAL_STATE_STEPS="${FINAL_STATE_STEPS:-10000}"' in launcher
-    assert "FINAL_STATE_STEPS <= 0" in launcher
-    assert "post-RVQ state alignment is mandatory" in launcher
+    assert 'FINAL_STATE_STEPS="${FINAL_STATE_STEPS:-3000}"' in launcher
+    assert "FINAL_STATE_STEPS < 0" in launcher
+    assert "Final state calibration skipped" in launcher
     assert "--reinitialize-rvq-from-bypass-checkpoint" in launcher
     assert "--reinitialize-rvq-codebooks-from-projection-checkpoint" in launcher
     assert 'PRETRAINED_Q0_CKPT="${PRETRAINED_Q0_CKPT:-}"' in launcher
@@ -263,7 +269,7 @@ def test_stateful_stages_have_distinct_pre_and_post_rvq_roles():
         'B1 RVQ calibration with codec frozen'
     )
     assert launcher.index('B2 RVQ GAN decoder adaptation') < launcher.index(
-        'Final post-RVQ stateful Decoder fine-tune'
+        'Final post-RVQ stateful Decoder calibration'
     )
     assert '--num-train-steps "$FINAL_STATE_STEPS"' in launcher
     assert '--no-bypass-rvq-during-training' in launcher
@@ -343,6 +349,9 @@ def test_pipeline_inserts_joint_rvq_adaptation_and_shortens_b2():
     assert 'def rvq_codebook_balance_loss(self, encoded, indices):' in model_source
     assert 'def rvq_quantization_error_loss(self, encoded, quantized, indices):' in model_source
     assert 'x = projected_continuous_x + alpha * (x - projected_continuous_x)' in model_source
+    assert 'self._last_student_latent64_for_teacher = quantized' in model_source
+    assert 'self._last_student_recon_for_teacher = recon_x' in model_source
+    assert 'correlation_loss_weight_override=correlation_loss_weight' in source
     trainer_source = (ROOT / "audiolm_pytorch" / "trainer.py").read_text(
         encoding="utf-8"
     )
@@ -350,6 +359,7 @@ def test_pipeline_inserts_joint_rvq_adaptation_and_shortens_b2():
     assert "object.__setattr__(self, '_rvq_q0_teacher', teacher)" in trainer_source
     assert 'def capture_stage2_decoder_teacher(self):' in trainer_source
     assert 'def stage2_decoder_teacher_loss(self, student_recon, latent64):' in trainer_source
+    assert "target.shape[-1] >= getattr(model, 'stream_frame_size', 1)" in trainer_source
     assert 'def update_stage2_gan_quality_scale(self, metrics):' in trainer_source
     assert "pkg.get('stage2_gan_quality_scale', 1.)" in trainer_source
     assert "reduction='mean'" in trainer_source

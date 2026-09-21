@@ -80,7 +80,7 @@ RVQ_STAGE2_STEPS="${RVQ_STAGE2_STEPS:-75000}"
 RVQ_STAGE2_BEST_EVAL_BATCHES="${RVQ_STAGE2_BEST_EVAL_BATCHES:-80}"
 ENABLE_PRE_RVQ_STATE_FT="${ENABLE_PRE_RVQ_STATE_FT:-0}"
 PRE_RVQ_STATE_STEPS="${PRE_RVQ_STATE_STEPS:-20000}"
-FINAL_STATE_STEPS="${FINAL_STATE_STEPS:-10000}"
+FINAL_STATE_STEPS="${FINAL_STATE_STEPS:-3000}"
 RESUME_BYPASS_STAGE1="${RESUME_BYPASS_STAGE1:-0}"
 START_PHASE="${START_PHASE:-bypass_stage1}"
 STOP_AFTER_PHASE="${STOP_AFTER_PHASE:-}"
@@ -135,11 +135,11 @@ if [[ "$ENABLE_PRE_RVQ_STATE_FT" != "0" && "$ENABLE_PRE_RVQ_STATE_FT" != "1" ]];
   exit 2
 fi
 
-# The deployable graph is Encoder -> RVQ -> Decoder with persistent 20 ms
-# state.  Therefore the post-RVQ state pass is not optional: a zero/negative
-# length would silently leave B2's offline checkpoint as the final artifact.
-if (( FINAL_STATE_STEPS <= 0 )); then
-  echo "ERROR: FINAL_STATE_STEPS must be positive; post-RVQ state alignment is mandatory." >&2
+# State calibration may be skipped explicitly with FINAL_STATE_STEPS=0 after
+# separately confirming that persistent-state and offline paths are aligned.
+# Negative values remain invalid.
+if (( FINAL_STATE_STEPS < 0 )); then
+  echo "ERROR: FINAL_STATE_STEPS cannot be negative." >&2
   exit 2
 fi
 if (( RVQ_JOINT_ADAPT_STEPS < RVQ_B15_RVQ_ADAPT_END_STEPS )); then
@@ -189,7 +189,7 @@ if [[ "$START_PHASE" == "rvq_stage2" ]]; then
     exit 2
   fi
   if [[ -n "$STOP_AFTER_PHASE" ]]; then
-    echo "ERROR: STOP_AFTER_PHASE must be empty with START_PHASE=rvq_stage2; B2 must be followed by the mandatory final state fine-tune." >&2
+    echo "ERROR: STOP_AFTER_PHASE must be empty with START_PHASE=rvq_stage2; use FINAL_STATE_STEPS=0 to explicitly skip final state calibration." >&2
     exit 2
   fi
   if [[ -z "$PRETRAINED_RVQ_B15_CKPT" || ! -f "$PRETRAINED_RVQ_B15_CKPT" ]]; then
@@ -769,21 +769,22 @@ run_stage "B2 RVQ GAN decoder adaptation" 29514 "$PWD/logs/rvq-gan-$BASE.log" 0 
 RVQ_S2_CKPT="$(pick_b2_best "$RVQ_S2_DIR")"
 echo "B2 checkpoint=$RVQ_S2_CKPT"
 
-# Final state alignment is mandatory for the deployable path. The
-# stream_finetune_long policy freezes Encoder and RVQ for the complete stage,
-# keeps GAN losses disabled, and updates only Decoder parameters against
-# persistent 20 ms state / boundary consistency losses.
-run_stage "Final post-RVQ stateful Decoder fine-tune" 29517 \
-  "$PWD/logs/state-final-rvq-$BASE.log" 0 \
-  --stage stream_finetune_long --results-dir "$FINAL_STATE_DIR" \
-  --init-checkpoint "$RVQ_S2_CKPT" \
-  --num-train-steps "$FINAL_STATE_STEPS" \
-  --no-bypass-rvq-during-training \
-  --preceding-context-seconds "$PRECEDING_CONTEXT_SECONDS" \
-  --stream-tbptt-frames 20 \
-  "${COMMON[@]}" --no-resume
-FINAL_STATE_CKPT="$(pick_best "$FINAL_STATE_DIR")"
-echo "Final stateful checkpoint=$FINAL_STATE_CKPT"
+if (( FINAL_STATE_STEPS > 0 )); then
+  run_stage "Final post-RVQ stateful Decoder calibration" 29517 \
+    "$PWD/logs/state-final-rvq-$BASE.log" 0 \
+    --stage stream_finetune_long --results-dir "$FINAL_STATE_DIR" \
+    --init-checkpoint "$RVQ_S2_CKPT" \
+    --num-train-steps "$FINAL_STATE_STEPS" \
+    --no-bypass-rvq-during-training \
+    --preceding-context-seconds "$PRECEDING_CONTEXT_SECONDS" \
+    --stream-tbptt-frames 20 \
+    "${COMMON[@]}" --no-resume
+  FINAL_STATE_CKPT="$(pick_best "$FINAL_STATE_DIR")"
+  echo "Final stateful checkpoint=$FINAL_STATE_CKPT"
+else
+  FINAL_STATE_CKPT="$RVQ_S2_CKPT"
+  echo "Final state calibration skipped; deployable checkpoint remains B2: $FINAL_STATE_CKPT"
+fi
 
 echo "===== deployment training pipeline complete ====="
 echo "bypass Stage-1: $BYPASS_S1_DIR"
@@ -801,4 +802,4 @@ echo "RVQ calibration: $RVQ_S1_DIR"
 echo "RVQ joint adaptation: $RVQ_B15_DIR"
 echo "RVQ fidelity-restored Decoder polish: $RVQ_B15_POLISH_DIR"
 echo "RVQ Stage-2: $RVQ_S2_DIR"
-echo "Final stateful fine-tune: $FINAL_STATE_DIR"
+echo "Final deployable checkpoint: $FINAL_STATE_CKPT"

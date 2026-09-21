@@ -338,6 +338,7 @@ class SoundStreamTrainer(nn.Module):
         stage2_adaptive_gan: bool = False,
         stage2_max_gan_grad_ratio: float = 0.05,
         decoder_lr_multipliers: tuple[float, float, float] = (1., 1., 1.),
+        decoder_trainable_from_block: int | None = None,
         discriminator_hold_steps: int = 0,
         discriminator_hold_lr: float | None = None,
         discriminator_start_step: int | None = None,
@@ -935,6 +936,32 @@ class SoundStreamTrainer(nn.Module):
                 parameter for parameter in generator_parameters
                 if id(parameter) not in first_decoder_parameter_ids
             ]
+        if exists(decoder_trainable_from_block):
+            decoder = soundstream.decoder
+            if not isinstance(decoder, nn.Sequential) or len(decoder) < 6:
+                raise RuntimeError(
+                    'Partial Decoder calibration requires input conv, four '
+                    'upsampling blocks, and output conv.'
+                )
+            if not 0 <= decoder_trainable_from_block < 4:
+                raise ValueError('decoder_trainable_from_block must be in [0, 3]')
+            # child 0 is the Decoder input convolution; children 1..4 are the
+            # four upsampling blocks; child 5 is the output convolution.
+            frozen_decoder_modules = list(decoder.children())[
+                :1 + decoder_trainable_from_block
+            ]
+            frozen_decoder_parameter_ids = {
+                id(parameter)
+                for module in frozen_decoder_modules
+                for parameter in module.parameters()
+            }
+            for module in frozen_decoder_modules:
+                module.requires_grad_(False)
+            generator_parameters = [
+                parameter for parameter in generator_parameters
+                if id(parameter) not in frozen_decoder_parameter_ids
+            ]
+        self.decoder_trainable_from_block = decoder_trainable_from_block
 
         decoder_lr_multipliers = tuple(float(value) for value in decoder_lr_multipliers)
         if len(decoder_lr_multipliers) != 3 or any(
@@ -2506,7 +2533,15 @@ class SoundStreamTrainer(nn.Module):
 
         if hasattr(model, 'frame_boundary_loss'):
             boundary_loss = model.frame_boundary_loss(recon)
-        if hasattr(model, 'stream_consistency_loss'):
+        if (
+            hasattr(model, 'stream_consistency_loss') and
+            target.shape[-1] >= getattr(model, 'stream_frame_size', 1)
+        ):
+            # Full-file evaluation can end with a very short tail block.  It
+            # has already been decoded from a padded stateful frame, but the
+            # raw tail is too short to run through the offline Encoder.  The
+            # tail still contributes every reconstruction metric; only the
+            # undefined offline/stateful consistency diagnostic is skipped.
             stream_consistency_loss = model.stream_consistency_loss(target, recon)
         if hasattr(model, 'encoder_stream_consistency_metrics'):
             stream_encoder_metrics = model.encoder_stream_consistency_metrics(target)
@@ -3506,6 +3541,26 @@ class SoundStreamTrainer(nn.Module):
             )
         return float(allowed)
 
+    def effective_clean_gate_max_negative_fraction(self):
+        """Use a baseline-relative polarity gate during final state calibration."""
+        allowed = self.clean_gate_max_negative_fraction
+        if (
+            self.best_checkpoint_metric in (
+                'stream_finetune',
+                'stream_finetune_long',
+            ) and
+            self.quality_retention_gate and
+            self.has_quality_retention_baseline and
+            'alignment_negative_fraction' in self.quality_retention_baseline
+        ):
+            allowed = max(
+                allowed,
+                self.quality_retention_baseline[
+                    'alignment_negative_fraction'
+                ] + 0.01,
+            )
+        return float(allowed)
+
     def clean_gate_passes(self, metrics):
         if not self.clean_gate:
             return True
@@ -3518,7 +3573,7 @@ class SoundStreamTrainer(nn.Module):
 
         return (
             metrics.get('aligned_si_sdr', float('-inf')) >= self.clean_gate_min_aligned_si_sdr and
-            metrics.get('alignment_negative_fraction', 0.) <= self.clean_gate_max_negative_fraction and
+            metrics.get('alignment_negative_fraction', 0.) <= self.effective_clean_gate_max_negative_fraction() and
             metrics.get('aligned_correlation', float('-inf')) >= self.clean_gate_min_aligned_corr and
             self.clean_gate_min_rms_ratio <= metrics.get('rms_ratio', float('inf')) <= self.clean_gate_max_rms_ratio and
             metrics.get('recon_peak', float('inf')) <= self.clean_gate_max_recon_peak and
@@ -3536,7 +3591,7 @@ class SoundStreamTrainer(nn.Module):
 
         if metrics.get('aligned_si_sdr', float('-inf')) < self.clean_gate_min_aligned_si_sdr:
             reasons.append('aligned_si_sdr')
-        if metrics.get('alignment_negative_fraction', 0.) > self.clean_gate_max_negative_fraction:
+        if metrics.get('alignment_negative_fraction', 0.) > self.effective_clean_gate_max_negative_fraction():
             reasons.append('negative_polarity')
 
         if metrics.get('aligned_correlation', float('-inf')) < self.clean_gate_min_aligned_corr:
@@ -3599,6 +3654,7 @@ class SoundStreamTrainer(nn.Module):
             key: float(metrics[key]) for key in required
         }
         for key in (
+            'alignment_negative_fraction',
             'voiced_7k_7p8k_ratio_db',
             'quiet_7k_7p8k_excess_db',
             'codebook_q00_active_ratio',
@@ -6205,6 +6261,21 @@ class SoundStreamTrainer(nn.Module):
                             runtime_model.correlation_loss_weight
                         ),
                     }
+                    if is_streaming_model:
+                        weighted_objectives.update({
+                            'boundary': (
+                                frame_phase_or_boundary_loss *
+                                runtime_model.runtime_boundary_loss_weight
+                            ),
+                            'stream': (
+                                stream_consistency_loss *
+                                runtime_model.runtime_stream_consistency_loss_weight
+                            ),
+                        })
+                    if self.stage2_teacher_retention_weight > 0.:
+                        weighted_objectives['teacher'] = (
+                            stage2_teacher_loss * self.stage2_teacher_retention_weight
+                        )
                     for formant_name in ('f1', 'f2', 'f3'):
                         component = formant_diagnostics.get(
                             f'{formant_name}_weighted_loss'
@@ -6337,6 +6408,18 @@ class SoundStreamTrainer(nn.Module):
                     stream_consistency_loss.item() / self.grad_accum_every
                 ),
             ))
+            stream_metrics = getattr(
+                runtime_model, '_last_stream_consistency_metrics', {}
+            )
+            boundary_metrics = getattr(runtime_model, '_last_boundary_metrics', {})
+            for name, value in stream_metrics.items():
+                accum_log(logs, {
+                    f'stream_{name}': float(value) / self.grad_accum_every
+                })
+            for name, value in boundary_metrics.items():
+                accum_log(logs, {
+                    f'boundary_{name}': float(value) / self.grad_accum_every
+                })
             for scale, scale_loss in stft_scale_losses.items():
                 accum_log(logs, {
                     f'stft_scale_{scale}': (
@@ -6551,8 +6634,11 @@ class SoundStreamTrainer(nn.Module):
             losses_str += (
                 f" | boundary={logs['boundary_loss']:.6f}"
                 f"(w={getattr(model, 'runtime_boundary_loss_weight', model.boundary_loss_weight):.4g})"
-                f" | stream_consistency={logs['stream_consistency_loss']:.6f}"
+                f" | stream_consistency={logs['stream_consistency_loss']:.9e}"
                 f"(w={getattr(model, 'runtime_stream_consistency_loss_weight', 0.):.4g})"
+                f"[l1={logs.get('stream_l1', 0.):.3e},"
+                f"nmse={logs.get('stream_nmse', 0.):.3e},"
+                f"max={logs.get('stream_maxerr', 0.):.3e}]"
             )
 
         losses_str += (
@@ -6643,6 +6729,9 @@ class SoundStreamTrainer(nn.Module):
                 f"hf={logs.get('grad_voiced_highband', 0.):.5f},"
                 f"sisdr={logs.get('grad_si_sdr', 0.):.5f},"
                 f"corr={logs.get('grad_correlation', 0.):.5f},"
+                f"state={logs.get('grad_stream', 0.):.5f},"
+                f"boundary={logs.get('grad_boundary', 0.):.5f},"
+                f"teacher={logs.get('grad_teacher', 0.):.5f},"
                 f"formant_ratio={(logs.get('grad_formant_env', 0.) + logs.get('grad_formant_peak', 0.)) / total_grad:.4f}]"
             )
 
