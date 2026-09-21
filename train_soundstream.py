@@ -40,6 +40,7 @@ STAGE_RESULTS_DIRS = {
     "gan_pretrain": PROJECT_DIR / "results" / "gan-pretrain-lowrank-dscnn-fp-64d-9q128-l32",
     "stream_finetune": PROJECT_DIR / "results" / "stream-finetune-lowrank-dscnn-fp-64d-9q128-l32",
     "stream_finetune_long": PROJECT_DIR / "results" / "stream-finetune-long-lowrank-dscnn-fp-64d-9q128-l32",
+    "hardware_qat_finetune": PROJECT_DIR / "results" / "hardware-qat-encoder-lowrank-dscnn-int8-64d-9q128-l32",
 }
 
 RECONSTRUCTION_STAGES = frozenset((
@@ -48,6 +49,7 @@ RECONSTRUCTION_STAGES = frozenset((
     "gan_pretrain",
     "stream_finetune",
     "stream_finetune_long",
+    "hardware_qat_finetune",
 ))
 # Stateful alignment is deliberately reconstruction-only. Adversarial training
 # finishes in A2; neither the optional pre-RVQ nor final post-RVQ state pass
@@ -58,6 +60,7 @@ QUALITY_RETENTION_STAGES = frozenset((
     "gan_pretrain",
     "stream_finetune",
     "stream_finetune_long",
+    "hardware_qat_finetune",
 ))
 
 STAGE_DEFAULTS = {
@@ -286,6 +289,23 @@ STAGE_DEFAULTS = {
         gan_start=0, gan_ramp=0,
         gan_adversarial_max=0., gan_feature_max=0.,
     ),
+    "hardware_qat_finetune": dict(
+        # Encoder-only hardware QAT from a validation-selected floating B2.
+        steps=20_000, batch_size=4, segment_seconds=4.,
+        save_every=1_000, eval_every=250, min_steps=4_000, patience=20,
+        lr=1e-6, discr_lr=None, stft_discr_lr=None, ema_beta=0.999,
+        ema_update_after_step=0, ema_update_every=1, use_ema=False,
+        click_loss_weight=0., jump_loss_weight=0.,
+        preemph_loss_weight=0., noise_floor_loss_weight=0.,
+        transient_loss_warmup_steps=0,
+        spectral_envelope_loss_weight=0., voiced_highband_loss_weight=0.,
+        stft_recon_loss_weight=0.05, si_sdr_loss_weight=0.12,
+        waveform_recon_loss_weight=1.0,
+        multi_spectral_recon_loss_weight=0.7,
+        correlation_loss_weight=0.02,
+        gan_start=0, gan_ramp=0,
+        gan_adversarial_max=0., gan_feature_max=0.,
+    ),
 }
 
 
@@ -413,6 +433,11 @@ def parse_args() -> argparse.Namespace:
             "The stage default is retained when omitted."
         ),
     )
+    parser.add_argument('--hardware-qat-start-step', type=int, default=1000)
+    parser.add_argument(
+        '--hardware-qat-observer-freeze-step', type=int, default=4000
+    )
+    parser.add_argument('--hardware-qat-ema-decay', type=float, default=0.99)
     parser.add_argument(
         "--waveform-recon-loss-weight",
         type=float,
@@ -2297,6 +2322,10 @@ def build_model(
     recon_loss_weight_override: float | None = None,
     multi_spectral_recon_loss_weight_override: float | None = None,
     correlation_loss_weight_override: float | None = None,
+    hardware_encoder_qat: bool = False,
+    hardware_qat_start_step: int = 1000,
+    hardware_qat_observer_freeze_step: int = 4000,
+    hardware_qat_ema_decay: float = 0.99,
 ) -> SoundStream:
     if sync_codebook is None:
         sync_codebook = int(os.environ.get("WORLD_SIZE", "1")) > 1
@@ -2417,6 +2446,13 @@ def build_model(
         decoder_interpolation_mode=decoder_interpolation_mode,
         decoder_split_first_upsample=decoder_split_first_upsample,
         pad_mode="constant",
+        hardware_compatible_encoder=hardware_encoder_qat,
+        hardware_encoder_qat=hardware_encoder_qat,
+        hardware_qat_start_step=hardware_qat_start_step,
+        hardware_qat_observer_freeze_step=(
+            hardware_qat_observer_freeze_step
+        ),
+        hardware_qat_ema_decay=hardware_qat_ema_decay,
     )
 
     if stage not in ("stream_finetune", "stream_finetune_long"):
@@ -4200,6 +4236,12 @@ def main() -> None:
             multi_spectral_recon_loss_weight
         ),
         correlation_loss_weight_override=correlation_loss_weight,
+        hardware_encoder_qat=(args.stage == 'hardware_qat_finetune'),
+        hardware_qat_start_step=args.hardware_qat_start_step,
+        hardware_qat_observer_freeze_step=(
+            args.hardware_qat_observer_freeze_step
+        ),
+        hardware_qat_ema_decay=args.hardware_qat_ema_decay,
     )
     if rvq_joint_adapt:
         if soundstream.recon_loss_weight != 7.5:
@@ -4359,7 +4401,11 @@ def main() -> None:
             rvq_joint_adapt or
             (args.stage2_targeted_refine and not rvq_joint_adapt) or
             (args.stage == "gan_pretrain" and not rvq_joint_adapt) or
-            args.stage in ("stream_finetune", "stream_finetune_long")
+            args.stage in (
+                "stream_finetune",
+                "stream_finetune_long",
+                "hardware_qat_finetune",
+            )
         ),
         exclude_encoder_from_generator_optimizer=(
             args.rvq_projection_only or
@@ -4797,6 +4843,7 @@ def main() -> None:
             )
             if rvq_joint_adapt else None
         ),
+        encoder_only_training=(args.stage == 'hardware_qat_finetune'),
         freeze_decoder_before_step=(
             num_train_steps
             if (args.rvq_projection_only or stage25_rvq_midband_refine)
@@ -4804,7 +4851,11 @@ def main() -> None:
         ),
         freeze_codebook_during_training=(
             args.rvq_projection_only or
-            args.stage in ("stream_finetune", "stream_finetune_long") or
+            args.stage in (
+                "stream_finetune",
+                "stream_finetune_long",
+                "hardware_qat_finetune",
+            ) or
             (
                 args.stage2_targeted_refine and
                 not stage25_rvq_midband_refine and
@@ -4900,6 +4951,7 @@ def main() -> None:
             "gan_pretrain",
             "stream_finetune",
             "stream_finetune_long",
+            "hardware_qat_finetune",
         ):
             resumed_model = trainer.unwrapped_soundstream
             resumed_block_scales = tuple(
@@ -4939,6 +4991,7 @@ def main() -> None:
             "gan_pretrain": "spectral_refine",
             "stream_finetune": "gan_pretrain",
             "stream_finetune_long": "stream_finetune",
+            "hardware_qat_finetune": "gan_pretrain",
         }.get(args.stage)
         init_checkpoint = args.init_checkpoint
 
@@ -5009,6 +5062,7 @@ def main() -> None:
                 "gan_pretrain",
                 "stream_finetune",
                 "stream_finetune_long",
+                "hardware_qat_finetune",
             ):
                 inherited_block_scales = checkpoint_config.get(
                     "decoder_block_residual_scales"
@@ -5043,6 +5097,7 @@ def main() -> None:
                     "gan_pretrain",
                     "stream_finetune",
                     "stream_finetune_long",
+                    "hardware_qat_finetune",
                 ):
                     # Keep every refined block scale fixed. Using the legacy
                     # scalar scheduler here would silently reset x5/x4/x2.
@@ -5077,6 +5132,12 @@ def main() -> None:
                         "Captured immutable B1.5 Decoder teacher for Stage-2 "
                         "waveform/log-STFT retention."
                     )
+            if args.stage == 'hardware_qat_finetune':
+                trainer.capture_stage2_latent_reference()
+                print(
+                    'Captured immutable FP32 B2 Encoder teacher for '
+                    'latent64/latent32 QAT retention and RVQ index-flip diagnostics.'
+                )
             if (
                 args.stage == "stream_finetune_long" and
                 trainer.stage2_teacher_retention_weight > 0.
@@ -5383,7 +5444,11 @@ def main() -> None:
             )
             if checkpoint.exists()
         ), None)
-    elif args.stage in ("stream_finetune", "stream_finetune_long"):
+    elif args.stage in (
+        "stream_finetune",
+        "stream_finetune_long",
+        "hardware_qat_finetune",
+    ):
         # Streaming adaptation is ranked by the gated reconstruction +
         # boundary + offline/stateful consistency score.
         best_checkpoint = next((

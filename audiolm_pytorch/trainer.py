@@ -297,6 +297,9 @@ class SoundStreamTrainer(nn.Module):
         encoder_trainable_from_block: int | None = None,
         exclude_rq_from_generator_optimizer: bool = False,
         exclude_encoder_from_generator_optimizer: bool = False,
+        encoder_only_training: bool = False,
+        hardware_qat_latent64_weight: float = 0.10,
+        hardware_qat_latent32_weight: float = 0.05,
         exclude_first_decoder_block_from_generator_optimizer: bool = False,
         discr_lr: float | None = None,
         stft_discr_lr: float | None = None,
@@ -793,6 +796,9 @@ class SoundStreamTrainer(nn.Module):
         self.encoder_excluded_from_generator_optimizer = bool(
             exclude_encoder_from_generator_optimizer
         )
+        self.encoder_only_training = bool(encoder_only_training)
+        self.hardware_qat_latent64_weight = float(hardware_qat_latent64_weight)
+        self.hardware_qat_latent32_weight = float(hardware_qat_latent32_weight)
         self.rq_excluded_from_generator_optimizer = bool(
             exclude_rq_from_generator_optimizer
         )
@@ -864,6 +870,19 @@ class SoundStreamTrainer(nn.Module):
             for module in encoder_modules
             for parameter in module.parameters()
         }
+        if encoder_only_training:
+            if exclude_encoder_from_generator_optimizer:
+                raise ValueError(
+                    'encoder_only_training conflicts with excluding Encoder'
+                )
+            for parameter in soundstream.parameters():
+                parameter.requires_grad_(id(parameter) in encoder_parameter_ids)
+            generator_parameters = [
+                parameter for parameter in generator_parameters
+                if id(parameter) in encoder_parameter_ids
+            ]
+            if not generator_parameters:
+                raise RuntimeError('Encoder-only QAT has no trainable parameters')
         if exists(encoder_trainable_from_block) and not exclude_encoder_from_generator_optimizer:
             encoder = soundstream.encoder
             if not isinstance(encoder, nn.Sequential) or len(encoder) < 3:
@@ -5508,6 +5527,42 @@ class SoundStreamTrainer(nn.Module):
             ).abs().mean().cpu()),
         }
 
+    def hardware_qat_teacher_loss(self, wave, student64):
+        """Keep the INT8 Encoder in the selected floating B2 latent space."""
+        reference = self._stage2_latent_reference_encoder
+        if reference is None:
+            raise RuntimeError('hardware QAT requires a captured FP32 Encoder teacher')
+        model = self.unwrapped_soundstream
+        encoder_input, _ = model.process_input(wave)
+        with torch.no_grad():
+            teacher64 = rearrange(
+                reference(encoder_input), 'b c n -> b n c'
+            ).float()
+        student64_f = student64.float()
+        teacher_energy = teacher64.square().mean().clamp_min(1e-8)
+        latent64_nmse = F.mse_loss(student64_f, teacher64) / teacher_energy
+        student32 = model.rq_input_projection(student64_f)
+        with torch.no_grad():
+            teacher32 = model.rq_input_projection(teacher64)
+        latent32_nmse = F.mse_loss(student32, teacher32) / (
+            teacher32.square().mean().clamp_min(1e-8)
+        )
+
+        with torch.no_grad():
+            _, student_indices, _ = model.rq(student32, freeze_codebook=True)
+            _, teacher_indices, _ = model.rq(teacher32, freeze_codebook=True)
+            flips = (student_indices != teacher_indices).float()
+            per_level = flips.mean(dim=(0, 1, 2))
+            model._last_hardware_qat_index_flip = {
+                f'q{index:02d}': value.detach()
+                for index, value in enumerate(per_level)
+            }
+        weighted = (
+            self.hardware_qat_latent64_weight * latent64_nmse +
+            self.hardware_qat_latent32_weight * latent32_nmse
+        )
+        return weighted, latent64_nmse, latent32_nmse
+
     @contextmanager
     def frozen_decoder_stack(self):
         """Temporarily update Encoder/RVQ while keeping all Decoder modules fixed."""
@@ -5892,6 +5947,11 @@ class SoundStreamTrainer(nn.Module):
         model = self.unwrapped_soundstream
 
         steps = int(self.steps.item())
+        hardware_qat_state = None
+        if hasattr(self.unwrapped_soundstream, 'update_hardware_qat'):
+            hardware_qat_state = self.unwrapped_soundstream.update_hardware_qat(
+                steps
+            )
         log_losses = self.log_losses_every > 0 and not (steps % self.log_losses_every)
         if self.best_checkpoint_metric == 'recon_pretrain':
             self.unwrapped_soundstream.correlation_loss_weight = (
@@ -6056,6 +6116,33 @@ class SoundStreamTrainer(nn.Module):
                     freeze_codebook = freeze_codebook,
                     rvq_warm_in_alpha = rvq_warm_in_alpha
                 )
+                if self.encoder_only_training:
+                    student64 = getattr(
+                        runtime_model, '_last_encoder_latent64', None
+                    )
+                    if student64 is None:
+                        raise RuntimeError(
+                            'hardware QAT Encoder latent was not cached'
+                        )
+                    (
+                        qat_teacher_loss,
+                        qat_latent64_nmse,
+                        qat_latent32_nmse,
+                    ) = self.hardware_qat_teacher_loss(wave, student64)
+                    loss = loss + qat_teacher_loss
+                    if i == 0:
+                        logs['qat_latent64_nmse'] = float(
+                            qat_latent64_nmse.detach().cpu()
+                        )
+                        logs['qat_latent32_nmse'] = float(
+                            qat_latent32_nmse.detach().cpu()
+                        )
+                        for name, value in getattr(
+                            runtime_model,
+                            '_last_hardware_qat_index_flip',
+                            {},
+                        ).items():
+                            logs[f'qat_index_flip_{name}'] = float(value.cpu())
                 if self.rvq_projection_only:
                     (
                         projection_fidelity_loss,
@@ -6577,6 +6664,37 @@ class SoundStreamTrainer(nn.Module):
                 f" | projection_orth={logs['projection_orth']:.6f}"
                 f" | projection_tie={logs['projection_tie']:.6f}"
             )
+        if 'qat_latent64_nmse' in logs:
+            qat_enabled, qat_observer = hardware_qat_state or (False, False)
+            flip_parts = [
+                f"{name.removeprefix('qat_index_flip_')}={value:.4f}"
+                for name, value in sorted(logs.items())
+                if name.startswith('qat_index_flip_')
+            ]
+            layer_diagnostics = model.hardware_encoder_quantization_diagnostics()
+            accumulator_overflow = max(
+                (
+                    values.get('accumulator_overflow_rate', 0.)
+                    for values in layer_diagnostics.values()
+                ),
+                default=0.,
+            )
+            output_saturation = max(
+                (
+                    values.get('output_saturation_rate', 0.)
+                    for values in layer_diagnostics.values()
+                ),
+                default=0.,
+            )
+            losses_str += (
+                f" | hardware_qat=enabled{int(qat_enabled)}/observer{int(qat_observer)}"
+                f" | qat_latent64_nmse={logs['qat_latent64_nmse']:.6f}"
+                f" | qat_latent32_nmse={logs['qat_latent32_nmse']:.6f}"
+                f" | qat_int32_overflow_max={accumulator_overflow:.6e}"
+                f" | qat_int8_saturation_max={output_saturation:.6f}"
+            )
+            if flip_parts:
+                losses_str += ' | qat_index_flip[' + ','.join(flip_parts) + ']'
         rvq_stage_errors = getattr(model, '_last_rvq_quantization_stages', {})
         if rvq_stage_errors:
             losses_str += " | quant_error_stages=" + ",".join(

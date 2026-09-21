@@ -136,7 +136,7 @@ def test_hardware_relu_preserves_large_positive_branch_without_overflow():
     assert relu.fake_quant.scale.grad is None
 
 
-def test_hardware_encoder_factors_oversized_x8_layer_and_keeps_shape():
+def test_hardware_qat_supports_current_lowrank_dscnn_encoder_and_keeps_shape():
     model = SoundStream(
         channels=16,
         channel_mults=(2, 4, 8, 16),
@@ -144,6 +144,9 @@ def test_hardware_encoder_factors_oversized_x8_layer_and_keeps_shape():
         codebook_size=256,
         rq_num_quantizers=8,
         use_local_attn=False,
+        encoder_depthwise_separable_blocks=(1, 2, 3),
+        encoder_depthwise_separable_revision=3,
+        encoder_low_rank_pointwise_ranks=((0, 0), (8, 16), (16, 32), (32, 64)),
         hardware_compatible_encoder=True,
         hardware_encoder_qat=True,
         hardware_qat_start_step=1,
@@ -154,20 +157,8 @@ def test_hardware_encoder_factors_oversized_x8_layer_and_keeps_shape():
     report = model.hardware_encoder_weight_report()
     assert report
     assert all(layer["fits_weight_bank"] for layer in report)
-    assert any(
-        layer["cin"] == 128
-        and layer["cout"] == 128
-        and layer["kernel"] == 8
-        and layer["stride"] == 4
-        for layer in report
-    )
-    assert any(
-        layer["cin"] == 128
-        and layer["cout"] == 256
-        and layer["kernel"] == 4
-        and layer["stride"] == 2
-        for layer in report
-    )
+    assert any(layer["groups"] > 1 for layer in report)
+    assert max(layer["packed_weight_bytes"] for layer in report) <= 128 * 1024
 
     with torch.no_grad():
         encoded = model.encoder(torch.randn(1, 1, 320))

@@ -43,6 +43,18 @@ from local_attention.transformer import FeedForward, DynamicPositionBias
 from gateloop_transformer import SimpleGateLoopLayer as GateLoop
 
 from audiolm_pytorch.utils import curtail_to_multiple
+from audiolm_pytorch.hardware_quantization import (
+    INT8_QMIN,
+    INT8_QMAX,
+    INT32_QMIN,
+    INT32_QMAX,
+    HardwareReLU,
+    HardwareResidualAdd,
+    PerOutputChannelWeightFakeQuant,
+    SymmetricActivationFakeQuant,
+    approximate_requant_multiplier,
+    quantize_bias_dequantized,
+)
 
 from audiolm_pytorch.version import __version__
 from packaging import version
@@ -60,6 +72,41 @@ def default(val, d):
 
 def cast_tuple(t, l = 1):
     return ((t,) * l) if not isinstance(t, tuple) else t
+
+def hardware_input_fake_quant(module):
+    """Return the first hardware-QAT input edge contained in ``module``."""
+    if isinstance(module, CausalConv1d):
+        return module.hardware_input_fake_quant
+    for child in module.children():
+        fake_quant = hardware_input_fake_quant(child)
+        if exists(fake_quant):
+            return fake_quant
+    return None
+
+def _replace_relu_for_hardware(module, ema_decay):
+    for name, child in tuple(module.named_children()):
+        if isinstance(child, nn.ReLU):
+            setattr(module, name, HardwareReLU(ema_decay=ema_decay))
+        else:
+            _replace_relu_for_hardware(child, ema_decay)
+
+def _wire_hardware_qat_edges(module, incoming=None):
+    """Wire observer ownership in actual feed-forward/residual dataflow order."""
+    if isinstance(module, CausalConv1d):
+        if exists(incoming):
+            module.share_hardware_input_fake_quant(incoming)
+        return module.hardware_output_fake_quant
+    if isinstance(module, HardwareReLU):
+        if exists(incoming):
+            module.share_producer_fake_quant(incoming)
+        return module.fake_quant
+    if isinstance(module, Residual):
+        _wire_hardware_qat_edges(module.fn, incoming)
+        return module.hardware_residual_add.fake_quant
+    output = incoming
+    for child in module.children():
+        output = _wire_hardware_qat_edges(child, output)
+    return output
 
 def canonicalize_waveform_pair(target, recon):
     """Return two ``[batch, channels, samples]`` tensors without broadcasting.
@@ -454,12 +501,28 @@ class Residual(Module):
         super().__init__()
         self.fn = fn
         self.residual_scale = float(scale)
+        self.hardware_residual_add = None
+
+    def configure_hardware_qat(self, ema_decay = 0.99):
+        self.hardware_residual_add = HardwareResidualAdd(ema_decay=ema_decay)
+
+    def set_hardware_qat_state(self, *, enabled, observer_enabled):
+        if exists(self.hardware_residual_add):
+            self.hardware_residual_add.set_hardware_qat_state(
+                enabled=enabled,
+                observer_enabled=observer_enabled,
+            )
 
     def set_residual_scale(self, scale: float):
         self.residual_scale = float(scale)
 
     def forward(self, x, **kwargs):
-        return self.fn(x, **kwargs) * self.residual_scale + x
+        branch = self.fn(x, **kwargs)
+        if exists(self.hardware_residual_add):
+            return self.hardware_residual_add(
+                x, branch, residual_scale=self.residual_scale
+            )
+        return branch * self.residual_scale + x
 
 class ChannelTranspose(Module):
     def __init__(self, fn: Module):
@@ -481,22 +544,118 @@ class CausalConv1d(Module):
         self.causal_padding = dilation * (kernel_size - 1) + (1 - stride)
 
         self.conv = nn.Conv1d(chan_in, chan_out, kernel_size, **kwargs)
+        self.hardware_input_fake_quant = None
+        self.hardware_output_fake_quant = None
+        self.hardware_weight_fake_quant = None
+        self.hardware_input_observer_owned_by_producer = False
+        self._hardware_diagnostics = {}
+
+    def configure_hardware_qat(self, ema_decay = 0.99):
+        self.hardware_input_fake_quant = SymmetricActivationFakeQuant(ema_decay)
+        self.hardware_output_fake_quant = SymmetricActivationFakeQuant(ema_decay)
+        self.hardware_weight_fake_quant = PerOutputChannelWeightFakeQuant()
+        self.hardware_input_observer_owned_by_producer = False
+
+    def share_hardware_input_fake_quant(self, producer):
+        if not isinstance(producer, SymmetricActivationFakeQuant):
+            raise TypeError('producer must be SymmetricActivationFakeQuant')
+        self.hardware_input_fake_quant = producer
+        self.hardware_input_observer_owned_by_producer = True
+
+    def set_hardware_qat_state(self, *, enabled, observer_enabled):
+        for fake_quant in (
+            self.hardware_input_fake_quant,
+            self.hardware_output_fake_quant,
+        ):
+            if exists(fake_quant):
+                fake_quant.set_state(
+                    enabled=enabled,
+                    observer_enabled=observer_enabled,
+                )
+
+    def hardware_quantization_diagnostics(self):
+        return {
+            key: (
+                value.detach().cpu().tolist()
+                if torch.is_tensor(value) and value.ndim > 0
+                else float(value.detach().cpu())
+                if torch.is_tensor(value)
+                else value
+            )
+            for key, value in self._hardware_diagnostics.items()
+        }
+
+    def _conv_forward(self, x):
+        if not exists(self.hardware_input_fake_quant):
+            return self.conv(x)
+
+        if self.hardware_input_observer_owned_by_producer:
+            if self.hardware_input_fake_quant.enabled:
+                input_scale = self.hardware_input_fake_quant.effective_scale(x)
+                x = self.hardware_input_fake_quant.quantize(
+                    x, scale=input_scale
+                ) * input_scale
+        else:
+            x = self.hardware_input_fake_quant(x)
+        if not self.hardware_input_fake_quant.enabled:
+            return self.conv(x)
+
+        weight, weight_scale = self.hardware_weight_fake_quant(self.conv.weight)
+        input_scale = self.hardware_input_fake_quant.effective_scale(x)
+        bias = quantize_bias_dequantized(
+            self.conv.bias, input_scale, weight_scale
+        )
+        output = F.conv1d(
+            x, weight, bias, self.conv.stride, self.conv.padding,
+            self.conv.dilation, self.conv.groups
+        )
+        if self.training and self.hardware_output_fake_quant.observer_enabled:
+            self.hardware_output_fake_quant.observe(output)
+        output_scale = self.hardware_output_fake_quant.effective_scale(output)
+        real_multiplier = (
+            input_scale * weight_scale.flatten() / output_scale
+        )
+        _, multiplier, shift = approximate_requant_multiplier(real_multiplier)
+        qinput = torch.round(x.detach() / input_scale).clamp(INT8_QMIN, INT8_QMAX)
+        qweight = torch.round(
+            self.conv.weight.detach() / weight_scale
+        ).clamp(INT8_QMIN, INT8_QMAX)
+        accumulator = F.conv1d(
+            qinput, qweight, None, self.conv.stride, self.conv.padding,
+            self.conv.dilation, self.conv.groups
+        )
+        self._hardware_diagnostics = {
+            'accumulator_values': int(accumulator.numel()),
+            'output_values': int(output.numel()),
+            'accumulator_overflow_rate': (
+                ((accumulator < INT32_QMIN) | (accumulator > INT32_QMAX))
+                .float().mean().detach()
+            ),
+            'output_saturation_rate': (
+                ((output.detach() / output_scale <= INT8_QMIN) |
+                 (output.detach() / output_scale >= INT8_QMAX))
+                .float().mean().detach()
+            ),
+            'requant_multiplier': multiplier.detach(),
+            'requant_shift': shift.detach(),
+        }
+        return self.hardware_output_fake_quant(output)
 
     def forward(self, x):
         x = F.pad(x, (self.causal_padding, 0), mode = self.pad_mode)
-        return self.conv(x)
+        return self._conv_forward(x)
 
     def forward_stream(self, x, state = None):
         cache_size = self.causal_padding
 
         if cache_size == 0:
-            return self.conv(x), None
+            return self._conv_forward(x), None
 
         if not exists(state):
             state = x.new_zeros(*x.shape[:-1], cache_size)
 
         x_with_cache = torch.cat((state, x), dim = -1)
-        out = self.conv(x_with_cache)
+        out = self._conv_forward(x_with_cache)
         next_state = x_with_cache[..., -cache_size:]
         return out, next_state
 
@@ -1069,6 +1228,11 @@ class SoundStream(Module):
         squeeze_excite = False,
         complex_stft_discr_logits_abs = False,
         pad_mode = 'reflect',
+        hardware_compatible_encoder = False,
+        hardware_encoder_qat = False,
+        hardware_qat_start_step = 1000,
+        hardware_qat_observer_freeze_step = 4000,
+        hardware_qat_ema_decay = 0.99,
         stft_discriminator: Module | None = None,  # can pass in own stft discriminator
         complex_stft_discr_kwargs: dict = dict()
     ):
@@ -1090,6 +1254,28 @@ class SoundStream(Module):
         # rest of the class
 
         self.target_sample_hz = target_sample_hz # for resampling on the fly
+
+        if hardware_encoder_qat and not hardware_compatible_encoder:
+            raise ValueError(
+                'hardware_encoder_qat requires hardware_compatible_encoder=True'
+            )
+        if hardware_compatible_encoder and pad_mode != 'constant':
+            raise ValueError(
+                'hardware-compatible Encoder requires zero/constant padding'
+            )
+        if hardware_qat_start_step < 0:
+            raise ValueError('hardware_qat_start_step must be non-negative')
+        if hardware_qat_observer_freeze_step < hardware_qat_start_step:
+            raise ValueError(
+                'hardware_qat_observer_freeze_step must be >= hardware_qat_start_step'
+            )
+        self.hardware_compatible_encoder = bool(hardware_compatible_encoder)
+        self.hardware_encoder_qat = bool(hardware_encoder_qat)
+        self.hardware_qat_start_step = int(hardware_qat_start_step)
+        self.hardware_qat_observer_freeze_step = int(
+            hardware_qat_observer_freeze_step
+        )
+        self.hardware_qat_ema_decay = float(hardware_qat_ema_decay)
 
         self.single_channel = input_channels == 1
         self.strides = strides
@@ -1231,6 +1417,8 @@ class SoundStream(Module):
             *encoder_blocks,
             CausalConv1d(layer_channels[-1], codebook_dim, 3, pad_mode = pad_mode)
         )
+        if self.hardware_encoder_qat:
+            self.configure_hardware_encoder_qat()
 
         attn_kwargs = dict(
             dim = codebook_dim,
@@ -3259,7 +3447,16 @@ class SoundStream(Module):
         unexpected = list(incompatible.unexpected_keys)
         missing_generator = [
             key for key in incompatible.missing_keys
-            if not self.is_discriminator_state_key(key)
+            if (
+                not self.is_discriminator_state_key(key) and
+                not (
+                    self.hardware_encoder_qat and
+                    (
+                        '.hardware_' in key or
+                        '.fake_quant.' in key
+                    )
+                )
+            )
         ]
         if unexpected or missing_generator:
             raise RuntimeError(
@@ -3449,6 +3646,71 @@ class SoundStream(Module):
 
         return recon_x
 
+    def configure_hardware_encoder_qat(self):
+        """Attach hardware-contract fake quantizers to the current Encoder."""
+        _replace_relu_for_hardware(self.encoder, self.hardware_qat_ema_decay)
+        convs = [
+            module for module in self.encoder.modules()
+            if isinstance(module, CausalConv1d)
+        ]
+        residuals = [
+            module for module in self.encoder.modules()
+            if isinstance(module, Residual)
+        ]
+        for conv in convs:
+            conv.configure_hardware_qat(self.hardware_qat_ema_decay)
+        for residual in residuals:
+            residual.configure_hardware_qat(self.hardware_qat_ema_decay)
+
+        # One tensor edge owns one observer.  This also makes exported scales
+        # unambiguous; branch merges receive their own HardwareResidualAdd.
+        _wire_hardware_qat_edges(self.encoder)
+        self.update_hardware_qat(0)
+
+    def update_hardware_qat(self, step):
+        if not self.hardware_encoder_qat:
+            return False, False
+        step = int(step)
+        enabled = step >= self.hardware_qat_start_step
+        observer_enabled = (
+            enabled and step < self.hardware_qat_observer_freeze_step
+        )
+        for module in self.encoder.modules():
+            setter = getattr(module, 'set_hardware_qat_state', None)
+            if callable(setter):
+                setter(
+                    enabled=enabled,
+                    observer_enabled=observer_enabled,
+                )
+        return enabled, observer_enabled
+
+    def hardware_encoder_weight_report(self):
+        report = []
+        for name, module in self.encoder.named_modules():
+            if not isinstance(module, CausalConv1d):
+                continue
+            weight = module.conv.weight
+            cout, cin_per_group, kernel = weight.shape
+            packed_bytes = int(weight.numel())
+            report.append(dict(
+                name=name,
+                cin=int(cin_per_group * module.conv.groups),
+                cout=int(cout),
+                kernel=int(kernel),
+                stride=int(module.conv.stride[0]),
+                groups=int(module.conv.groups),
+                packed_weight_bytes=packed_bytes,
+                fits_weight_bank=(packed_bytes <= 128 * 1024),
+            ))
+        return report
+
+    def hardware_encoder_quantization_diagnostics(self):
+        diagnostics = {}
+        for name, module in self.encoder.named_modules():
+            if isinstance(module, CausalConv1d):
+                diagnostics[name] = module.hardware_quantization_diagnostics()
+        return diagnostics
+
     def rvq_codebook_balance_loss(self, encoded, indices):
         """Entropy-floor loss from differentiable per-stage soft assignments."""
         if self.rq_codebook_balance_loss_weight <= 0.:
@@ -3594,6 +3856,7 @@ class SoundStream(Module):
             x = self.encoder_film(x, denoise_input)
 
         continuous_x = x
+        self._last_encoder_latent64 = continuous_x
         quantization_error_loss = self.zero
         if self.rq_projection_only:
             x = self.rq_output_projection(self.rq_input_projection(x))
