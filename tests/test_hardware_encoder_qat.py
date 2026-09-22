@@ -41,6 +41,21 @@ def test_symmetric_activation_fake_quant_uses_signed_int8_and_ste():
     torch.testing.assert_close(x.grad, torch.ones_like(x))
 
 
+def test_percentile_observer_rejects_rare_activation_outlier():
+    values = torch.cat((torch.ones(10_000), torch.tensor([100.])))
+    percentile = SymmetricActivationFakeQuant(
+        ema_decay=0., observer="percentile", percentile=99.9
+    )
+    maximum = SymmetricActivationFakeQuant(
+        ema_decay=0., observer="max", percentile=99.9
+    )
+    percentile.observe(values)
+    maximum.observe(values)
+    assert percentile.amax.item() < 2.
+    assert maximum.amax.item() == 100.
+    assert percentile.scale.item() < maximum.scale.item() / 50.
+
+
 def test_activation_uses_full_rtl_negative_saturation_code():
     fake_quant = SymmetricActivationFakeQuant().eval()
     fake_quant.set_state(enabled=True, observer_enabled=False)
@@ -154,6 +169,7 @@ def test_hardware_qat_supports_current_lowrank_dscnn_encoder_and_keeps_shape():
         hardware_qat_activation_start_step=2,
         hardware_qat_warm_in_steps=2,
         hardware_qat_block_interval_steps=0,
+        hardware_qat_validation_gated=False,
         hardware_qat_observer_freeze_step=1,
         pad_mode="constant",
     ).eval()
@@ -183,6 +199,43 @@ def test_hardware_qat_supports_current_lowrank_dscnn_encoder_and_keeps_shape():
         model.encoder[0].hardware_output_fake_quant is
         hardware_input_fake_quant(model.encoder[1])
     )
+
+
+def test_hardware_qat_uses_six_groups_and_requires_two_validation_passes():
+    model = SoundStream(
+        channels=16,
+        channel_mults=(2, 4, 8, 16),
+        codebook_dim=64,
+        codebook_size=256,
+        rq_num_quantizers=8,
+        use_local_attn=False,
+        hardware_compatible_encoder=True,
+        hardware_encoder_qat=True,
+        hardware_qat_start_step=1,
+        hardware_qat_activation_start_step=2,
+        hardware_qat_observer_freeze_step=1,
+        hardware_qat_warm_in_steps=1,
+        hardware_qat_validation_gated=True,
+        hardware_qat_gate_required_passes=2,
+        pad_mode="constant",
+    ).eval()
+    model.update_hardware_qat(2)
+    assert model.hardware_qat_group_alphas == (1., 0., 0., 0., 0., 0.)
+    passing = {
+        "aligned_si_sdr": 2.0,
+        "qat_latent32_nmse": 0.01,
+        "qat_index_flip_q00": 0.05,
+        "qat_index_flip_q01": 0.08,
+    }
+    baseline = {"aligned_si_sdr": 2.0}
+    assert model.update_hardware_qat_validation_gate(
+        passing, baseline, 2
+    ) == (False, "awaiting_consecutive_pass")
+    assert model.update_hardware_qat_validation_gate(
+        passing, baseline, 3
+    ) == (True, "advanced")
+    model.update_hardware_qat(4)
+    assert model.hardware_qat_group_alphas == (1., 1., 0., 0., 0., 0.)
 
 
 def test_hardware_qat_disabled_stage_rebuild_starts_in_float_mode():

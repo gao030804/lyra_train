@@ -300,8 +300,10 @@ class SoundStreamTrainer(nn.Module):
         encoder_only_training: bool = False,
         hardware_qat_latent64_weight: float = 0.25,
         hardware_qat_latent32_weight: float = 0.75,
-        hardware_qat_rvq_margin_weight: float = 0.25,
+        hardware_qat_rvq_margin_weight: float = 0.03,
         hardware_qat_rvq_margin: float = 0.05,
+        hardware_qat_rvq_margin_max: float = 1.0,
+        hardware_qat_sensitivity_scan: bool = True,
         hardware_qat_fixed_scale_step: int = 1500,
         hardware_qat_fixed_scale_lr: float = 1e-7,
         hardware_qat_final_polish_step: int = 5000,
@@ -810,6 +812,9 @@ class SoundStreamTrainer(nn.Module):
         self.hardware_qat_latent32_weight = float(hardware_qat_latent32_weight)
         self.hardware_qat_rvq_margin_weight = float(hardware_qat_rvq_margin_weight)
         self.hardware_qat_rvq_margin = float(hardware_qat_rvq_margin)
+        self.hardware_qat_rvq_margin_max = float(hardware_qat_rvq_margin_max)
+        self.hardware_qat_sensitivity_scan = bool(hardware_qat_sensitivity_scan)
+        self.hardware_qat_sensitivity_scan_done = False
         self.best_full_qat_score = float('-inf')
         self.hardware_qat_fixed_scale_step = int(hardware_qat_fixed_scale_step)
         self.hardware_qat_fixed_scale_lr = float(hardware_qat_fixed_scale_lr)
@@ -1789,6 +1794,27 @@ class SoundStreamTrainer(nn.Module):
             early_stopping_metric = self.early_stopping_metric,
             best_aligned_si_sdr = self.best_aligned_si_sdr,
             best_full_qat_score = self.best_full_qat_score,
+            hardware_qat_progression_state = dict(
+                active_group=int(getattr(
+                    self.unwrapped_soundstream,
+                    'hardware_qat_active_group', torch.tensor(0)
+                ).item()),
+                group_start_step=int(getattr(
+                    self.unwrapped_soundstream,
+                    'hardware_qat_group_start_step', torch.tensor(0)
+                ).item()),
+                gate_pass_count=int(getattr(
+                    self.unwrapped_soundstream,
+                    'hardware_qat_gate_pass_count', torch.tensor(0)
+                ).item()),
+                group_order=[int(value) for value in getattr(
+                    self.unwrapped_soundstream,
+                    'hardware_qat_group_order', torch.arange(6)
+                )],
+                sensitivity_scan_done=bool(
+                    self.hardware_qat_sensitivity_scan_done
+                ),
+            ),
             best_rvq_fidelity_score = self.best_rvq_fidelity_score,
             rvq_plateau_best_lookup_nmse = self.rvq_plateau_best_lookup_nmse,
             rvq_plateau_bad_evals = self.rvq_plateau_bad_evals,
@@ -4391,6 +4417,30 @@ class SoundStreamTrainer(nn.Module):
         self.best_valid_score = pkg.get('best_valid_score', float('inf'))
         self.best_aligned_si_sdr = pkg.get('best_aligned_si_sdr', float('-inf'))
         self.best_full_qat_score = pkg.get('best_full_qat_score', float('-inf'))
+        qat_progression = pkg.get('hardware_qat_progression_state', {})
+        self.hardware_qat_sensitivity_scan_done = bool(
+            qat_progression.get('sensitivity_scan_done', False)
+        )
+        qat_model = self.unwrapped_soundstream
+        if hasattr(qat_model, 'hardware_qat_active_group'):
+            qat_model.hardware_qat_active_group.fill_(
+                int(qat_progression.get('active_group', 0))
+            )
+            qat_model.hardware_qat_group_start_step.fill_(int(
+                qat_progression.get(
+                    'group_start_step',
+                    getattr(qat_model, 'hardware_qat_activation_start_step', 0)
+                )
+            ))
+            qat_model.hardware_qat_gate_pass_count.fill_(
+                int(qat_progression.get('gate_pass_count', 0))
+            )
+            group_order = qat_progression.get('group_order', list(range(6)))
+            qat_model.hardware_qat_group_order.copy_(torch.tensor(
+                group_order,
+                device=qat_model.hardware_qat_group_order.device,
+                dtype=qat_model.hardware_qat_group_order.dtype,
+            ))
         self.best_rvq_fidelity_score = pkg.get(
             'best_rvq_fidelity_score',
             float('-inf'),
@@ -5621,6 +5671,9 @@ class SoundStreamTrainer(nn.Module):
                 f'q{index:02d}': value.detach()
                 for index, value in enumerate(per_level)
             }
+        rvq_margin_loss = rvq_margin_loss.clamp_max(
+            self.hardware_qat_rvq_margin_max
+        )
         weighted = (
             self.hardware_qat_latent64_weight * latent64_nmse +
             self.hardware_qat_latent32_weight * latent32_nmse +
@@ -5683,6 +5736,74 @@ class SoundStreamTrainer(nn.Module):
                     min(values) if values else 0.
                 )
         return output
+
+    @torch.no_grad()
+    def run_hardware_qat_sensitivity_scan(self, step):
+        """Measure every activation group independently on fixed validation."""
+        model = self.unwrapped_soundstream
+        rows = []
+        names = ('initial_conv', 'block1', 'block2', 'block3', 'block4', 'final_conv')
+        try:
+            for group_index, group_name in enumerate(names):
+                model.set_hardware_qat_sensitivity_group(group_index)
+                metrics = self.evaluate_fixed_validation_score(model)
+                baseline_si_sdr = (
+                    self.quality_retention_baseline['aligned_si_sdr']
+                    if self.has_quality_retention_baseline else float('nan')
+                )
+                rows.append((
+                    group_index,
+                    group_name,
+                    metrics.get('aligned_si_sdr', float('-inf')) - baseline_si_sdr,
+                    metrics.get('qat_latent32_nmse', float('inf')),
+                    metrics.get('qat_index_flip_q00', float('inf')),
+                    metrics.get('qat_index_flip_q01', float('inf')),
+                    metrics.get('qat_activation_utilization_p999_mean', 0.),
+                    metrics.get('qat_activation_utilization_p999_min', 0.),
+                ))
+        finally:
+            model.update_hardware_qat(step)
+
+        # Least sensitive groups progress first.  The order is deterministic
+        # for identical fixed-validation inputs and is stored in trainer
+        # checkpoints for safe resume.
+        ordered = sorted(
+            rows,
+            key=lambda row: (-row[2], row[3], row[4] + row[5]),
+        )
+        model.hardware_qat_group_order.copy_(torch.tensor(
+            [row[0] for row in ordered],
+            device=model.hardware_qat_group_order.device,
+            dtype=model.hardware_qat_group_order.dtype,
+        ))
+        model.update_hardware_qat(step)
+
+        report = self.results_folder / 'hardware_qat_sensitivity.tsv'
+        with report.open('w', encoding='utf-8') as handle:
+            handle.write(
+                'group\tname\tdelta_aligned_si_sdr_db\tlatent32_nmse\t'
+                'q00_flip\tq01_flip\tu999_mean\tu999_min\n'
+            )
+            for row in rows:
+                handle.write('\t'.join(str(value) for value in row) + '\n')
+        self.hardware_qat_sensitivity_scan_done = True
+        self.print(
+            f'{step}: hardware QAT activation sensitivity scan saved to {report}'
+        )
+        for row in rows:
+            self.print(
+                f'{step}: QAT sensitivity {row[1]}: '
+                f'delta_si_sdr={row[2]:+.3f}dB, nmse32={row[3]:.4f}, '
+                f'q00/q01={row[4]:.3f}/{row[5]:.3f}, '
+                f'u999={row[6]:.3f}/{row[7]:.3f}'
+            )
+        self.print(
+            f'{step}: QAT activation progression order='
+            + ','.join(
+                names[int(index)] for index in model.hardware_qat_group_order
+            )
+        )
+        return rows
 
     def update_hardware_qat_lr(self, steps):
         """Apply the conservative fixed-scale and final-polish QAT LR phases."""
@@ -6852,6 +6973,10 @@ class SoundStreamTrainer(nn.Module):
                 f"/groups[{','.join(f'{value:.2f}' for value in qat_group_alphas)}]"
                 f" | qat_lr={hardware_qat_lr:.3e}"
                 f" | qat_rvq_margin={float(getattr(model, '_last_hardware_qat_rvq_margin', 0.)):.6f}"
+                f" | optimizer_scope={'encoder_only' if self.encoder_only_training else 'generator'}"
+                f"/decoder_requires_grad={int(any(p.requires_grad for p in model.decoder.parameters()))}"
+                f"/projection_requires_grad={int(any(p.requires_grad for p in model.rq_input_projection.parameters()))}"
+                f"/rvq_requires_grad={int(any(p.requires_grad for p in model.rq.parameters()))}"
                 f" | qat_latent64_nmse={logs['qat_latent64_nmse']:.6f}"
                 f" | qat_latent32_nmse={logs['qat_latent32_nmse']:.6f}"
                 f" | qat_int32_overflow_max={accumulator_overflow:.6e}"
@@ -7185,6 +7310,7 @@ class SoundStreamTrainer(nn.Module):
         )
         plateau_metric_tensor = None
         rvq_plateau_state_tensor = None
+        qat_progression_state_tensor = None
         early_stopping_triggered_by_patience = False
         if should_eval_best and exists(self.plateau_scheduler):
             plateau_metric_tensor = torch.zeros(3, device = device)
@@ -7205,10 +7331,49 @@ class SoundStreamTrainer(nn.Module):
                 ],
                 device = device,
             )
+        if should_eval_best and self.encoder_only_training:
+            qat_progression_state_tensor = torch.zeros(10, device=device)
 
         if self.is_main and should_eval_best:
             online_model = self.unwrapped_soundstream
             online_score = self.evaluate_fixed_validation_score(online_model)
+            if (
+                self.encoder_only_training and
+                self.hardware_qat_sensitivity_scan and
+                not self.hardware_qat_sensitivity_scan_done and
+                steps >= getattr(online_model, 'hardware_qat_start_step', 0) and
+                steps < getattr(
+                    online_model, 'hardware_qat_activation_start_step', 0
+                )
+            ):
+                self.run_hardware_qat_sensitivity_scan(steps)
+            if (
+                exists(qat_progression_state_tensor) and
+                self.has_quality_retention_baseline and
+                hasattr(online_model, 'update_hardware_qat_validation_gate')
+            ):
+                advanced, gate_reason = (
+                    online_model.update_hardware_qat_validation_gate(
+                        online_score, self.quality_retention_baseline, steps
+                    )
+                )
+                qat_progression_state_tensor.copy_(torch.tensor([
+                    float(online_model.hardware_qat_active_group.item()),
+                    float(online_model.hardware_qat_group_start_step.item()),
+                    float(online_model.hardware_qat_gate_pass_count.item()),
+                    float(advanced),
+                    *[
+                        float(value)
+                        for value in online_model.hardware_qat_group_order
+                    ],
+                ], device=device))
+                self.print(
+                    f"{steps}: QAT activation validation gate group="
+                    f"{int(online_model.hardware_qat_active_group.item())}/5 "
+                    f"pass_count={int(online_model.hardware_qat_gate_pass_count.item())}/"
+                    f"{online_model.hardware_qat_gate_required_passes} "
+                    f"action={gate_reason}"
+                )
             if (
                 rvq_joint_phase == 'rvq_ema' and
                 steps >= self.rvq_plateau_freeze_start_steps and
@@ -8353,6 +8518,28 @@ class SoundStreamTrainer(nn.Module):
                     f"{steps}: early stopping is inactive until "
                     f"step {self.early_stopping_start_steps}"
                 )
+
+        if exists(qat_progression_state_tensor):
+            if (
+                self.is_distributed and torch.distributed.is_available() and
+                torch.distributed.is_initialized()
+            ):
+                torch.distributed.broadcast(qat_progression_state_tensor, src=0)
+            qat_model = self.unwrapped_soundstream
+            qat_model.hardware_qat_active_group.fill_(
+                int(round(float(qat_progression_state_tensor[0].item())))
+            )
+            qat_model.hardware_qat_group_start_step.fill_(
+                int(round(float(qat_progression_state_tensor[1].item())))
+            )
+            qat_model.hardware_qat_gate_pass_count.fill_(
+                int(round(float(qat_progression_state_tensor[2].item())))
+            )
+            qat_model.hardware_qat_group_order.copy_(
+                qat_progression_state_tensor[4:10].round().to(
+                    dtype=qat_model.hardware_qat_group_order.dtype
+                )
+            )
 
         if exists(rvq_plateau_state_tensor):
             if (

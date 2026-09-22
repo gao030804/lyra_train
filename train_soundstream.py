@@ -443,10 +443,28 @@ def parse_args() -> argparse.Namespace:
         '--hardware-qat-observer-freeze-step', type=int, default=1000
     )
     parser.add_argument('--hardware-qat-ema-decay', type=float, default=0.99)
+    parser.add_argument(
+        '--hardware-qat-observer', choices=('max', 'percentile'),
+        default='percentile'
+    )
+    parser.add_argument('--hardware-qat-percentile', type=float, default=99.99)
+    parser.add_argument(
+        '--hardware-qat-validation-gated',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Require consecutive fixed-validation passes before enabling the next activation group.'
+    )
+    parser.add_argument('--hardware-qat-gate-required-passes', type=int, default=2)
     parser.add_argument('--hardware-qat-latent64-weight', type=float, default=0.5)
     parser.add_argument('--hardware-qat-latent32-weight', type=float, default=1.5)
-    parser.add_argument('--hardware-qat-rvq-margin-weight', type=float, default=0.25)
+    parser.add_argument('--hardware-qat-rvq-margin-weight', type=float, default=0.03)
     parser.add_argument('--hardware-qat-rvq-margin', type=float, default=0.05)
+    parser.add_argument('--hardware-qat-rvq-margin-max', type=float, default=1.0)
+    parser.add_argument(
+        '--hardware-qat-sensitivity-scan',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument('--hardware-qat-fixed-scale-lr', type=float, default=1e-7)
     parser.add_argument('--hardware-qat-final-polish-step', type=int, default=5000)
     parser.add_argument('--hardware-qat-final-polish-lr', type=float, default=5e-8)
@@ -2345,6 +2363,10 @@ def build_model(
     hardware_qat_block_interval_steps: int = 600,
     hardware_qat_observer_freeze_step: int = 1000,
     hardware_qat_ema_decay: float = 0.99,
+    hardware_qat_observer: str = 'percentile',
+    hardware_qat_percentile: float = 99.99,
+    hardware_qat_validation_gated: bool = True,
+    hardware_qat_gate_required_passes: int = 2,
 ) -> SoundStream:
     if sync_codebook is None:
         sync_codebook = int(os.environ.get("WORLD_SIZE", "1")) > 1
@@ -2476,6 +2498,10 @@ def build_model(
             hardware_qat_observer_freeze_step
         ),
         hardware_qat_ema_decay=hardware_qat_ema_decay,
+        hardware_qat_observer=hardware_qat_observer,
+        hardware_qat_percentile=hardware_qat_percentile,
+        hardware_qat_validation_gated=hardware_qat_validation_gated,
+        hardware_qat_gate_required_passes=hardware_qat_gate_required_passes,
     )
 
     if stage not in ("stream_finetune", "stream_finetune_long"):
@@ -2515,11 +2541,16 @@ def main() -> None:
         raise ValueError('--hardware-qat-block-interval-steps cannot be negative')
     if args.hardware_qat_warm_in_steps < 0:
         raise ValueError('--hardware-qat-warm-in-steps cannot be negative')
+    if not 0. < args.hardware_qat_percentile <= 100.:
+        raise ValueError('--hardware-qat-percentile must be in (0, 100]')
+    if args.hardware_qat_gate_required_passes < 1:
+        raise ValueError('--hardware-qat-gate-required-passes must be positive')
     for name in (
         'hardware_qat_latent64_weight',
         'hardware_qat_latent32_weight',
         'hardware_qat_rvq_margin_weight',
         'hardware_qat_rvq_margin',
+        'hardware_qat_rvq_margin_max',
         'hardware_qat_fixed_scale_lr',
         'hardware_qat_final_polish_lr',
         'hardware_qat_max_latent32_nmse',
@@ -4300,6 +4331,10 @@ def main() -> None:
             args.hardware_qat_observer_freeze_step
         ),
         hardware_qat_ema_decay=args.hardware_qat_ema_decay,
+        hardware_qat_observer=args.hardware_qat_observer,
+        hardware_qat_percentile=args.hardware_qat_percentile,
+        hardware_qat_validation_gated=args.hardware_qat_validation_gated,
+        hardware_qat_gate_required_passes=args.hardware_qat_gate_required_passes,
     )
     if rvq_joint_adapt:
         if soundstream.recon_loss_weight != 7.5:
@@ -4912,6 +4947,8 @@ def main() -> None:
         hardware_qat_latent32_weight=args.hardware_qat_latent32_weight,
         hardware_qat_rvq_margin_weight=args.hardware_qat_rvq_margin_weight,
         hardware_qat_rvq_margin=args.hardware_qat_rvq_margin,
+        hardware_qat_rvq_margin_max=args.hardware_qat_rvq_margin_max,
+        hardware_qat_sensitivity_scan=args.hardware_qat_sensitivity_scan,
         hardware_qat_fixed_scale_step=args.hardware_qat_observer_freeze_step,
         hardware_qat_fixed_scale_lr=args.hardware_qat_fixed_scale_lr,
         hardware_qat_final_polish_step=args.hardware_qat_final_polish_step,
@@ -5222,6 +5259,12 @@ def main() -> None:
                     f'per-block blend={args.hardware_qat_warm_in_steps}, '
                     f'block interval={args.hardware_qat_block_interval_steps}; '
                     f'observer_freeze={args.hardware_qat_observer_freeze_step}; '
+                    f'observer={args.hardware_qat_observer}'
+                    f'({args.hardware_qat_percentile:g}%); '
+                    f'activation_groups=6; validation_gated='
+                    f'{int(args.hardware_qat_validation_gated)} '
+                    f'(passes={args.hardware_qat_gate_required_passes}); '
+                    f'sensitivity_scan={int(args.hardware_qat_sensitivity_scan)}; '
                     f'fixed_scale_lr={args.hardware_qat_fixed_scale_lr:g}; '
                     f'final_polish={args.hardware_qat_final_polish_step} '
                     f'at lr={args.hardware_qat_final_polish_lr:g}; '

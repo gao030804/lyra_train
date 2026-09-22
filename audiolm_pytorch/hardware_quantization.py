@@ -37,14 +37,30 @@ def clamp_ste(x: torch.Tensor, qmin: int, qmax: int) -> torch.Tensor:
 
 
 class SymmetricActivationFakeQuant(nn.Module):
-    """EMA-observed, per-tensor, signed symmetric INT8 fake quantization."""
+    """Observed, per-tensor, signed symmetric INT8 fake quantization.
 
-    def __init__(self, ema_decay: float = 0.99, eps: float = 1e-8):
+    ``percentile`` keeps the hardware format unchanged while preventing rare
+    audio transients from consuming almost the entire INT8 dynamic range.
+    """
+
+    def __init__(
+        self,
+        ema_decay: float = 0.99,
+        eps: float = 1e-8,
+        observer: str = "max",
+        percentile: float = 99.99,
+    ):
         super().__init__()
         if not 0. <= ema_decay < 1.:
             raise ValueError("ema_decay must be in [0, 1)")
         self.ema_decay = float(ema_decay)
         self.eps = float(eps)
+        if observer not in {"max", "percentile"}:
+            raise ValueError("observer must be 'max' or 'percentile'")
+        if not 0. < percentile <= 100.:
+            raise ValueError("percentile must be in (0, 100]")
+        self.observer = observer
+        self.percentile = float(percentile)
         self.register_buffer("amax", torch.tensor(0.))
         # Keep scale observer-owned and fixed after calibration.  It retains
         # the historical state-dict key, but is deliberately not optimized;
@@ -85,13 +101,28 @@ class SymmetricActivationFakeQuant(nn.Module):
 
     @torch.no_grad()
     def observe(self, x: torch.Tensor) -> None:
-        current_amax = x.detach().abs().amax().float()
+        absolute = x.detach().abs().float().flatten()
+        if absolute.numel() == 0:
+            return
+        # Bound calibration overhead on early high-resolution feature maps.
+        # Deterministic striding keeps runs reproducible and does not alter the
+        # tensor that is quantized in the forward path.
+        if absolute.numel() > 65_536:
+            stride = max(1, absolute.numel() // 65_536)
+            absolute = absolute[::stride][:65_536]
+        current_amax = (
+            absolute.amax()
+            if self.observer == "max" or self.percentile >= 100.
+            else torch.quantile(absolute, self.percentile / 100.)
+        )
         if not torch.isfinite(current_amax):
             return
         # DDP broadcasts buffers at forward boundaries, but that does not make
         # the current batch statistic global.  All ranks must update the EMA
-        # from the same maximum or the saved rank-0 scale is not representative
-        # of the six-GPU training run.
+        # from the same conservative statistic or the saved rank-0 scale is not
+        # representative of the distributed training run.  MAX is deliberate:
+        # it avoids an unsafe scale even though each rank estimates its local
+        # percentile independently.
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.all_reduce(
                 current_amax,
@@ -202,9 +233,14 @@ def requantize_int32_with_multiplier_shift(
 class HardwareReLU(nn.Module):
     """ReLU with shared-scale signed-INT8 input and output."""
 
-    def __init__(self, ema_decay: float = 0.99):
+    def __init__(
+        self, ema_decay: float = 0.99, observer: str = "max",
+        percentile: float = 99.99
+    ):
         super().__init__()
-        self.fake_quant = SymmetricActivationFakeQuant(ema_decay=ema_decay)
+        self.fake_quant = SymmetricActivationFakeQuant(
+            ema_decay=ema_decay, observer=observer, percentile=percentile
+        )
         self.observer_owned_by_producer = False
 
     def share_producer_fake_quant(
@@ -248,9 +284,14 @@ class HardwareReLU(nn.Module):
 class HardwareResidualAdd(nn.Module):
     """Shared-scale INT8 residual merge with saturation and STE gradients."""
 
-    def __init__(self, ema_decay: float = 0.99):
+    def __init__(
+        self, ema_decay: float = 0.99, observer: str = "max",
+        percentile: float = 99.99
+    ):
         super().__init__()
-        self.fake_quant = SymmetricActivationFakeQuant(ema_decay=ema_decay)
+        self.fake_quant = SymmetricActivationFakeQuant(
+            ema_decay=ema_decay, observer=observer, percentile=percentile
+        )
 
     def set_hardware_qat_state(
         self, *, enabled: bool, observer_enabled: bool, blend_alpha: float = 1.
