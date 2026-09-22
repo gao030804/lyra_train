@@ -608,10 +608,12 @@ class CausalConv1d(Module):
         self.hardware_qat_blend_alpha = float(blend_alpha)
         self.hardware_weight_qat_enabled_state.fill_(weight_enabled)
         self.hardware_activation_qat_enabled_state.fill_(activation_enabled)
-        for fake_quant in (
-            self.hardware_input_fake_quant,
-            self.hardware_output_fake_quant,
-        ):
+        fake_quants = [self.hardware_output_fake_quant]
+        # Shared input edges are owned by the producer. Letting this consumer
+        # change their observer state would reopen an already accepted group.
+        if not self.hardware_input_observer_owned_by_producer:
+            fake_quants.append(self.hardware_input_fake_quant)
+        for fake_quant in fake_quants:
             if exists(fake_quant):
                 fake_quant.set_state(
                     enabled=activation_enabled,
@@ -1324,6 +1326,8 @@ class SoundStream(Module):
         hardware_qat_validation_gated = True,
         hardware_qat_gate_required_passes = 2,
         hardware_qat_group_fail_patience = 4,
+        hardware_qat_group_recalibration_steps = 150,
+        hardware_qat_group_percentiles = None,
         stft_discriminator: Module | None = None,  # can pass in own stft discriminator
         complex_stft_discr_kwargs: dict = dict()
     ):
@@ -1399,6 +1403,8 @@ class SoundStream(Module):
             raise ValueError('hardware_qat_gate_required_passes must be positive')
         if hardware_qat_group_fail_patience < 1:
             raise ValueError('hardware_qat_group_fail_patience must be positive')
+        if hardware_qat_group_recalibration_steps < 0:
+            raise ValueError('hardware_qat_group_recalibration_steps cannot be negative')
         self.hardware_qat_observer = str(hardware_qat_observer)
         self.hardware_qat_percentile = float(hardware_qat_percentile)
         self.hardware_qat_validation_gated = bool(hardware_qat_validation_gated)
@@ -1408,6 +1414,21 @@ class SoundStream(Module):
         self.hardware_qat_group_fail_patience = int(
             hardware_qat_group_fail_patience
         )
+        self.hardware_qat_group_recalibration_steps = int(
+            hardware_qat_group_recalibration_steps
+        )
+        if hardware_qat_group_percentiles is None:
+            hardware_qat_group_percentiles = (hardware_qat_percentile,) * 6
+        self.hardware_qat_group_percentiles = tuple(
+            float(value) for value in hardware_qat_group_percentiles
+        )
+        if (
+            len(self.hardware_qat_group_percentiles) != 6 or
+            any(not 0. < value <= 100. for value in self.hardware_qat_group_percentiles)
+        ):
+            raise ValueError(
+                'hardware_qat_group_percentiles must contain six values in (0, 100]'
+            )
         # Progression is trainer runtime state, not architecture state.  Keep
         # these buffers out of model-only state_dicts so older FP checkpoints
         # remain strict-load compatible; full trainer checkpoints serialize
@@ -3844,19 +3865,60 @@ class SoundStream(Module):
             group_index = child_index
             for module in child.modules():
                 module._hardware_qat_group_index = group_index
+                for fake_quant in (
+                    getattr(module, 'hardware_output_fake_quant', None),
+                    getattr(getattr(module, 'hardware_residual_add', None), 'fake_quant', None),
+                ):
+                    if isinstance(fake_quant, SymmetricActivationFakeQuant):
+                        fake_quant.percentile = self.hardware_qat_group_percentiles[group_index]
         self.update_hardware_qat(0)
+
+    @torch.no_grad()
+    def reset_hardware_qat_group_observers(self, group_index):
+        """Reset only producer-owned observers in one physical Encoder group."""
+        group_index = int(group_index)
+        if group_index not in range(6):
+            raise ValueError('group_index must be in [0, 5]')
+        percentile = self.hardware_qat_group_percentiles[group_index]
+        seen = set()
+        for module in self.encoder.modules():
+            if int(getattr(module, '_hardware_qat_group_index', -1)) != group_index:
+                continue
+            candidates = (
+                getattr(module, 'hardware_input_fake_quant', None)
+                if (
+                    isinstance(module, CausalConv1d) and
+                    not module.hardware_input_observer_owned_by_producer
+                ) else None,
+                getattr(module, 'hardware_output_fake_quant', None),
+                getattr(getattr(module, 'hardware_residual_add', None), 'fake_quant', None),
+            )
+            for fake_quant in candidates:
+                if (
+                    isinstance(fake_quant, SymmetricActivationFakeQuant) and
+                    id(fake_quant) not in seen
+                ):
+                    fake_quant.reset_observer(percentile=percentile)
+                    seen.add(id(fake_quant))
+        return len(seen)
 
     def update_hardware_qat(self, step):
         if not self.hardware_encoder_qat:
             return False, False
         step = int(step)
         weight_enabled = step >= self.hardware_qat_start_step
-        observer_enabled = (
+        initial_observer_enabled = (
             self.hardware_qat_observer_start_step <= step <
             self.hardware_qat_observer_freeze_step
         )
         group_alphas = []
         active_group = int(self.hardware_qat_active_group.item())
+        active_group_recalibrating = bool(
+            self.hardware_qat_validation_gated and
+            active_group >= 0 and
+            step >= self.hardware_qat_activation_start_step and
+            step < int(self.hardware_qat_group_start_step.item())
+        )
         completed_groups = {
             index for index, accepted in enumerate(
                 self.hardware_qat_accepted_groups.tolist()
@@ -3895,6 +3957,10 @@ class SoundStream(Module):
             if callable(setter):
                 group_index = int(getattr(module, '_hardware_qat_group_index', 0))
                 alpha = group_alphas[min(group_index, len(group_alphas) - 1)]
+                observer_enabled = bool(
+                    initial_observer_enabled or
+                    (active_group_recalibrating and group_index == active_group)
+                )
                 if isinstance(module, CausalConv1d):
                     setter(
                         observer_enabled=observer_enabled,
@@ -3908,7 +3974,10 @@ class SoundStream(Module):
                         observer_enabled=observer_enabled,
                         blend_alpha=alpha,
                     )
-        return weight_enabled or any(alpha > 0. for alpha in group_alphas), observer_enabled
+        return (
+            weight_enabled or any(alpha > 0. for alpha in group_alphas),
+            initial_observer_enabled or active_group_recalibrating,
+        )
 
     @torch.no_grad()
     def set_hardware_qat_sensitivity_group(
@@ -3951,6 +4020,8 @@ class SoundStream(Module):
         *,
         max_latent32_nmse=0.03,
         max_quantized_output_nmse=0.05,
+        max_incremental_latent32_nmse=0.02,
+        max_incremental_quantized_output_nmse=0.03,
     ):
         """Advance one activation group only after two clean validations."""
         if not self.hardware_qat_validation_gated:
@@ -3966,10 +4037,10 @@ class SoundStream(Module):
         passed = bool(
             metrics.get('aligned_si_sdr', float('-inf')) >=
             baseline.get('aligned_si_sdr', float('-inf')) - 0.10 and
-            metrics.get('qat_latent32_nmse', float('inf')) <
-            float(max_latent32_nmse) and
-            metrics.get('qat_quantized_output_nmse', float('inf')) <
-            float(max_quantized_output_nmse) and
+            metrics.get('qat_incremental_latent32_nmse', float('inf')) <
+            float(max_incremental_latent32_nmse) and
+            metrics.get('qat_incremental_quantized_output_nmse', float('inf')) <
+            float(max_incremental_quantized_output_nmse) and
             metrics.get('qat_int32_overflow_max', 0.) <= 0.
         )
         if not passed:

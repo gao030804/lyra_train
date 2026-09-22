@@ -310,6 +310,9 @@ class SoundStreamTrainer(nn.Module):
         hardware_qat_final_polish_lr: float = 5e-8,
         hardware_qat_max_latent32_nmse: float = 0.03,
         hardware_qat_max_quantized_output_nmse: float = 0.05,
+        hardware_qat_max_incremental_latent32_nmse: float = 0.02,
+        hardware_qat_max_incremental_quantized_output_nmse: float = 0.03,
+        hardware_qat_accepted_lr_scale: float = 0.1,
         hardware_qat_group_fail_patience: int = 4,
         hardware_qat_max_q00_index_flip: float = 0.10,
         hardware_qat_max_q01_index_flip: float = 0.15,
@@ -826,6 +829,15 @@ class SoundStreamTrainer(nn.Module):
         self.hardware_qat_max_quantized_output_nmse = float(
             hardware_qat_max_quantized_output_nmse
         )
+        self.hardware_qat_max_incremental_latent32_nmse = float(
+            hardware_qat_max_incremental_latent32_nmse
+        )
+        self.hardware_qat_max_incremental_quantized_output_nmse = float(
+            hardware_qat_max_incremental_quantized_output_nmse
+        )
+        self.hardware_qat_accepted_lr_scale = float(
+            hardware_qat_accepted_lr_scale
+        )
         self.hardware_qat_group_fail_patience = int(
             hardware_qat_group_fail_patience
         )
@@ -835,6 +847,7 @@ class SoundStreamTrainer(nn.Module):
             exclude_rq_from_generator_optimizer
         )
         self._stage2_latent_reference_encoder = None
+        object.__setattr__(self, '_hardware_qat_progressive_reference_encoder', None)
         object.__setattr__(self, '_rvq_q0_teacher', None)
         object.__setattr__(self, '_stage2_decoder_teacher', None)
         self.first_decoder_block_excluded_from_generator_optimizer = bool(
@@ -1021,7 +1034,10 @@ class SoundStreamTrainer(nn.Module):
             raise ValueError('decoder_lr_multipliers must contain three positive values')
         use_decoder_lr_groups = decoder_lr_multipliers != (1., 1., 1.)
 
-        if exists(encoder_lr) or exists(projection_lr) or use_decoder_lr_groups:
+        if (
+            exists(encoder_lr) or exists(projection_lr) or
+            use_decoder_lr_groups or encoder_only_training
+        ):
             if exists(encoder_lr) and encoder_lr <= 0.:
                 raise ValueError('encoder_lr must be positive when specified')
 
@@ -1048,11 +1064,33 @@ class SoundStreamTrainer(nn.Module):
                 raise RuntimeError(
                     'separate projection optimizer group has no parameters'
                 )
-            if not decoder_parameters and not rvq_projection_only:
+            if (
+                not decoder_parameters and not rvq_projection_only and
+                not encoder_only_training
+            ):
                 raise RuntimeError('separate optimizer groups have no Decoder parameters')
 
             generator_parameter_groups = []
-            if use_decoder_lr_groups:
+            if encoder_only_training:
+                encoder_children = list(soundstream.encoder.children())
+                assigned_ids = set()
+                named_parameter_groups = []
+                for group_index, child in enumerate(encoder_children):
+                    child_ids = {id(parameter) for parameter in child.parameters()}
+                    parameters = [
+                        parameter for parameter in encoder_parameters
+                        if id(parameter) in child_ids
+                    ]
+                    assigned_ids.update(id(parameter) for parameter in parameters)
+                    named_parameter_groups.append((
+                        f'qat_group_{group_index}', parameters, lr
+                    ))
+                extra_parameters = [
+                    parameter for parameter in encoder_parameters
+                    if id(parameter) not in assigned_ids
+                ]
+                named_parameter_groups.append(('qat_encoder_extra', extra_parameters, lr))
+            elif use_decoder_lr_groups:
                 decoder = soundstream.decoder
                 if not isinstance(decoder, nn.Sequential) or len(decoder) < 6:
                     raise RuntimeError(
@@ -1095,7 +1133,7 @@ class SoundStreamTrainer(nn.Module):
                     projection_parameters,
                     projection_lr if exists(projection_lr) else lr,
                 ))
-            if encoder_parameters:
+            if encoder_parameters and not encoder_only_training:
                 named_parameter_groups.append(('encoder', encoder_parameters, encoder_lr))
             for group_name, parameters, group_lr in named_parameter_groups:
                 if not parameters:
@@ -1108,6 +1146,10 @@ class SoundStreamTrainer(nn.Module):
                         weight_decay = wd,
                         group_name = group_name,
                         lr_scale = group_lr / lr,
+                        qat_group_index = (
+                            int(group_name.rsplit('_', 1)[-1])
+                            if group_name.startswith('qat_group_') else -1
+                        ),
                     ))
                 if no_wd_parameters:
                     generator_parameter_groups.append(dict(
@@ -1116,6 +1158,10 @@ class SoundStreamTrainer(nn.Module):
                         weight_decay = 0.,
                         group_name = group_name,
                         lr_scale = group_lr / lr,
+                        qat_group_index = (
+                            int(group_name.rsplit('_', 1)[-1])
+                            if group_name.startswith('qat_group_') else -1
+                        ),
                     ))
             generator_optimizer = get_optimizer(
                 generator_parameter_groups,
@@ -5720,6 +5766,11 @@ class SoundStreamTrainer(nn.Module):
         if reference is None:
             return {}
         model = self.unwrapped_soundstream
+        if (
+            self._hardware_qat_progressive_reference_encoder is None and
+            int(getattr(model, 'hardware_qat_active_group', torch.tensor(-1)).item()) >= 0
+        ):
+            self.capture_hardware_qat_progressive_reference()
         encoder_input, _ = model.process_input(wave)
         student64 = rearrange(
             model.encoder(encoder_input), 'b c n -> b n c'
@@ -5752,6 +5803,29 @@ class SoundStreamTrainer(nn.Module):
             'qat_latent32_nmse': float(latent32_nmse.cpu()),
             'qat_quantized_output_nmse': float(quantized_output_nmse.cpu()),
         }
+        progressive_reference = self._hardware_qat_progressive_reference_encoder
+        if progressive_reference is not None:
+            accepted64 = rearrange(
+                progressive_reference(encoder_input), 'b c n -> b n c'
+            ).float()
+            accepted32 = model.rq_input_projection(accepted64)
+            accepted_quantized, _, _ = model.rq(
+                accepted32, freeze_codebook=True
+            )
+            incremental_latent32_nmse = F.mse_loss(
+                student32, accepted32
+            ) / accepted32.square().mean().clamp_min(1e-8)
+            incremental_quantized_output_nmse = F.mse_loss(
+                student_quantized.float(), accepted_quantized.float()
+            ) / accepted_quantized.float().square().mean().clamp_min(1e-8)
+            output.update({
+                'qat_incremental_latent32_nmse': float(
+                    incremental_latent32_nmse.cpu()
+                ),
+                'qat_incremental_quantized_output_nmse': float(
+                    incremental_quantized_output_nmse.cpu()
+                ),
+            })
         output.update({
             f'qat_index_flip_q{index:02d}': float(value.cpu())
             for index, value in enumerate(per_level)
@@ -5777,6 +5851,43 @@ class SoundStreamTrainer(nn.Module):
         return output
 
     @torch.no_grad()
+    def capture_hardware_qat_progressive_reference(self):
+        """Freeze the currently accepted INT8 groups as the next gate baseline."""
+        model = self.unwrapped_soundstream
+        accepted = {
+            index for index, value in enumerate(
+                model.hardware_qat_accepted_groups.tolist()
+            ) if value
+        }
+        reference = copy.deepcopy(model.encoder).eval()
+        # Configure the copied modules directly: accepted groups remain A8,
+        # all pending/deferred groups remain float, and observers stay frozen.
+        for module in reference.modules():
+            setter = getattr(module, 'set_hardware_qat_state', None)
+            if not callable(setter):
+                continue
+            group_index = int(getattr(module, '_hardware_qat_group_index', 0))
+            enabled = group_index in accepted
+            if hasattr(module, 'hardware_weight_qat_enabled_state'):
+                setter(
+                    observer_enabled=False,
+                    weight_enabled=True,
+                    activation_enabled=enabled,
+                    blend_alpha=1. if enabled else 0.,
+                )
+            else:
+                setter(
+                    enabled=enabled,
+                    observer_enabled=False,
+                    blend_alpha=1. if enabled else 0.,
+                )
+        reference.requires_grad_(False)
+        object.__setattr__(
+            self, '_hardware_qat_progressive_reference_encoder', reference
+        )
+        return accepted
+
+    @torch.no_grad()
     def run_hardware_qat_sensitivity_scan(self, step):
         """Greedily rescan remaining groups on top of accepted INT8 groups."""
         model = self.unwrapped_soundstream
@@ -5796,19 +5907,13 @@ class SoundStreamTrainer(nn.Module):
             index for index in range(6)
             if index not in accepted and index not in deferred
         ]
-        if not candidates and deferred:
-            # After every other group has been attempted, deferred groups get
-            # another chance on top of the now-adapted accepted network.
-            model.hardware_qat_deferred_groups.zero_()
-            deferred.clear()
-            candidates = [index for index in range(6) if index not in accepted]
-            self.print(f'{step}: retrying deferred QAT activation groups')
         if not candidates:
             model.hardware_qat_active_group.fill_(-1)
             model.update_hardware_qat(step)
             return []
 
         model.set_hardware_qat_sensitivity_group(-1, accepted)
+        self.capture_hardware_qat_progressive_reference()
         accepted_metrics = self.evaluate_fixed_validation_score(model)
         accepted_si_sdr = accepted_metrics.get('aligned_si_sdr', float('-inf'))
         try:
@@ -5822,6 +5927,10 @@ class SoundStreamTrainer(nn.Module):
                     metrics.get('aligned_si_sdr', float('-inf')) - accepted_si_sdr,
                     metrics.get('qat_latent32_nmse', float('inf')),
                     metrics.get('qat_quantized_output_nmse', float('inf')),
+                    metrics.get('qat_incremental_latent32_nmse', float('inf')),
+                    metrics.get(
+                        'qat_incremental_quantized_output_nmse', float('inf')
+                    ),
                     metrics.get('qat_int32_overflow_max', float('inf')),
                     metrics.get('qat_index_flip_q00', float('inf')),
                     metrics.get('qat_index_flip_q01', float('inf')),
@@ -5835,22 +5944,31 @@ class SoundStreamTrainer(nn.Module):
         # not allow a group that already violates a deployment-fidelity limit
         # to block the entire progression.
         def group_risk(row):
-            delta_si_sdr, nmse32, vqout_nmse, overflow = row[2:6]
+            delta_si_sdr = row[2]
+            incremental_nmse32 = row[5]
+            incremental_vqout_nmse = row[6]
+            overflow = row[7]
             eligible = (
                 delta_si_sdr >= -0.10 and
-                nmse32 <= self.hardware_qat_max_latent32_nmse and
-                vqout_nmse <= self.hardware_qat_max_quantized_output_nmse and
+                incremental_nmse32 <=
+                self.hardware_qat_max_incremental_latent32_nmse and
+                incremental_vqout_nmse <=
+                self.hardware_qat_max_incremental_quantized_output_nmse and
                 overflow <= 0.
             )
             risk = max(
                 max(0., -delta_si_sdr) / 0.10,
-                nmse32 / max(self.hardware_qat_max_latent32_nmse, 1e-8),
-                vqout_nmse /
-                max(self.hardware_qat_max_quantized_output_nmse, 1e-8),
+                incremental_nmse32 /
+                max(self.hardware_qat_max_incremental_latent32_nmse, 1e-8),
+                incremental_vqout_nmse /
+                max(
+                    self.hardware_qat_max_incremental_quantized_output_nmse,
+                    1e-8,
+                ),
             )
             # FP32 index flips are diagnostics and deterministic tie-breakers,
             # not hard gates for the deployable INT8 Encoder + RVQ path.
-            return (not eligible, risk, row[6] + row[7], -delta_si_sdr, row[0])
+            return (not eligible, risk, row[8] + row[9], -delta_si_sdr, row[0])
 
         # The order is deterministic for identical fixed-validation inputs and
         # is stored in trainer checkpoints for safe resume.
@@ -5868,15 +5986,33 @@ class SoundStreamTrainer(nn.Module):
             device=model.hardware_qat_group_order.device,
             dtype=model.hardware_qat_group_order.dtype,
         ))
-        selected_group = int(ordered[0][0])
-        model.hardware_qat_active_group.fill_(selected_group)
-        model.hardware_qat_group_start_step.fill_(max(
-            int(step) + 1,
-            int(model.hardware_qat_activation_start_step),
-        ))
-        model.hardware_qat_gate_pass_count.zero_()
-        model.hardware_qat_group_fail_count.zero_()
-        model.update_hardware_qat(step)
+        eligible_rows = [row for row in ordered if not group_risk(row)[0]]
+        selected_group = None
+        reset_count = 0
+        if not eligible_rows:
+            for row in ordered:
+                model.hardware_qat_deferred_groups[int(row[0])] = True
+            model.hardware_qat_active_group.fill_(-1)
+            model.update_hardware_qat(step)
+            self.print(
+                f'{step}: no QAT activation group satisfies incremental gate; '
+                'progression stopped without forcing an ineligible group'
+            )
+        else:
+            selected_group = int(eligible_rows[0][0])
+            model.hardware_qat_active_group.fill_(selected_group)
+            recalibration_start = max(
+                int(step) + 1,
+                int(model.hardware_qat_activation_start_step),
+            )
+            model.hardware_qat_group_start_step.fill_(
+                recalibration_start +
+                int(model.hardware_qat_group_recalibration_steps)
+            )
+            reset_count = model.reset_hardware_qat_group_observers(selected_group)
+            model.hardware_qat_gate_pass_count.zero_()
+            model.hardware_qat_group_fail_count.zero_()
+            model.update_hardware_qat(step)
 
         report = self.results_folder / 'hardware_qat_sensitivity.tsv'
         write_header = not report.exists()
@@ -5884,7 +6020,8 @@ class SoundStreamTrainer(nn.Module):
             if write_header:
                 handle.write(
                     'step\tgroup\tname\tdelta_aligned_si_sdr_db\tlatent32_nmse\t'
-                    'quantized_output_nmse\tint32_overflow\tq00_flip\tq01_flip\t'
+                    'quantized_output_nmse\tincremental_latent32_nmse\t'
+                    'incremental_quantized_output_nmse\tint32_overflow\tq00_flip\tq01_flip\t'
                     'u999_mean\tu999_min\n'
                 )
             for row in rows:
@@ -5899,9 +6036,10 @@ class SoundStreamTrainer(nn.Module):
             self.print(
                 f'{step}: QAT sensitivity {row[1]}: '
                 f'delta_si_sdr={row[2]:+.3f}dB, nmse32={row[3]:.4f}, '
-                f'vqout_nmse={row[4]:.4f}, overflow={row[5]:.3e}, '
-                f'q00/q01={row[6]:.3f}/{row[7]:.3f}, '
-                f'u999={row[8]:.3f}/{row[9]:.3f}'
+                f'vqout_nmse={row[4]:.4f}, inc_nmse32={row[5]:.4f}, '
+                f'inc_vqout_nmse={row[6]:.4f}, overflow={row[7]:.3e}, '
+                f'q00/q01={row[8]:.3f}/{row[9]:.3f}, '
+                f'u999={row[10]:.3f}/{row[11]:.3f}'
             )
         self.print(
             f'{step}: QAT activation progression order='
@@ -5916,7 +6054,13 @@ class SoundStreamTrainer(nn.Module):
             f"{','.join(eligible_names) or 'none'}; deferred="
             f"{','.join(deferred_names) or 'none'}"
         )
-        self.save_hardware_qat_group_entry(step, selected_group)
+        if selected_group is not None:
+            self.print(
+                f'{step}: reset {reset_count} producer observers for active group '
+                f'{names[selected_group]}; local recalibration runs until step '
+                f'{int(model.hardware_qat_group_start_step.item()) - 1}'
+            )
+            self.save_hardware_qat_group_entry(step, selected_group)
         return rows
 
     def save_hardware_qat_group_entry(self, step, active_group):
@@ -5947,7 +6091,7 @@ class SoundStreamTrainer(nn.Module):
         )
 
     def update_hardware_qat_lr(self, steps):
-        """Apply the conservative fixed-scale and final-polish QAT LR phases."""
+        """Apply QAT phase LR plus active/accepted/pending group ownership."""
         if not self.encoder_only_training:
             return self.optim.optimizer.param_groups[0]['lr']
         target_lr = None
@@ -5962,8 +6106,32 @@ class SoundStreamTrainer(nn.Module):
             target_lr = self.hardware_qat_fixed_scale_lr
         if target_lr is None:
             return self.optim.optimizer.param_groups[0]['lr']
+        model = self.unwrapped_soundstream
+        active_group = int(model.hardware_qat_active_group.item())
+        accepted_groups = {
+            index for index, accepted in enumerate(
+                model.hardware_qat_accepted_groups.tolist()
+            ) if accepted
+        }
+        progressive = steps >= model.hardware_qat_activation_start_step
+        recalibrating = bool(
+            progressive and active_group >= 0 and
+            steps < int(model.hardware_qat_group_start_step.item())
+        )
         for group in self.optim.optimizer.param_groups:
-            group['lr'] = target_lr * float(group.get('lr_scale', 1.))
+            group_scale = float(group.get('lr_scale', 1.))
+            qat_group_index = int(group.get('qat_group_index', -1))
+            lr_multiplier = 1.
+            if progressive:
+                if recalibrating:
+                    lr_multiplier = 0.
+                elif qat_group_index in accepted_groups:
+                    lr_multiplier = self.hardware_qat_accepted_lr_scale
+                elif qat_group_index == active_group:
+                    lr_multiplier = 1.
+                else:
+                    lr_multiplier = 0.
+            group['lr'] = target_lr * group_scale * lr_multiplier
         self.optim.sync_warmup_lrs_from_optimizer()
         return target_lr
 
@@ -7510,6 +7678,12 @@ class SoundStreamTrainer(nn.Module):
                         max_quantized_output_nmse=(
                             self.hardware_qat_max_quantized_output_nmse
                         ),
+                        max_incremental_latent32_nmse=(
+                            self.hardware_qat_max_incremental_latent32_nmse
+                        ),
+                        max_incremental_quantized_output_nmse=(
+                            self.hardware_qat_max_incremental_quantized_output_nmse
+                        ),
                     )
                 )
                 if gate_reason == 'accepted_rescan_required':
@@ -7549,6 +7723,10 @@ class SoundStreamTrainer(nn.Module):
                     f"{online_score.get('qat_latent32_nmse', float('inf')):.4f}, "
                     f"quantized_output_nmse="
                     f"{online_score.get('qat_quantized_output_nmse', float('inf')):.4f}, "
+                    f"incremental_latent32_nmse="
+                    f"{online_score.get('qat_incremental_latent32_nmse', float('inf')):.4f}, "
+                    f"incremental_quantized_output_nmse="
+                    f"{online_score.get('qat_incremental_quantized_output_nmse', float('inf')):.4f}, "
                     f"int32_overflow="
                     f"{online_score.get('qat_int32_overflow_max', float('inf')):.3e}, "
                     f"q00/q01_flip(diagnostic)="

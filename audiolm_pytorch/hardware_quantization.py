@@ -100,6 +100,17 @@ class SymmetricActivationFakeQuant(nn.Module):
         self.blend_alpha_state.fill_(float(blend_alpha))
 
     @torch.no_grad()
+    def reset_observer(self, *, percentile: float | None = None) -> None:
+        """Clear calibration history before a local activation-group pass."""
+        if percentile is not None:
+            if not 0. < float(percentile) <= 100.:
+                raise ValueError("percentile must be in (0, 100]")
+            self.percentile = float(percentile)
+        self.amax.zero_()
+        self.scale.fill_(1.)
+        self.num_observations.zero_()
+
+    @torch.no_grad()
     def observe(self, x: torch.Tensor) -> None:
         absolute = x.detach().abs().float().flatten()
         if absolute.numel() == 0:

@@ -473,6 +473,16 @@ def parse_args() -> argparse.Namespace:
         '--hardware-qat-max-quantized-output-nmse', type=float, default=0.05
     )
     parser.add_argument('--hardware-qat-group-fail-patience', type=int, default=4)
+    parser.add_argument('--hardware-qat-group-recalibration-steps', type=int, default=150)
+    parser.add_argument(
+        '--hardware-qat-group-percentiles', type=float, nargs=6,
+        default=None,
+        metavar=('INITIAL', 'BLOCK1', 'BLOCK2', 'BLOCK3', 'BLOCK4', 'FINAL'),
+        help='Per-group signed-INT8 activation observer percentiles.',
+    )
+    parser.add_argument('--hardware-qat-max-incremental-latent32-nmse', type=float, default=0.02)
+    parser.add_argument('--hardware-qat-max-incremental-quantized-output-nmse', type=float, default=0.03)
+    parser.add_argument('--hardware-qat-accepted-lr-scale', type=float, default=0.1)
     parser.add_argument('--hardware-qat-max-q00-index-flip', type=float, default=0.10)
     parser.add_argument('--hardware-qat-max-q01-index-flip', type=float, default=0.15)
     parser.add_argument(
@@ -2372,6 +2382,8 @@ def build_model(
     hardware_qat_validation_gated: bool = True,
     hardware_qat_gate_required_passes: int = 2,
     hardware_qat_group_fail_patience: int = 4,
+    hardware_qat_group_recalibration_steps: int = 150,
+    hardware_qat_group_percentiles: tuple[float, ...] | None = None,
 ) -> SoundStream:
     if sync_codebook is None:
         sync_codebook = int(os.environ.get("WORLD_SIZE", "1")) > 1
@@ -2508,6 +2520,8 @@ def build_model(
         hardware_qat_validation_gated=hardware_qat_validation_gated,
         hardware_qat_gate_required_passes=hardware_qat_gate_required_passes,
         hardware_qat_group_fail_patience=hardware_qat_group_fail_patience,
+        hardware_qat_group_recalibration_steps=hardware_qat_group_recalibration_steps,
+        hardware_qat_group_percentiles=hardware_qat_group_percentiles,
     )
 
     if stage not in ("stream_finetune", "stream_finetune_long"):
@@ -2553,6 +2567,14 @@ def main() -> None:
         raise ValueError('--hardware-qat-gate-required-passes must be positive')
     if args.hardware_qat_group_fail_patience < 1:
         raise ValueError('--hardware-qat-group-fail-patience must be positive')
+    if args.hardware_qat_group_recalibration_steps < 0:
+        raise ValueError('--hardware-qat-group-recalibration-steps cannot be negative')
+    if args.hardware_qat_group_percentiles is not None and any(
+        not 0. < value <= 100. for value in args.hardware_qat_group_percentiles
+    ):
+        raise ValueError('--hardware-qat-group-percentiles values must be in (0, 100]')
+    if not 0. <= args.hardware_qat_accepted_lr_scale <= 1.:
+        raise ValueError('--hardware-qat-accepted-lr-scale must be in [0, 1]')
     for name in (
         'hardware_qat_latent64_weight',
         'hardware_qat_latent32_weight',
@@ -2563,6 +2585,9 @@ def main() -> None:
         'hardware_qat_final_polish_lr',
         'hardware_qat_max_latent32_nmse',
         'hardware_qat_max_quantized_output_nmse',
+        'hardware_qat_max_incremental_latent32_nmse',
+        'hardware_qat_max_incremental_quantized_output_nmse',
+        'hardware_qat_accepted_lr_scale',
         'hardware_qat_max_q00_index_flip',
         'hardware_qat_max_q01_index_flip',
     ):
@@ -4345,6 +4370,8 @@ def main() -> None:
         hardware_qat_validation_gated=args.hardware_qat_validation_gated,
         hardware_qat_gate_required_passes=args.hardware_qat_gate_required_passes,
         hardware_qat_group_fail_patience=args.hardware_qat_group_fail_patience,
+        hardware_qat_group_recalibration_steps=args.hardware_qat_group_recalibration_steps,
+        hardware_qat_group_percentiles=args.hardware_qat_group_percentiles,
     )
     if rvq_joint_adapt:
         if soundstream.recon_loss_weight != 7.5:
@@ -4968,6 +4995,13 @@ def main() -> None:
             args.hardware_qat_max_quantized_output_nmse
         ),
         hardware_qat_group_fail_patience=args.hardware_qat_group_fail_patience,
+        hardware_qat_max_incremental_latent32_nmse=(
+            args.hardware_qat_max_incremental_latent32_nmse
+        ),
+        hardware_qat_max_incremental_quantized_output_nmse=(
+            args.hardware_qat_max_incremental_quantized_output_nmse
+        ),
+        hardware_qat_accepted_lr_scale=args.hardware_qat_accepted_lr_scale,
         hardware_qat_max_q00_index_flip=args.hardware_qat_max_q00_index_flip,
         hardware_qat_max_q01_index_flip=args.hardware_qat_max_q01_index_flip,
         freeze_decoder_before_step=(
@@ -5275,6 +5309,8 @@ def main() -> None:
                     f'observer_freeze={args.hardware_qat_observer_freeze_step}; '
                     f'observer={args.hardware_qat_observer}'
                     f'({args.hardware_qat_percentile:g}%); '
+                    f'local_recalibration={args.hardware_qat_group_recalibration_steps} steps; '
+                    f'group_percentiles={args.hardware_qat_group_percentiles or [args.hardware_qat_percentile] * 6}; '
                     f'activation_groups=6; validation_gated='
                     f'{int(args.hardware_qat_validation_gated)} '
                     f'(passes={args.hardware_qat_gate_required_passes}); '
@@ -5285,10 +5321,15 @@ def main() -> None:
                     f'teacher_weights=64D:{args.hardware_qat_latent64_weight:g}/'
                     f'32D:{args.hardware_qat_latent32_weight:g}/'
                     f'RVQ-margin:{args.hardware_qat_rvq_margin_weight:g}; '
-                    f'gates=NMSE32<={args.hardware_qat_max_latent32_nmse:g}, '
-                    'VQout-NMSE<='
-                    f'{args.hardware_qat_max_quantized_output_nmse:g}, '
+                    f'progressive_gates=incremental-NMSE32<='
+                    f'{args.hardware_qat_max_incremental_latent32_nmse:g}, '
+                    f'incremental-VQout-NMSE<='
+                    f'{args.hardware_qat_max_incremental_quantized_output_nmse:g}; '
+                    f'final_gates=absolute-NMSE32<={args.hardware_qat_max_latent32_nmse:g}, '
+                    'absolute-VQout-NMSE<='
+                    f'{args.hardware_qat_max_quantized_output_nmse:g}; '
                     'INT32-overflow=0; q00/q01 index flips are diagnostic; '
+                    f'accepted_lr_scale={args.hardware_qat_accepted_lr_scale:g}; '
                     f'group_fail_patience={args.hardware_qat_group_fail_patience}.'
                 )
             if (

@@ -56,6 +56,19 @@ def test_percentile_observer_rejects_rare_activation_outlier():
     assert percentile.scale.item() < maximum.scale.item() / 50.
 
 
+def test_activation_observer_can_be_reset_for_group_local_recalibration():
+    observer = SymmetricActivationFakeQuant(
+        ema_decay=0.99, observer="percentile", percentile=99.99
+    )
+    observer.observe(torch.tensor([-10., 10.]))
+    assert observer.num_observations.item() == 1
+    observer.reset_observer(percentile=99.9)
+    assert observer.num_observations.item() == 0
+    assert observer.amax.item() == 0.
+    assert observer.scale.item() == 1.
+    assert observer.percentile == 99.9
+
+
 def test_activation_uses_full_rtl_negative_saturation_code():
     fake_quant = SymmetricActivationFakeQuant().eval()
     fake_quant.set_state(enabled=True, observer_enabled=False)
@@ -225,6 +238,8 @@ def test_hardware_qat_uses_six_groups_and_requires_two_validation_passes():
         "aligned_si_sdr": 2.0,
         "qat_latent32_nmse": 0.01,
         "qat_quantized_output_nmse": 0.01,
+        "qat_incremental_latent32_nmse": 0.005,
+        "qat_incremental_quantized_output_nmse": 0.008,
         "qat_int32_overflow_max": 0.0,
         "qat_index_flip_q00": 0.05,
         "qat_index_flip_q01": 0.08,
@@ -274,6 +289,41 @@ def test_hardware_qat_validation_gated_warm_in_uses_physical_group_order():
     assert model.hardware_qat_group_alphas == (0., 0., 1., 0., .5, 0.)
 
 
+def test_hardware_qat_recalibrates_only_active_group_before_warm_in():
+    model = SoundStream(
+        channels=16,
+        channel_mults=(2, 4, 8, 16),
+        codebook_dim=64,
+        codebook_size=256,
+        rq_num_quantizers=8,
+        use_local_attn=False,
+        hardware_compatible_encoder=True,
+        hardware_encoder_qat=True,
+        hardware_qat_start_step=1,
+        hardware_qat_activation_start_step=2,
+        hardware_qat_observer_freeze_step=1,
+        hardware_qat_warm_in_steps=1,
+        hardware_qat_validation_gated=True,
+        hardware_qat_group_recalibration_steps=2,
+        pad_mode="constant",
+    ).train()
+    model.hardware_qat_active_group.fill_(0)
+    model.hardware_qat_group_start_step.fill_(4)
+    model.update_hardware_qat(2)
+
+    assert model.hardware_qat_group_alphas == (0., 0., 0., 0., 0., 0.)
+    assert model.encoder[0].hardware_output_fake_quant.observer_enabled
+    block1_conv = next(
+        module for module in model.encoder[1].modules()
+        if isinstance(module, CausalConv1d)
+    )
+    assert not block1_conv.hardware_output_fake_quant.observer_enabled
+
+    model.update_hardware_qat(4)
+    assert model.hardware_qat_group_alphas == (1., 0., 0., 0., 0., 0.)
+    assert not model.encoder[0].hardware_output_fake_quant.observer_enabled
+
+
 def test_hardware_qat_gate_uses_vq_output_and_defers_after_patience():
     model = SoundStream(
         channels=16,
@@ -302,6 +352,8 @@ def test_hardware_qat_gate_uses_vq_output_and_defers_after_patience():
         "aligned_si_sdr": 2.0,
         "qat_latent32_nmse": 0.01,
         "qat_quantized_output_nmse": 0.02,
+        "qat_incremental_latent32_nmse": 0.005,
+        "qat_incremental_quantized_output_nmse": 0.008,
         "qat_int32_overflow_max": 0.0,
         "qat_index_flip_q00": 0.9,
         "qat_index_flip_q01": 0.9,
@@ -313,7 +365,18 @@ def test_hardware_qat_gate_uses_vq_output_and_defers_after_patience():
     model.hardware_qat_active_group.fill_(1)
     model.hardware_qat_group_start_step.fill_(3)
     model.update_hardware_qat(3)
-    failing = dict(passing, qat_quantized_output_nmse=0.2)
+    # Absolute error is reserved for the final deployment gate. Progressive
+    # acceptance depends on the error added by the current group alone.
+    absolute_only = dict(passing, qat_quantized_output_nmse=0.2)
+    assert model.update_hardware_qat_validation_gate(
+        absolute_only, baseline, 3
+    ) == (True, "accepted_rescan_required")
+
+    model.hardware_qat_accepted_groups[1] = False
+    model.hardware_qat_active_group.fill_(1)
+    model.hardware_qat_group_start_step.fill_(3)
+    model.update_hardware_qat(3)
+    failing = dict(passing, qat_incremental_quantized_output_nmse=0.2)
     assert model.update_hardware_qat_validation_gate(
         failing, baseline, 3
     ) == (False, "metrics_failed")
