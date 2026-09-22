@@ -11,11 +11,9 @@ import torch.nn.functional as F
 from audiolm_pytorch.hardware_quantization import (
     INT8_QMAX,
     INT8_QMIN,
-    INT32_QMAX,
-    INT32_QMIN,
     approximate_requant_multiplier,
-    quantize_bias_int32,
-    round_half_away_from_zero,
+    quantize_bias_integer,
+    signed_integer_range,
 )
 
 
@@ -53,6 +51,8 @@ def integer_conv1d_reference(
     stride: int = 1,
     dilation: int = 1,
     left_pad: int = 0,
+    activation_bits: int = 8,
+    accumulator_bits: int = 32,
 ) -> dict[str, torch.Tensor]:
     """Pure integer Conv1d reference following the RTL reduction order.
 
@@ -70,6 +70,8 @@ def integer_conv1d_reference(
     if output_length <= 0:
         raise ValueError("non-positive Conv1d output length")
 
+    activation_qmin, activation_qmax = signed_integer_range(activation_bits)
+    accumulator_qmin, accumulator_qmax = signed_integer_range(accumulator_bits)
     x = qinput.detach().cpu().to(torch.int64)
     w = qweight.detach().cpu().to(torch.int64)
     bias = (
@@ -88,13 +90,18 @@ def integer_conv1d_reference(
                     partial[:, :, m] += (
                         x[:, c, source_index].view(batch, 1) * w[:, c, k].view(1, cout)
                     )
-        if bool((partial < -(2 ** 19)).any() or (partial > (2 ** 19) - 1).any()):
-            raise OverflowError("INT20 partial sum overflow")
+        # A16 products no longer fit the historical INT20 partial datapath.
+        # The W8A16 reference therefore checks every reduction group against
+        # the configured wide accumulator contract (ACC40 by default).
+        if bool((partial < accumulator_qmin).any() or (partial > accumulator_qmax).any()):
+            raise OverflowError(f"INT{accumulator_bits} partial sum overflow")
         accumulator += partial
-        if bool((accumulator < INT32_QMIN).any() or (accumulator > INT32_QMAX).any()):
-            raise OverflowError("INT32 accumulator overflow")
+        if bool((accumulator < accumulator_qmin).any() or (accumulator > accumulator_qmax).any()):
+            raise OverflowError(f"INT{accumulator_bits} accumulator overflow")
 
-    biased = (accumulator + bias.view(1, cout, 1)).clamp(INT32_QMIN, INT32_QMAX)
+    biased = (accumulator + bias.view(1, cout, 1)).clamp(
+        accumulator_qmin, accumulator_qmax
+    )
     mul = multiplier.detach().cpu().to(torch.int64).view(1, cout, 1)
     right_shift = shift.detach().cpu().to(torch.int64).view(1, cout, 1)
     product = biased * mul
@@ -105,12 +112,21 @@ def integer_conv1d_reference(
     )
     magnitude = torch.bitwise_right_shift(product.abs() + half, right_shift)
     requant = torch.where(product < 0, -magnitude, magnitude)
-    output = requant.clamp(INT8_QMIN, INT8_QMAX).to(torch.int8)
-    return {
-        "accumulator_int32": accumulator.to(torch.int32),
-        "biased_int32": biased.to(torch.int32),
-        "requant_int8": output,
+    output_dtype = torch.int8 if activation_bits <= 8 else torch.int16
+    output = requant.clamp(activation_qmin, activation_qmax).to(output_dtype)
+    result = {
+        "accumulator": accumulator,
+        "biased_accumulator": biased,
+        "requant": output,
     }
+    # Preserve the original W8A8 API for existing RTL tests.
+    if activation_bits == 8 and accumulator_bits == 32:
+        result.update({
+            "accumulator_int32": accumulator.to(torch.int32),
+            "biased_int32": biased.to(torch.int32),
+            "requant_int8": output,
+        })
+    return result
 
 
 def _conv_followed_by_hardware_relu(encoder: torch.nn.Module) -> set[str]:
@@ -144,6 +160,12 @@ def export_hardware_encoder_package(
     parameter_group_blob = bytearray()
     residual_blob = bytearray()
     layers: list[dict[str, Any]] = []
+    activation_bits = int(getattr(model, 'hardware_qat_activation_bits', 8))
+    accumulator_bits = int(getattr(model, 'hardware_qat_accumulator_bits', 32))
+    activation_qmin, activation_qmax = signed_integer_range(activation_bits)
+    accumulator_qmin, accumulator_qmax = signed_integer_range(accumulator_bits)
+    bias_dtype = torch.int32 if accumulator_bits <= 32 else torch.int64
+    bias_bytes = 4 if accumulator_bits <= 32 else 8
 
     for name, module in encoder.named_modules():
         if not (
@@ -179,10 +201,15 @@ def export_hardware_encoder_package(
         output_scale = module.hardware_output_fake_quant.scale.detach().float()
         qweight, weight_scale = module.hardware_weight_fake_quant.quantize(conv.weight)
         qweight = qweight.round().clamp(INT8_QMIN, INT8_QMAX).to(torch.int8)
-        qbias = quantize_bias_int32(conv.bias, input_scale, weight_scale)
+        qbias = quantize_bias_integer(
+            conv.bias,
+            input_scale,
+            weight_scale,
+            accumulator_bits=accumulator_bits,
+        )
         if qbias is None:
             qbias = torch.zeros(conv.out_channels, device=conv.weight.device)
-        qbias = qbias.round().clamp(INT32_QMIN, INT32_QMAX).to(torch.int32)
+        qbias = qbias.round().clamp(accumulator_qmin, accumulator_qmax).to(bias_dtype)
         real_multiplier = input_scale * weight_scale.flatten() / output_scale
         _, multiplier, shift = approximate_requant_multiplier(real_multiplier)
         multiplier = multiplier.to(torch.int32)
@@ -194,7 +221,7 @@ def export_hardware_encoder_package(
             padding = padded_cout - tensor.numel()
             return F.pad(tensor.flatten(), (0, padding), value=value)
 
-        padded_bias = pad_channels(qbias).to(torch.int32)
+        padded_bias = pad_channels(qbias).to(bias_dtype)
         padded_multiplier = pad_channels(multiplier).to(torch.int32)
         padded_shift = pad_channels(shift_u8).to(torch.uint8)
 
@@ -203,14 +230,14 @@ def export_hardware_encoder_package(
         parameter_offset = len(parameter_blob)
         parameter_group_offset = len(parameter_group_blob)
         weight_blob.extend(_int_tensor_bytes(packed_weight, torch.int8))
-        bias_blob.extend(_int_tensor_bytes(padded_bias, torch.int32))
+        bias_blob.extend(_int_tensor_bytes(padded_bias, bias_dtype))
         parameter_blob.extend(_int_tensor_bytes(padded_multiplier, torch.int32))
         parameter_blob.extend(_int_tensor_bytes(padded_shift, torch.uint8))
         parameter_blob.extend(bytes(padded_cout))  # zero_point = 0
         for group in range(padded_cout // 8):
             channel_slice = slice(group * 8, (group + 1) * 8)
             parameter_group_blob.extend(_int_tensor_bytes(
-                padded_bias[channel_slice], torch.int32
+                padded_bias[channel_slice], bias_dtype
             ))
             parameter_group_blob.extend(_int_tensor_bytes(
                 padded_multiplier[channel_slice], torch.int32
@@ -246,7 +273,9 @@ def export_hardware_encoder_package(
             "bias_offset": bias_offset,
             "parameter_offset": parameter_offset,
             "parameter_group_offset": parameter_group_offset,
-            "parameter_group_bytes": (padded_cout // 8) * 80,
+            "parameter_group_bytes": (padded_cout // 8) * (48 + 8 * bias_bytes),
+            "activation_bits": activation_bits,
+            "accumulator_bits": accumulator_bits,
             "relu_enabled": name in relu_layers,
             "fits_128k_weight_bank": packed_bytes <= 128 * 1024,
         })
@@ -279,23 +308,34 @@ def export_hardware_encoder_package(
             "residual_scale": float(module.residual_scale),
             "parameter_offset": offset,
             "parameter_bytes": channels * 5,
-            "accumulator": "int32",
-            "output_saturation": [INT8_QMIN, INT8_QMAX],
+            "accumulator": f"int{accumulator_bits}",
+            "output_saturation": [activation_qmin, activation_qmax],
         })
 
     (output_dir / "encoder_weights_int8.bin").write_bytes(weight_blob)
-    (output_dir / "encoder_bias_int32.bin").write_bytes(bias_blob)
+    bias_filename = (
+        "encoder_bias_int32.bin" if accumulator_bits <= 32
+        else f"encoder_bias_int{accumulator_bits}_in_int64.bin"
+    )
+    (output_dir / bias_filename).write_bytes(bias_blob)
     (output_dir / "encoder_quant_params.bin").write_bytes(parameter_blob)
     (output_dir / "encoder_parameter_groups.bin").write_bytes(parameter_group_blob)
     (output_dir / "encoder_residual_params.bin").write_bytes(residual_blob)
     manifest = {
-        "format_version": 1,
+        "format_version": 2,
         "int8_range": [INT8_QMIN, INT8_QMAX],
+        "weight_bits": 8,
+        "activation_bits": activation_bits,
+        "activation_range": [activation_qmin, activation_qmax],
+        "accumulator_bits": accumulator_bits,
+        "bias_file": bias_filename,
+        "bias_storage": "int32" if accumulator_bits <= 32 else "int64_container",
         "zero_point": 0,
         "rounding": "half_away_from_zero",
         "weight_layout": "output_group_k_group_4x8",
         "parameter_group_layout": (
-            "8xbias_int32,8xmultiplier_int32,8xshift_uint8,8xzero_point_int8"
+            f"8xbias_int{32 if accumulator_bits <= 32 else 64},"
+            "8xmultiplier_int32,8xshift_uint8,8xzero_point_int8"
         ),
         "layers": layers,
         "residuals": residuals,

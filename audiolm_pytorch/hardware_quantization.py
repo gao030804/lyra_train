@@ -13,7 +13,14 @@ INT8_QMIN = -128
 INT8_QMAX = 127
 INT32_QMIN = -(2 ** 31)
 INT32_QMAX = (2 ** 31) - 1
-HARDWARE_QUANTIZATION_CONTRACT_VERSION = 2
+HARDWARE_QUANTIZATION_CONTRACT_VERSION = 3
+
+
+def signed_integer_range(bits: int) -> tuple[int, int]:
+    bits = int(bits)
+    if bits < 2 or bits > 62:
+        raise ValueError("signed integer width must be in [2, 62]")
+    return -(2 ** (bits - 1)), (2 ** (bits - 1)) - 1
 
 
 def round_half_away_from_zero(x: torch.Tensor) -> torch.Tensor:
@@ -37,10 +44,10 @@ def clamp_ste(x: torch.Tensor, qmin: int, qmax: int) -> torch.Tensor:
 
 
 class SymmetricActivationFakeQuant(nn.Module):
-    """Observed, per-tensor, signed symmetric INT8 fake quantization.
+    """Observed, per-tensor, signed symmetric activation fake quantization.
 
-    ``percentile`` keeps the hardware format unchanged while preventing rare
-    audio transients from consuming almost the entire INT8 dynamic range.
+    ``percentile`` keeps the selected hardware format unchanged while
+    preventing rare audio transients from consuming most of its dynamic range.
     """
 
     def __init__(
@@ -49,6 +56,7 @@ class SymmetricActivationFakeQuant(nn.Module):
         eps: float = 1e-8,
         observer: str = "max",
         percentile: float = 99.99,
+        bits: int = 8,
     ):
         super().__init__()
         if not 0. <= ema_decay < 1.:
@@ -61,6 +69,8 @@ class SymmetricActivationFakeQuant(nn.Module):
             raise ValueError("percentile must be in (0, 100]")
         self.observer = observer
         self.percentile = float(percentile)
+        self.bits = int(bits)
+        self.qmin, self.qmax = signed_integer_range(self.bits)
         self.register_buffer("amax", torch.tensor(0.))
         # Keep scale observer-owned and fixed after calibration.  It retains
         # the historical state-dict key, but is deliberately not optimized;
@@ -144,7 +154,7 @@ class SymmetricActivationFakeQuant(nn.Module):
         else:
             updated_amax = self.ema_decay * self.amax + (1. - self.ema_decay) * current_amax
         self.amax.copy_(updated_amax)
-        self.scale.copy_((updated_amax / INT8_QMAX).clamp_min(self.eps))
+        self.scale.copy_((updated_amax / self.qmax).clamp_min(self.eps))
         self.num_observations.add_(1)
 
     def effective_scale(self, x: torch.Tensor) -> torch.Tensor:
@@ -157,7 +167,7 @@ class SymmetricActivationFakeQuant(nn.Module):
 
     def quantize(self, x: torch.Tensor, scale: torch.Tensor | None = None) -> torch.Tensor:
         scale = self.effective_scale(x) if scale is None else scale
-        return round_ste(x / scale).clamp(INT8_QMIN, INT8_QMAX)
+        return round_ste(x / scale).clamp(self.qmin, self.qmax)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.training and self.observer_enabled:
@@ -246,11 +256,12 @@ class HardwareReLU(nn.Module):
 
     def __init__(
         self, ema_decay: float = 0.99, observer: str = "max",
-        percentile: float = 99.99
+        percentile: float = 99.99, activation_bits: int = 8
     ):
         super().__init__()
         self.fake_quant = SymmetricActivationFakeQuant(
-            ema_decay=ema_decay, observer=observer, percentile=percentile
+            ema_decay=ema_decay, observer=observer, percentile=percentile,
+            bits=activation_bits,
         )
         self.observer_owned_by_producer = False
 
@@ -293,15 +304,16 @@ class HardwareReLU(nn.Module):
 
 
 class HardwareResidualAdd(nn.Module):
-    """Shared-scale INT8 residual merge with saturation and STE gradients."""
+    """Shared-scale signed-integer residual merge with hardware saturation."""
 
     def __init__(
         self, ema_decay: float = 0.99, observer: str = "max",
-        percentile: float = 99.99
+        percentile: float = 99.99, activation_bits: int = 8
     ):
         super().__init__()
         self.fake_quant = SymmetricActivationFakeQuant(
-            ema_decay=ema_decay, observer=observer, percentile=percentile
+            ema_decay=ema_decay, observer=observer, percentile=percentile,
+            bits=activation_bits,
         )
 
     def set_hardware_qat_state(
@@ -359,8 +371,8 @@ class HardwareResidualAdd(nn.Module):
         )
         qoutput = clamp_ste(
             qidentity + aligned_residual,
-            INT8_QMIN,
-            INT8_QMAX,
+            self.fake_quant.qmin,
+            self.fake_quant.qmax,
         )
         quantized = qoutput * scale
         return float_output + self.fake_quant.blend_alpha * (
@@ -385,28 +397,42 @@ class HardwareResidualAdd(nn.Module):
         return multiplier, shift
 
 
+def quantize_bias_integer(
+    bias: torch.Tensor | None,
+    input_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    accumulator_bits: int = 32,
+) -> torch.Tensor | None:
+    """Return bias in the selected signed accumulator integer domain."""
+    if bias is None:
+        return None
+    bias_scale = input_scale.to(device=bias.device, dtype=bias.dtype) * weight_scale.flatten()
+    bias_scale = bias_scale.clamp_min(torch.finfo(bias.dtype).eps)
+    qmin, qmax = signed_integer_range(accumulator_bits)
+    return clamp_ste(round_ste(bias / bias_scale), qmin, qmax)
+
+
 def quantize_bias_int32(
     bias: torch.Tensor | None,
     input_scale: torch.Tensor,
     weight_scale: torch.Tensor,
 ) -> torch.Tensor | None:
-    """Return the integer-domain per-output-channel INT32 bias."""
-    if bias is None:
-        return None
-    bias_scale = input_scale.to(device=bias.device, dtype=bias.dtype) * weight_scale.flatten()
-    bias_scale = bias_scale.clamp_min(torch.finfo(bias.dtype).eps)
-    return clamp_ste(round_ste(bias / bias_scale), INT32_QMIN, INT32_QMAX)
+    """Backward-compatible fixed INT32 bias helper."""
+    return quantize_bias_integer(bias, input_scale, weight_scale, 32)
 
 
 def quantize_bias_dequantized(
     bias: torch.Tensor | None,
     input_scale: torch.Tensor,
     weight_scale: torch.Tensor,
+    accumulator_bits: int = 32,
 ) -> torch.Tensor | None:
     """Simulate per-output-channel INT32 bias storage for QAT."""
     if bias is None:
         return None
     bias_scale = input_scale.to(device=bias.device, dtype=bias.dtype) * weight_scale.flatten()
     bias_scale = bias_scale.clamp_min(torch.finfo(bias.dtype).eps)
-    qbias = quantize_bias_int32(bias, input_scale, weight_scale)
+    qbias = quantize_bias_integer(
+        bias, input_scale, weight_scale, accumulator_bits
+    )
     return qbias * bias_scale

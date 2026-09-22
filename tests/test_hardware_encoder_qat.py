@@ -121,6 +121,19 @@ def test_hardware_relu_shares_one_scale_and_preserves_gradients():
     assert torch.isfinite(x.grad).all()
 
 
+def test_symmetric_activation_fake_quant_supports_signed_int16():
+    fake_quant = SymmetricActivationFakeQuant(ema_decay=0., bits=16).train()
+    fake_quant.set_state(enabled=True, observer_enabled=True)
+    x = torch.tensor([-2., 0., 1.])
+    fake_quant(x)
+    assert fake_quant.qmin == -32768
+    assert fake_quant.qmax == 32767
+    torch.testing.assert_close(
+        fake_quant.scale,
+        torch.tensor(2. / 32767.),
+    )
+
+
 def test_hardware_relu_does_not_double_update_shared_conv_observer():
     producer = SymmetricActivationFakeQuant(ema_decay=0.).train()
     producer.set_state(enabled=True, observer_enabled=True)
@@ -501,3 +514,19 @@ def test_integer_reference_keeps_bias_after_accumulation():
         result["requant_int8"],
         torch.tensor([[[13, 17]]], dtype=torch.int8),
     )
+
+
+def test_integer_reference_supports_w8a16_acc40():
+    result = integer_conv1d_reference(
+        torch.tensor([[[30000]]], dtype=torch.int16),
+        torch.tensor([[[127]]], dtype=torch.int8),
+        torch.tensor([5], dtype=torch.int64),
+        torch.tensor([1], dtype=torch.int32),
+        torch.tensor([0], dtype=torch.uint8),
+        activation_bits=16,
+        accumulator_bits=40,
+    )
+    assert result["accumulator"].item() == 3_810_000
+    assert result["biased_accumulator"].item() == 3_810_005
+    assert result["requant"].dtype == torch.int16
+    assert result["requant"].item() == 32767

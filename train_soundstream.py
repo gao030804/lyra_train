@@ -437,7 +437,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--hardware-qat-start-step', type=int, default=1000,
                         help='First step of weight-only INT8 QAT.')
     parser.add_argument('--hardware-qat-activation-start-step', type=int, default=2000)
-    parser.add_argument('--hardware-qat-warm-in-steps', type=int, default=600)
+    parser.add_argument('--hardware-qat-warm-in-steps', type=int, default=300)
     parser.add_argument('--hardware-qat-block-interval-steps', type=int, default=600)
     parser.add_argument(
         '--hardware-qat-observer-freeze-step', type=int, default=1000
@@ -445,7 +445,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--hardware-qat-ema-decay', type=float, default=0.99)
     parser.add_argument(
         '--hardware-qat-observer', choices=('max', 'percentile'),
-        default='percentile'
+        default='max'
     )
     parser.add_argument('--hardware-qat-percentile', type=float, default=99.99)
     parser.add_argument(
@@ -478,11 +478,23 @@ def parse_args() -> argparse.Namespace:
         '--hardware-qat-group-percentiles', type=float, nargs=6,
         default=None,
         metavar=('INITIAL', 'BLOCK1', 'BLOCK2', 'BLOCK3', 'BLOCK4', 'FINAL'),
-        help='Per-group signed-INT8 activation observer percentiles.',
+        help='Per-group signed-activation observer percentiles.',
     )
-    parser.add_argument('--hardware-qat-max-incremental-latent32-nmse', type=float, default=0.02)
-    parser.add_argument('--hardware-qat-max-incremental-quantized-output-nmse', type=float, default=0.03)
+    parser.add_argument('--hardware-qat-max-incremental-latent32-nmse', type=float, default=0.01)
+    parser.add_argument('--hardware-qat-max-incremental-quantized-output-nmse', type=float, default=0.02)
+    parser.add_argument('--hardware-qat-scan-max-incremental-latent32-nmse', type=float, default=0.03)
+    parser.add_argument('--hardware-qat-scan-max-incremental-quantized-output-nmse', type=float, default=0.075)
     parser.add_argument('--hardware-qat-accepted-lr-scale', type=float, default=0.1)
+    parser.add_argument(
+        '--hardware-qat-activation-bits', type=int, choices=(8, 12, 16),
+        default=16,
+        help='Signed activation width; weights remain per-Cout INT8.',
+    )
+    parser.add_argument(
+        '--hardware-qat-accumulator-bits', type=int,
+        choices=(32, 36, 40, 48), default=40,
+        help='Signed MAC/bias accumulator width simulated by QAT diagnostics.',
+    )
     parser.add_argument('--hardware-qat-max-q00-index-flip', type=float, default=0.10)
     parser.add_argument('--hardware-qat-max-q01-index-flip', type=float, default=0.15)
     parser.add_argument(
@@ -2373,17 +2385,19 @@ def build_model(
     hardware_qat_observer_start_step: int = 0,
     hardware_qat_start_step: int = 1000,
     hardware_qat_activation_start_step: int = 2000,
-    hardware_qat_warm_in_steps: int = 600,
+    hardware_qat_warm_in_steps: int = 300,
     hardware_qat_block_interval_steps: int = 600,
     hardware_qat_observer_freeze_step: int = 1000,
     hardware_qat_ema_decay: float = 0.99,
-    hardware_qat_observer: str = 'percentile',
+    hardware_qat_observer: str = 'max',
     hardware_qat_percentile: float = 99.99,
     hardware_qat_validation_gated: bool = True,
     hardware_qat_gate_required_passes: int = 2,
     hardware_qat_group_fail_patience: int = 4,
     hardware_qat_group_recalibration_steps: int = 150,
     hardware_qat_group_percentiles: tuple[float, ...] | None = None,
+    hardware_qat_activation_bits: int = 16,
+    hardware_qat_accumulator_bits: int = 40,
 ) -> SoundStream:
     if sync_codebook is None:
         sync_codebook = int(os.environ.get("WORLD_SIZE", "1")) > 1
@@ -2522,6 +2536,8 @@ def build_model(
         hardware_qat_group_fail_patience=hardware_qat_group_fail_patience,
         hardware_qat_group_recalibration_steps=hardware_qat_group_recalibration_steps,
         hardware_qat_group_percentiles=hardware_qat_group_percentiles,
+        hardware_qat_activation_bits=hardware_qat_activation_bits,
+        hardware_qat_accumulator_bits=hardware_qat_accumulator_bits,
     )
 
     if stage not in ("stream_finetune", "stream_finetune_long"):
@@ -2587,6 +2603,8 @@ def main() -> None:
         'hardware_qat_max_quantized_output_nmse',
         'hardware_qat_max_incremental_latent32_nmse',
         'hardware_qat_max_incremental_quantized_output_nmse',
+        'hardware_qat_scan_max_incremental_latent32_nmse',
+        'hardware_qat_scan_max_incremental_quantized_output_nmse',
         'hardware_qat_accepted_lr_scale',
         'hardware_qat_max_q00_index_flip',
         'hardware_qat_max_q01_index_flip',
@@ -4372,6 +4390,8 @@ def main() -> None:
         hardware_qat_group_fail_patience=args.hardware_qat_group_fail_patience,
         hardware_qat_group_recalibration_steps=args.hardware_qat_group_recalibration_steps,
         hardware_qat_group_percentiles=args.hardware_qat_group_percentiles,
+        hardware_qat_activation_bits=args.hardware_qat_activation_bits,
+        hardware_qat_accumulator_bits=args.hardware_qat_accumulator_bits,
     )
     if rvq_joint_adapt:
         if soundstream.recon_loss_weight != 7.5:
@@ -5001,6 +5021,12 @@ def main() -> None:
         hardware_qat_max_incremental_quantized_output_nmse=(
             args.hardware_qat_max_incremental_quantized_output_nmse
         ),
+        hardware_qat_scan_max_incremental_latent32_nmse=(
+            args.hardware_qat_scan_max_incremental_latent32_nmse
+        ),
+        hardware_qat_scan_max_incremental_quantized_output_nmse=(
+            args.hardware_qat_scan_max_incremental_quantized_output_nmse
+        ),
         hardware_qat_accepted_lr_scale=args.hardware_qat_accepted_lr_scale,
         hardware_qat_max_q00_index_flip=args.hardware_qat_max_q00_index_flip,
         hardware_qat_max_q01_index_flip=args.hardware_qat_max_q01_index_flip,
@@ -5300,6 +5326,8 @@ def main() -> None:
                 )
                 print(
                     'Hardware QAT schedule: '
+                    f'W8A{args.hardware_qat_activation_bits}/'
+                    f'ACC{args.hardware_qat_accumulator_bits}; '
                     f'observer-only={args.hardware_qat_observer_start_step}..'
                     f'{args.hardware_qat_start_step - 1}; '
                     f'weight-only starts={args.hardware_qat_start_step}; '
@@ -5325,10 +5353,15 @@ def main() -> None:
                     f'{args.hardware_qat_max_incremental_latent32_nmse:g}, '
                     f'incremental-VQout-NMSE<='
                     f'{args.hardware_qat_max_incremental_quantized_output_nmse:g}; '
+                    f'scan_admission=incremental-NMSE32<='
+                    f'{args.hardware_qat_scan_max_incremental_latent32_nmse:g}, '
+                    f'incremental-VQout-NMSE<='
+                    f'{args.hardware_qat_scan_max_incremental_quantized_output_nmse:g}; '
                     f'final_gates=absolute-NMSE32<={args.hardware_qat_max_latent32_nmse:g}, '
                     'absolute-VQout-NMSE<='
                     f'{args.hardware_qat_max_quantized_output_nmse:g}; '
-                    'INT32-overflow=0; q00/q01 index flips are diagnostic; '
+                    f'ACC{args.hardware_qat_accumulator_bits}-overflow=0; '
+                    'q00/q01 index flips are diagnostic; '
                     f'accepted_lr_scale={args.hardware_qat_accepted_lr_scale:g}; '
                     f'group_fail_patience={args.hardware_qat_group_fail_patience}.'
                 )
@@ -5695,7 +5728,7 @@ def main() -> None:
         print(
             'Hardware QAT run FAILED deployment eligibility: no '
             'best_full_qat.pt satisfied full INT8, fixed observer, NMSE32, '
-            'quantized-output NMSE, and INT32 overflow gates. q00/q01 '
+            'quantized-output NMSE, and configured-accumulator overflow gates. q00/q01 '
             'FP32 index flips are diagnostic only. Final held-out '
             'test/export is intentionally skipped.'
         )

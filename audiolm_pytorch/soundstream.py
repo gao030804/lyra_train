@@ -48,12 +48,14 @@ from audiolm_pytorch.hardware_quantization import (
     INT8_QMAX,
     INT32_QMIN,
     INT32_QMAX,
+    signed_integer_range,
     HardwareReLU,
     HardwareResidualAdd,
     PerOutputChannelWeightFakeQuant,
     SymmetricActivationFakeQuant,
     approximate_requant_multiplier,
     quantize_bias_dequantized,
+    round_half_away_from_zero,
 )
 
 from audiolm_pytorch.version import __version__
@@ -83,14 +85,19 @@ def hardware_input_fake_quant(module):
             return fake_quant
     return None
 
-def _replace_relu_for_hardware(module, ema_decay, observer, percentile):
+def _replace_relu_for_hardware(
+    module, ema_decay, observer, percentile, activation_bits
+):
     for name, child in tuple(module.named_children()):
         if isinstance(child, nn.ReLU):
             setattr(module, name, HardwareReLU(
-                ema_decay=ema_decay, observer=observer, percentile=percentile
+                ema_decay=ema_decay, observer=observer, percentile=percentile,
+                activation_bits=activation_bits,
             ))
         else:
-            _replace_relu_for_hardware(child, ema_decay, observer, percentile)
+            _replace_relu_for_hardware(
+                child, ema_decay, observer, percentile, activation_bits
+            )
 
 def _wire_hardware_qat_edges(module, incoming=None):
     """Wire observer ownership in actual feed-forward/residual dataflow order."""
@@ -506,10 +513,12 @@ class Residual(Module):
         self.hardware_residual_add = None
 
     def configure_hardware_qat(
-        self, ema_decay = 0.99, observer = 'max', percentile = 99.99
+        self, ema_decay = 0.99, observer = 'max', percentile = 99.99,
+        activation_bits = 8
     ):
         self.hardware_residual_add = HardwareResidualAdd(
-            ema_decay=ema_decay, observer=observer, percentile=percentile
+            ema_decay=ema_decay, observer=observer, percentile=percentile,
+            activation_bits=activation_bits,
         )
 
     def set_hardware_qat_state(
@@ -559,6 +568,8 @@ class CausalConv1d(Module):
         self.hardware_input_observer_owned_by_producer = False
         self._hardware_diagnostics = {}
         self.hardware_qat_blend_alpha = 1.
+        self.hardware_activation_bits = 8
+        self.hardware_accumulator_bits = 32
 
     @property
     def hardware_weight_qat_enabled(self):
@@ -571,7 +582,8 @@ class CausalConv1d(Module):
         return bool(state.item()) if exists(state) else False
 
     def configure_hardware_qat(
-        self, ema_decay = 0.99, observer = 'max', percentile = 99.99
+        self, ema_decay = 0.99, observer = 'max', percentile = 99.99,
+        activation_bits = 8, accumulator_bits = 32
     ):
         if not hasattr(self, 'hardware_weight_qat_enabled_state'):
             self.register_buffer(
@@ -581,13 +593,17 @@ class CausalConv1d(Module):
                 'hardware_activation_qat_enabled_state', torch.tensor(False)
             )
         self.hardware_input_fake_quant = SymmetricActivationFakeQuant(
-            ema_decay, observer=observer, percentile=percentile
+            ema_decay, observer=observer, percentile=percentile,
+            bits=activation_bits,
         )
         self.hardware_output_fake_quant = SymmetricActivationFakeQuant(
-            ema_decay, observer=observer, percentile=percentile
+            ema_decay, observer=observer, percentile=percentile,
+            bits=activation_bits,
         )
         self.hardware_weight_fake_quant = PerOutputChannelWeightFakeQuant()
         self.hardware_input_observer_owned_by_producer = False
+        self.hardware_activation_bits = int(activation_bits)
+        self.hardware_accumulator_bits = int(accumulator_bits)
 
     def share_hardware_input_fake_quant(self, producer):
         if not isinstance(producer, SymmetricActivationFakeQuant):
@@ -668,7 +684,8 @@ class CausalConv1d(Module):
         )
         input_scale = self.hardware_input_fake_quant.effective_scale(x)
         quantized_bias = quantize_bias_dequantized(
-            self.conv.bias, input_scale, weight_scale
+            self.conv.bias, input_scale, weight_scale,
+            self.hardware_accumulator_bits,
         )
         bias = (
             None
@@ -688,7 +705,14 @@ class CausalConv1d(Module):
             input_scale * weight_scale.flatten() / output_scale
         )
         _, multiplier, shift = approximate_requant_multiplier(real_multiplier)
-        qinput = torch.round(x.detach() / input_scale).clamp(INT8_QMIN, INT8_QMAX)
+        activation_qmin = self.hardware_input_fake_quant.qmin
+        activation_qmax = self.hardware_input_fake_quant.qmax
+        accumulator_qmin, accumulator_qmax = signed_integer_range(
+            self.hardware_accumulator_bits
+        )
+        qinput = torch.round(x.detach() / input_scale).clamp(
+            activation_qmin, activation_qmax
+        )
         qweight = torch.round(
             self.conv.weight.detach() / weight_scale
         ).clamp(INT8_QMIN, INT8_QMAX)
@@ -696,16 +720,36 @@ class CausalConv1d(Module):
             qinput, qweight, None, self.conv.stride, self.conv.padding,
             self.conv.dilation, self.conv.groups
         )
+        qbias_unclamped = None
+        if self.conv.bias is not None:
+            bias_scale = (
+                input_scale.to(self.conv.bias) * weight_scale.flatten()
+            ).clamp_min(torch.finfo(self.conv.bias.dtype).eps)
+            qbias_unclamped = round_half_away_from_zero(
+                self.conv.bias.detach() / bias_scale
+            )
         self._hardware_diagnostics = {
             'accumulator_values': int(accumulator.numel()),
             'output_values': int(output.numel()),
             'accumulator_overflow_rate': (
-                ((accumulator < INT32_QMIN) | (accumulator > INT32_QMAX))
+                ((accumulator < accumulator_qmin) |
+                 (accumulator > accumulator_qmax))
                 .float().mean().detach()
             ),
+            'accumulator_bits': self.hardware_accumulator_bits,
+            'activation_bits': self.hardware_activation_bits,
+            'product_peak': (
+                qinput.detach().abs().amax() * qweight.detach().abs().amax()
+            ),
+            'bias_overflow_rate': (
+                torch.zeros((), device=accumulator.device)
+                if qbias_unclamped is None else
+                ((qbias_unclamped < accumulator_qmin) |
+                 (qbias_unclamped > accumulator_qmax)).float().mean().detach()
+            ),
             'output_saturation_rate': (
-                ((output.detach() / output_scale <= INT8_QMIN) |
-                 (output.detach() / output_scale >= INT8_QMAX))
+                ((output.detach() / output_scale <= activation_qmin) |
+                 (output.detach() / output_scale >= activation_qmax))
                 .float().mean().detach()
             ),
             'requant_multiplier': multiplier.detach(),
@@ -716,7 +760,9 @@ class CausalConv1d(Module):
             percentiles = torch.quantile(
                 absolute_output, absolute_output.new_tensor((.99, .999, .9999))
             )
-            denominator = (INT8_QMAX * output_scale.detach().float()).clamp_min(1e-8)
+            denominator = (
+                activation_qmax * output_scale.detach().float()
+            ).clamp_min(1e-8)
             self._hardware_diagnostics.update({
                 'activation_utilization_p99': (percentiles[0] / denominator).mean(),
                 'activation_utilization_p999': (percentiles[1] / denominator).mean(),
@@ -1328,6 +1374,8 @@ class SoundStream(Module):
         hardware_qat_group_fail_patience = 4,
         hardware_qat_group_recalibration_steps = 150,
         hardware_qat_group_percentiles = None,
+        hardware_qat_activation_bits = 8,
+        hardware_qat_accumulator_bits = 32,
         stft_discriminator: Module | None = None,  # can pass in own stft discriminator
         complex_stft_discr_kwargs: dict = dict()
     ):
@@ -1405,6 +1453,10 @@ class SoundStream(Module):
             raise ValueError('hardware_qat_group_fail_patience must be positive')
         if hardware_qat_group_recalibration_steps < 0:
             raise ValueError('hardware_qat_group_recalibration_steps cannot be negative')
+        if int(hardware_qat_activation_bits) not in (8, 12, 16):
+            raise ValueError('hardware_qat_activation_bits must be 8, 12, or 16')
+        if int(hardware_qat_accumulator_bits) not in (32, 36, 40, 48):
+            raise ValueError('hardware_qat_accumulator_bits must be 32, 36, 40, or 48')
         self.hardware_qat_observer = str(hardware_qat_observer)
         self.hardware_qat_percentile = float(hardware_qat_percentile)
         self.hardware_qat_validation_gated = bool(hardware_qat_validation_gated)
@@ -1417,6 +1469,8 @@ class SoundStream(Module):
         self.hardware_qat_group_recalibration_steps = int(
             hardware_qat_group_recalibration_steps
         )
+        self.hardware_qat_activation_bits = int(hardware_qat_activation_bits)
+        self.hardware_qat_accumulator_bits = int(hardware_qat_accumulator_bits)
         if hardware_qat_group_percentiles is None:
             hardware_qat_group_percentiles = (hardware_qat_percentile,) * 6
         self.hardware_qat_group_percentiles = tuple(
@@ -3834,7 +3888,8 @@ class SoundStream(Module):
         """Attach hardware-contract fake quantizers to the current Encoder."""
         _replace_relu_for_hardware(
             self.encoder, self.hardware_qat_ema_decay,
-            self.hardware_qat_observer, self.hardware_qat_percentile
+            self.hardware_qat_observer, self.hardware_qat_percentile,
+            self.hardware_qat_activation_bits,
         )
         convs = [
             module for module in self.encoder.modules()
@@ -3847,12 +3902,15 @@ class SoundStream(Module):
         for conv in convs:
             conv.configure_hardware_qat(
                 self.hardware_qat_ema_decay, self.hardware_qat_observer,
-                self.hardware_qat_percentile
+                self.hardware_qat_percentile,
+                self.hardware_qat_activation_bits,
+                self.hardware_qat_accumulator_bits,
             )
         for residual in residuals:
             residual.configure_hardware_qat(
                 self.hardware_qat_ema_decay, self.hardware_qat_observer,
-                self.hardware_qat_percentile
+                self.hardware_qat_percentile,
+                self.hardware_qat_activation_bits,
             )
 
         # One tensor edge owns one observer.  This also makes exported scales
