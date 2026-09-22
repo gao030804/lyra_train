@@ -224,6 +224,8 @@ def test_hardware_qat_uses_six_groups_and_requires_two_validation_passes():
     passing = {
         "aligned_si_sdr": 2.0,
         "qat_latent32_nmse": 0.01,
+        "qat_quantized_output_nmse": 0.01,
+        "qat_int32_overflow_max": 0.0,
         "qat_index_flip_q00": 0.05,
         "qat_index_flip_q01": 0.08,
     }
@@ -233,7 +235,9 @@ def test_hardware_qat_uses_six_groups_and_requires_two_validation_passes():
     ) == (False, "awaiting_consecutive_pass")
     assert model.update_hardware_qat_validation_gate(
         passing, baseline, 3
-    ) == (True, "advanced")
+    ) == (True, "accepted_rescan_required")
+    model.hardware_qat_active_group.fill_(1)
+    model.hardware_qat_group_start_step.fill_(4)
     model.update_hardware_qat(4)
     assert model.hardware_qat_group_alphas == (1., 1., 0., 0., 0., 0.)
 
@@ -256,16 +260,69 @@ def test_hardware_qat_validation_gated_warm_in_uses_physical_group_order():
         pad_mode="constant",
     ).eval()
     model.hardware_qat_group_order.copy_(torch.tensor([2, 4, 0, 5, 3, 1]))
+    model.hardware_qat_active_group.fill_(2)
 
     model.update_hardware_qat(2)
     assert model.hardware_qat_group_alphas == (0., 0., .5, 0., 0., 0.)
     model.update_hardware_qat(3)
     assert model.hardware_qat_group_alphas == (0., 0., 1., 0., 0., 0.)
 
-    model.hardware_qat_active_group.fill_(1)
+    model.hardware_qat_accepted_groups[2] = True
+    model.hardware_qat_active_group.fill_(4)
     model.hardware_qat_group_start_step.fill_(4)
     model.update_hardware_qat(4)
     assert model.hardware_qat_group_alphas == (0., 0., 1., 0., .5, 0.)
+
+
+def test_hardware_qat_gate_uses_vq_output_and_defers_after_patience():
+    model = SoundStream(
+        channels=16,
+        channel_mults=(2, 4, 8, 16),
+        codebook_dim=64,
+        codebook_size=256,
+        rq_num_quantizers=8,
+        use_local_attn=False,
+        hardware_compatible_encoder=True,
+        hardware_encoder_qat=True,
+        hardware_qat_start_step=1,
+        hardware_qat_activation_start_step=2,
+        hardware_qat_observer_freeze_step=1,
+        hardware_qat_warm_in_steps=1,
+        hardware_qat_validation_gated=True,
+        hardware_qat_gate_required_passes=1,
+        hardware_qat_group_fail_patience=2,
+        pad_mode="constant",
+    ).eval()
+    baseline = {"aligned_si_sdr": 2.0}
+    model.update_hardware_qat(2)
+
+    # Large FP32 index flips are diagnostics only when quantized output is
+    # faithful to the teacher and integer arithmetic remains safe.
+    passing = {
+        "aligned_si_sdr": 2.0,
+        "qat_latent32_nmse": 0.01,
+        "qat_quantized_output_nmse": 0.02,
+        "qat_int32_overflow_max": 0.0,
+        "qat_index_flip_q00": 0.9,
+        "qat_index_flip_q01": 0.9,
+    }
+    assert model.update_hardware_qat_validation_gate(
+        passing, baseline, 2
+    ) == (True, "accepted_rescan_required")
+
+    model.hardware_qat_active_group.fill_(1)
+    model.hardware_qat_group_start_step.fill_(3)
+    model.update_hardware_qat(3)
+    failing = dict(passing, qat_quantized_output_nmse=0.2)
+    assert model.update_hardware_qat_validation_gate(
+        failing, baseline, 3
+    ) == (False, "metrics_failed")
+    assert model.update_hardware_qat_validation_gate(
+        failing, baseline, 4
+    ) == (False, "rollback_deferred")
+    assert model.hardware_qat_active_group.item() == -1
+    assert model.hardware_qat_deferred_groups[1]
+    assert model.hardware_qat_accepted_groups[0]
 
 
 def test_hardware_qat_disabled_stage_rebuild_starts_in_float_mode():

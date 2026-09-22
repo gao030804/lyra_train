@@ -469,6 +469,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--hardware-qat-final-polish-step', type=int, default=5000)
     parser.add_argument('--hardware-qat-final-polish-lr', type=float, default=5e-8)
     parser.add_argument('--hardware-qat-max-latent32-nmse', type=float, default=0.03)
+    parser.add_argument(
+        '--hardware-qat-max-quantized-output-nmse', type=float, default=0.05
+    )
+    parser.add_argument('--hardware-qat-group-fail-patience', type=int, default=4)
     parser.add_argument('--hardware-qat-max-q00-index-flip', type=float, default=0.10)
     parser.add_argument('--hardware-qat-max-q01-index-flip', type=float, default=0.15)
     parser.add_argument(
@@ -2367,6 +2371,7 @@ def build_model(
     hardware_qat_percentile: float = 99.99,
     hardware_qat_validation_gated: bool = True,
     hardware_qat_gate_required_passes: int = 2,
+    hardware_qat_group_fail_patience: int = 4,
 ) -> SoundStream:
     if sync_codebook is None:
         sync_codebook = int(os.environ.get("WORLD_SIZE", "1")) > 1
@@ -2502,6 +2507,7 @@ def build_model(
         hardware_qat_percentile=hardware_qat_percentile,
         hardware_qat_validation_gated=hardware_qat_validation_gated,
         hardware_qat_gate_required_passes=hardware_qat_gate_required_passes,
+        hardware_qat_group_fail_patience=hardware_qat_group_fail_patience,
     )
 
     if stage not in ("stream_finetune", "stream_finetune_long"):
@@ -2545,6 +2551,8 @@ def main() -> None:
         raise ValueError('--hardware-qat-percentile must be in (0, 100]')
     if args.hardware_qat_gate_required_passes < 1:
         raise ValueError('--hardware-qat-gate-required-passes must be positive')
+    if args.hardware_qat_group_fail_patience < 1:
+        raise ValueError('--hardware-qat-group-fail-patience must be positive')
     for name in (
         'hardware_qat_latent64_weight',
         'hardware_qat_latent32_weight',
@@ -2554,6 +2562,7 @@ def main() -> None:
         'hardware_qat_fixed_scale_lr',
         'hardware_qat_final_polish_lr',
         'hardware_qat_max_latent32_nmse',
+        'hardware_qat_max_quantized_output_nmse',
         'hardware_qat_max_q00_index_flip',
         'hardware_qat_max_q01_index_flip',
     ):
@@ -4335,6 +4344,7 @@ def main() -> None:
         hardware_qat_percentile=args.hardware_qat_percentile,
         hardware_qat_validation_gated=args.hardware_qat_validation_gated,
         hardware_qat_gate_required_passes=args.hardware_qat_gate_required_passes,
+        hardware_qat_group_fail_patience=args.hardware_qat_group_fail_patience,
     )
     if rvq_joint_adapt:
         if soundstream.recon_loss_weight != 7.5:
@@ -4954,6 +4964,10 @@ def main() -> None:
         hardware_qat_final_polish_step=args.hardware_qat_final_polish_step,
         hardware_qat_final_polish_lr=args.hardware_qat_final_polish_lr,
         hardware_qat_max_latent32_nmse=args.hardware_qat_max_latent32_nmse,
+        hardware_qat_max_quantized_output_nmse=(
+            args.hardware_qat_max_quantized_output_nmse
+        ),
+        hardware_qat_group_fail_patience=args.hardware_qat_group_fail_patience,
         hardware_qat_max_q00_index_flip=args.hardware_qat_max_q00_index_flip,
         hardware_qat_max_q01_index_flip=args.hardware_qat_max_q01_index_flip,
         freeze_decoder_before_step=(
@@ -5272,8 +5286,10 @@ def main() -> None:
                     f'32D:{args.hardware_qat_latent32_weight:g}/'
                     f'RVQ-margin:{args.hardware_qat_rvq_margin_weight:g}; '
                     f'gates=NMSE32<={args.hardware_qat_max_latent32_nmse:g}, '
-                    f'q00<={args.hardware_qat_max_q00_index_flip:g}, '
-                    f'q01<={args.hardware_qat_max_q01_index_flip:g}.'
+                    'VQout-NMSE<='
+                    f'{args.hardware_qat_max_quantized_output_nmse:g}, '
+                    'INT32-overflow=0; q00/q01 index flips are diagnostic; '
+                    f'group_fail_patience={args.hardware_qat_group_fail_patience}.'
                 )
             if (
                 args.stage == "stream_finetune_long" and
@@ -5638,7 +5654,8 @@ def main() -> None:
         print(
             'Hardware QAT run FAILED deployment eligibility: no '
             'best_full_qat.pt satisfied full INT8, fixed observer, NMSE32, '
-            'q00/q01 index-flip, and INT32 overflow gates. Final held-out '
+            'quantized-output NMSE, and INT32 overflow gates. q00/q01 '
+            'FP32 index flips are diagnostic only. Final held-out '
             'test/export is intentionally skipped.'
         )
 

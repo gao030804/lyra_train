@@ -1323,6 +1323,7 @@ class SoundStream(Module):
         hardware_qat_percentile = 99.99,
         hardware_qat_validation_gated = True,
         hardware_qat_gate_required_passes = 2,
+        hardware_qat_group_fail_patience = 4,
         stft_discriminator: Module | None = None,  # can pass in own stft discriminator
         complex_stft_discr_kwargs: dict = dict()
     ):
@@ -1396,11 +1397,16 @@ class SoundStream(Module):
             raise ValueError('hardware_qat_percentile must be in (0, 100]')
         if hardware_qat_gate_required_passes < 1:
             raise ValueError('hardware_qat_gate_required_passes must be positive')
+        if hardware_qat_group_fail_patience < 1:
+            raise ValueError('hardware_qat_group_fail_patience must be positive')
         self.hardware_qat_observer = str(hardware_qat_observer)
         self.hardware_qat_percentile = float(hardware_qat_percentile)
         self.hardware_qat_validation_gated = bool(hardware_qat_validation_gated)
         self.hardware_qat_gate_required_passes = int(
             hardware_qat_gate_required_passes
+        )
+        self.hardware_qat_group_fail_patience = int(
+            hardware_qat_group_fail_patience
         )
         # Progression is trainer runtime state, not architecture state.  Keep
         # these buffers out of model-only state_dicts so older FP checkpoints
@@ -1415,6 +1421,18 @@ class SoundStream(Module):
         ), persistent=False)
         self.register_buffer(
             'hardware_qat_gate_pass_count', torch.tensor(0, dtype=torch.long),
+            persistent=False
+        )
+        self.register_buffer(
+            'hardware_qat_group_fail_count', torch.tensor(0, dtype=torch.long),
+            persistent=False
+        )
+        self.register_buffer(
+            'hardware_qat_accepted_groups', torch.zeros(6, dtype=torch.bool),
+            persistent=False
+        )
+        self.register_buffer(
+            'hardware_qat_deferred_groups', torch.zeros(6, dtype=torch.bool),
             persistent=False
         )
         self.register_buffer(
@@ -3838,10 +3856,12 @@ class SoundStream(Module):
             self.hardware_qat_observer_freeze_step
         )
         group_alphas = []
-        active_stage = int(self.hardware_qat_active_group.item())
-        group_order = tuple(int(value) for value in self.hardware_qat_group_order)
-        active_group = group_order[min(active_stage, len(group_order) - 1)]
-        completed_groups = set(group_order[:active_stage])
+        active_group = int(self.hardware_qat_active_group.item())
+        completed_groups = {
+            index for index, accepted in enumerate(
+                self.hardware_qat_accepted_groups.tolist()
+            ) if accepted
+        }
         for group_index in range(6):
             if self.hardware_qat_validation_gated:
                 group_start = int(self.hardware_qat_group_start_step.item())
@@ -3852,7 +3872,7 @@ class SoundStream(Module):
                 # ordinal progression stage. Only completed groups stay on;
                 # exactly the current physical group is allowed to warm in.
                 if (
-                    group_index != active_group or
+                    active_group < 0 or group_index != active_group or
                     step < self.hardware_qat_activation_start_step
                 ):
                     group_alphas.append(0.)
@@ -3891,13 +3911,17 @@ class SoundStream(Module):
         return weight_enabled or any(alpha > 0. for alpha in group_alphas), observer_enabled
 
     @torch.no_grad()
-    def set_hardware_qat_sensitivity_group(self, selected_group):
-        """Enable exactly one activation group at alpha=1 for frozen scans."""
+    def set_hardware_qat_sensitivity_group(
+        self, selected_group, accepted_groups=()
+    ):
+        """Enable accepted groups plus one candidate for dynamic scans."""
         selected_group = int(selected_group)
-        if selected_group not in range(6):
-            raise ValueError('selected_group must be in [0, 5]')
+        if selected_group not in range(-1, 6):
+            raise ValueError('selected_group must be in [-1, 5]')
+        accepted_groups = {int(index) for index in accepted_groups}
         self.hardware_qat_group_alphas = tuple(
-            1. if index == selected_group else 0. for index in range(6)
+            1. if index == selected_group or index in accepted_groups else 0.
+            for index in range(6)
         )
         self.hardware_qat_blend_alpha = 0.
         for module in self.encoder.modules():
@@ -3905,7 +3929,7 @@ class SoundStream(Module):
             if not callable(setter):
                 continue
             group_index = int(getattr(module, '_hardware_qat_group_index', 0))
-            enabled = group_index == selected_group
+            enabled = group_index == selected_group or group_index in accepted_groups
             if isinstance(module, CausalConv1d):
                 setter(
                     observer_enabled=False, weight_enabled=True,
@@ -3919,36 +3943,60 @@ class SoundStream(Module):
                 )
 
     @torch.no_grad()
-    def update_hardware_qat_validation_gate(self, metrics, baseline, step):
+    def update_hardware_qat_validation_gate(
+        self,
+        metrics,
+        baseline,
+        step,
+        *,
+        max_latent32_nmse=0.03,
+        max_quantized_output_nmse=0.05,
+    ):
         """Advance one activation group only after two clean validations."""
         if not self.hardware_qat_validation_gated:
             return False, 'time_schedule'
         if int(step) < self.hardware_qat_activation_start_step:
             return False, 'before_activation_start'
-        active = int(self.hardware_qat_active_group.item())
-        actual_group = int(self.hardware_qat_group_order[active].item())
-        if self.hardware_qat_group_alphas[actual_group] < 1.:
+        active_group = int(self.hardware_qat_active_group.item())
+        if active_group < 0:
+            return False, 'needs_dynamic_scan'
+        if self.hardware_qat_group_alphas[active_group] < 1.:
             self.hardware_qat_gate_pass_count.zero_()
             return False, 'warm_in'
         passed = bool(
             metrics.get('aligned_si_sdr', float('-inf')) >=
             baseline.get('aligned_si_sdr', float('-inf')) - 0.10 and
-            metrics.get('qat_latent32_nmse', float('inf')) < 0.03 and
-            metrics.get('qat_index_flip_q00', float('inf')) < 0.10 and
-            metrics.get('qat_index_flip_q01', float('inf')) < 0.15
+            metrics.get('qat_latent32_nmse', float('inf')) <
+            float(max_latent32_nmse) and
+            metrics.get('qat_quantized_output_nmse', float('inf')) <
+            float(max_quantized_output_nmse) and
+            metrics.get('qat_int32_overflow_max', 0.) <= 0.
         )
         if not passed:
             self.hardware_qat_gate_pass_count.zero_()
+            self.hardware_qat_group_fail_count.add_(1)
+            if (
+                int(self.hardware_qat_group_fail_count.item()) >=
+                self.hardware_qat_group_fail_patience
+            ):
+                self.hardware_qat_deferred_groups[active_group] = True
+                self.hardware_qat_active_group.fill_(-1)
+                self.hardware_qat_group_fail_count.zero_()
+                return False, 'rollback_deferred'
             return False, 'metrics_failed'
+        self.hardware_qat_group_fail_count.zero_()
         self.hardware_qat_gate_pass_count.add_(1)
         if int(self.hardware_qat_gate_pass_count.item()) < self.hardware_qat_gate_required_passes:
             return False, 'awaiting_consecutive_pass'
-        if active >= 5:
-            return False, 'all_groups_enabled'
-        self.hardware_qat_active_group.add_(1)
+        self.hardware_qat_accepted_groups[active_group] = True
+        self.hardware_qat_active_group.fill_(-1)
         self.hardware_qat_group_start_step.fill_(int(step) + 1)
         self.hardware_qat_gate_pass_count.zero_()
-        return True, 'advanced'
+        return True, (
+            'all_groups_accepted'
+            if bool(self.hardware_qat_accepted_groups.all())
+            else 'accepted_rescan_required'
+        )
 
     def hardware_qat_is_full(self):
         convs = [
