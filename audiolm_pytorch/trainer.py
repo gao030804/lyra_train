@@ -5704,14 +5704,22 @@ class SoundStreamTrainer(nn.Module):
         latent32_nmse = F.mse_loss(student32, teacher32) / (
             teacher32.square().mean().clamp_min(1e-8)
         )
-        _, student_indices, _ = model.rq(student32, freeze_codebook=True)
-        _, teacher_indices, _ = model.rq(teacher32, freeze_codebook=True)
+        student_quantized, student_indices, _ = model.rq(
+            student32, freeze_codebook=True
+        )
+        teacher_quantized, teacher_indices, _ = model.rq(
+            teacher32, freeze_codebook=True
+        )
+        quantized_output_nmse = F.mse_loss(
+            student_quantized.float(), teacher_quantized.float()
+        ) / teacher_quantized.float().square().mean().clamp_min(1e-8)
         per_level = (
             (student_indices != teacher_indices).float().mean(dim=(0, 1, 2))
         )
         output = {
             'qat_latent64_nmse': float(latent64_nmse.cpu()),
             'qat_latent32_nmse': float(latent32_nmse.cpu()),
+            'qat_quantized_output_nmse': float(quantized_output_nmse.cpu()),
         }
         output.update({
             f'qat_index_flip_q{index:02d}': float(value.cpu())
@@ -5764,12 +5772,30 @@ class SoundStreamTrainer(nn.Module):
         finally:
             model.update_hardware_qat(step)
 
-        # Least sensitive groups progress first.  The order is deterministic
-        # for identical fixed-validation inputs and is stored in trainer
-        # checkpoints for safe resume.
+        # Gate-compatible groups progress first. A positive SI-SDR delta must
+        # not allow a group that already violates a deployment-fidelity limit
+        # to block the entire progression.
+        def group_risk(row):
+            delta_si_sdr, nmse32, q00_flip, q01_flip = row[2:6]
+            eligible = (
+                delta_si_sdr >= -0.10 and
+                nmse32 <= self.hardware_qat_max_latent32_nmse and
+                q00_flip <= self.hardware_qat_max_q00_index_flip and
+                q01_flip <= self.hardware_qat_max_q01_index_flip
+            )
+            risk = max(
+                max(0., -delta_si_sdr) / 0.10,
+                nmse32 / max(self.hardware_qat_max_latent32_nmse, 1e-8),
+                q00_flip / max(self.hardware_qat_max_q00_index_flip, 1e-8),
+                q01_flip / max(self.hardware_qat_max_q01_index_flip, 1e-8),
+            )
+            return (not eligible, risk, -delta_si_sdr, row[0])
+
+        # The order is deterministic for identical fixed-validation inputs and
+        # is stored in trainer checkpoints for safe resume.
         ordered = sorted(
             rows,
-            key=lambda row: (-row[2], row[3], row[4] + row[5]),
+            key=group_risk,
         )
         model.hardware_qat_group_order.copy_(torch.tensor(
             [row[0] for row in ordered],
@@ -5803,6 +5829,13 @@ class SoundStreamTrainer(nn.Module):
                 names[int(index)] for index in model.hardware_qat_group_order
             )
         )
+        eligible_names = [row[1] for row in ordered if not group_risk(row)[0]]
+        deferred_names = [row[1] for row in ordered if group_risk(row)[0]]
+        self.print(
+            f'{step}: QAT gate-aware groups eligible='
+            f"{','.join(eligible_names) or 'none'}; deferred="
+            f"{','.join(deferred_names) or 'none'}"
+        )
         return rows
 
     def update_hardware_qat_lr(self, steps):
@@ -5810,7 +5843,12 @@ class SoundStreamTrainer(nn.Module):
         if not self.encoder_only_training:
             return self.optim.optimizer.param_groups[0]['lr']
         target_lr = None
-        if steps >= self.hardware_qat_final_polish_step:
+        full_int8 = getattr(
+            self.unwrapped_soundstream,
+            'hardware_qat_is_full',
+            lambda: False,
+        )()
+        if steps >= self.hardware_qat_final_polish_step and full_int8:
             target_lr = self.hardware_qat_final_polish_lr
         elif steps >= self.hardware_qat_fixed_scale_step:
             target_lr = self.hardware_qat_fixed_scale_lr
@@ -8474,7 +8512,22 @@ class SoundStreamTrainer(nn.Module):
                 self.save(str(self.results_folder / 'latest.pt'))
                 self.print(f'{steps}: saving new best checkpoints to {str(self.results_folder)}')
 
-            if meaningful_improved:
+            progressive_qat_incomplete = bool(
+                self.encoder_only_training and
+                hasattr(online_model, 'hardware_qat_is_full') and
+                not online_model.hardware_qat_is_full()
+            )
+            if progressive_qat_incomplete:
+                # Group gates own stopping decisions until every activation
+                # group is INT8; global patience would stop a valid but
+                # incomplete progression before later groups are attempted.
+                self.early_stopping_bad_evals = 0
+                self.early_stopping_triggered = False
+                self.print(
+                    f"{steps}: global early stopping suspended until full "
+                    "INT8 QAT; progression is controlled by group gates"
+                )
+            elif meaningful_improved:
                 self.early_stopping_best_score = early_stopping_metric_value
                 self.early_stopping_bad_evals = 0
                 self.print(

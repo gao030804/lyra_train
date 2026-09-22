@@ -238,6 +238,36 @@ def test_hardware_qat_uses_six_groups_and_requires_two_validation_passes():
     assert model.hardware_qat_group_alphas == (1., 1., 0., 0., 0., 0.)
 
 
+def test_hardware_qat_validation_gated_warm_in_uses_physical_group_order():
+    model = SoundStream(
+        channels=16,
+        channel_mults=(2, 4, 8, 16),
+        codebook_dim=64,
+        codebook_size=256,
+        rq_num_quantizers=8,
+        use_local_attn=False,
+        hardware_compatible_encoder=True,
+        hardware_encoder_qat=True,
+        hardware_qat_start_step=1,
+        hardware_qat_activation_start_step=2,
+        hardware_qat_observer_freeze_step=1,
+        hardware_qat_warm_in_steps=2,
+        hardware_qat_validation_gated=True,
+        pad_mode="constant",
+    ).eval()
+    model.hardware_qat_group_order.copy_(torch.tensor([2, 4, 0, 5, 3, 1]))
+
+    model.update_hardware_qat(2)
+    assert model.hardware_qat_group_alphas == (0., 0., .5, 0., 0., 0.)
+    model.update_hardware_qat(3)
+    assert model.hardware_qat_group_alphas == (0., 0., 1., 0., 0., 0.)
+
+    model.hardware_qat_active_group.fill_(1)
+    model.hardware_qat_group_start_step.fill_(4)
+    model.update_hardware_qat(4)
+    assert model.hardware_qat_group_alphas == (0., 0., 1., 0., .5, 0.)
+
+
 def test_hardware_qat_disabled_stage_rebuild_starts_in_float_mode():
     model = SoundStream(
         channels=16,

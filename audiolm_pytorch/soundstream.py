@@ -3848,7 +3848,13 @@ class SoundStream(Module):
                 if group_index in completed_groups:
                     group_alphas.append(1.)
                     continue
-                if group_index > active_group or step < self.hardware_qat_activation_start_step:
+                # ``active_group`` is a physical Encoder group id, not the
+                # ordinal progression stage. Only completed groups stay on;
+                # exactly the current physical group is allowed to warm in.
+                if (
+                    group_index != active_group or
+                    step < self.hardware_qat_activation_start_step
+                ):
                     group_alphas.append(0.)
                     continue
             else:
