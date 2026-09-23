@@ -40,6 +40,9 @@ import wandb
 from ema_pytorch import EMA
 
 from audiolm_pytorch.soundstream import SoundStream, canonicalize_waveform_pair
+from audiolm_pytorch.hardware_quantization import (
+    HARDWARE_QUANTIZATION_CONTRACT_VERSION,
+)
 from audiolm_pytorch.encodec import EncodecWrapper
 
 try:
@@ -856,6 +859,7 @@ class SoundStreamTrainer(nn.Module):
         )
         self._stage2_latent_reference_encoder = None
         object.__setattr__(self, '_hardware_qat_progressive_reference_encoder', None)
+        self._hardware_qat_progressive_reference_group = -2
         object.__setattr__(self, '_rvq_q0_teacher', None)
         object.__setattr__(self, '_stage2_decoder_teacher', None)
         self.first_decoder_block_excluded_from_generator_optimizer = bool(
@@ -1915,7 +1919,10 @@ class SoundStreamTrainer(nn.Module):
             stage1_rvq_bad_evals = self.stage1_rvq_bad_evals,
             stage1_polarity_bad_evals = self.stage1_polarity_bad_evals,
             trainer_step = trainer_step,
-            version = __version__
+            version = __version__,
+            hardware_quantization_contract_version = (
+                HARDWARE_QUANTIZATION_CONTRACT_VERSION
+            )
         )
 
         if self.use_ema:
@@ -1940,7 +1947,17 @@ class SoundStreamTrainer(nn.Module):
         pkg = dict(
             model = model.state_dict(),
             config = self.unwrapped_soundstream._configs,
-            version = __version__
+            version = __version__,
+            hardware_quantization_contract_version = (
+                HARDWARE_QUANTIZATION_CONTRACT_VERSION
+            ),
+            hardware_qat_progression_state = dict(
+                accepted_groups=[bool(value) for value in getattr(
+                    self.unwrapped_soundstream,
+                    'hardware_qat_accepted_groups',
+                    torch.zeros(6, dtype=torch.bool),
+                )],
+            ),
         )
 
         if exists(score):
@@ -5863,6 +5880,18 @@ class SoundStreamTrainer(nn.Module):
                 float(values.get('product_peak', 0.))
                 for values in layer_diagnostics.values()
             )
+            output['qat_accumulator_peak_max'] = max(
+                float(values.get('accumulator_peak', 0.))
+                for values in layer_diagnostics.values()
+            )
+            output['qat_accumulator_required_bits_max'] = max(
+                float(values.get('accumulator_required_bits', 0.))
+                for values in layer_diagnostics.values()
+            )
+            output['qat_accumulator_headroom_bits_min'] = min(
+                float(values.get('accumulator_headroom_bits', 0.))
+                for values in layer_diagnostics.values()
+            )
             output['qat_activation_saturation_max'] = max(
                 float(values.get('output_saturation_rate', 0.))
                 for values in layer_diagnostics.values()
@@ -5882,8 +5911,8 @@ class SoundStreamTrainer(nn.Module):
         return output
 
     @torch.no_grad()
-    def capture_hardware_qat_progressive_reference(self):
-        """Freeze the currently accepted INT8 groups as the next gate baseline."""
+    def capture_hardware_qat_progressive_reference(self, candidate_group=-1):
+        """Freeze accepted A16 groups with the current candidate kept float."""
         model = self.unwrapped_soundstream
         accepted = {
             index for index, value in enumerate(
@@ -5916,6 +5945,7 @@ class SoundStreamTrainer(nn.Module):
         object.__setattr__(
             self, '_hardware_qat_progressive_reference_encoder', reference
         )
+        self._hardware_qat_progressive_reference_group = int(candidate_group)
         return accepted
 
     @torch.no_grad()
@@ -5944,8 +5974,25 @@ class SoundStreamTrainer(nn.Module):
             return []
 
         model.set_hardware_qat_sensitivity_group(-1, accepted)
-        self.capture_hardware_qat_progressive_reference()
+        self.capture_hardware_qat_progressive_reference(candidate_group=-1)
         accepted_metrics = self.evaluate_fixed_validation_score(model)
+        reference_drift_nmse32 = accepted_metrics.get(
+            'qat_incremental_latent32_nmse', float('inf')
+        )
+        reference_drift_vqout = accepted_metrics.get(
+            'qat_incremental_quantized_output_nmse', float('inf')
+        )
+        self.print(
+            f'{step}: QAT reference drift before sensitivity scan '
+            f'nmse32={reference_drift_nmse32:.6e}, '
+            f'vqout={reference_drift_vqout:.6e}'
+        )
+        if reference_drift_nmse32 >= 1e-4 or reference_drift_vqout >= 1e-3:
+            raise RuntimeError(
+                'QAT progressive reference is stale before sensitivity scan: '
+                f'nmse32={reference_drift_nmse32:.6e}, '
+                f'vqout={reference_drift_vqout:.6e}'
+            )
         accepted_si_sdr = accepted_metrics.get('aligned_si_sdr', float('-inf'))
         try:
             for group_index in candidates:
@@ -6049,6 +6096,7 @@ class SoundStreamTrainer(nn.Module):
                     'recalibration under the wider scan-only gate'
                 )
             model.hardware_qat_active_group.fill_(selected_group)
+            self._hardware_qat_progressive_reference_group = -1
             recalibration_start = max(
                 int(step) + 1,
                 int(model.hardware_qat_activation_start_step),
@@ -6570,6 +6618,25 @@ class SoundStreamTrainer(nn.Module):
 
         steps = int(self.steps.item())
         hardware_qat_state = None
+        if self.encoder_only_training and hasattr(model, 'hardware_qat_active_group'):
+            active_group = int(model.hardware_qat_active_group.item())
+            group_start = int(model.hardware_qat_group_start_step.item())
+            if (
+                self.is_main and active_group >= 0 and
+                steps >= group_start and
+                self._hardware_qat_progressive_reference_group != active_group
+            ):
+                # This runs before update_hardware_qat enables candidate alpha.
+                # Local observer calibration and weight freezing are therefore
+                # complete, accepted groups stay quantized, and the candidate
+                # remains float in the newly captured reference.
+                self.capture_hardware_qat_progressive_reference(
+                    candidate_group=active_group
+                )
+                self.print(
+                    f'{steps}: captured post-recalibration QAT reference for '
+                    f'candidate group {active_group} with candidate alpha=0'
+                )
         if hasattr(self.unwrapped_soundstream, 'update_hardware_qat'):
             hardware_qat_state = self.unwrapped_soundstream.update_hardware_qat(
                 steps
@@ -7340,16 +7407,46 @@ class SoundStreamTrainer(nn.Module):
                 ),
                 default=0.,
             )
+            accumulator_peak = max(
+                (
+                    values.get('accumulator_peak', 0.)
+                    for values in layer_diagnostics.values()
+                ),
+                default=0.,
+            )
+            accumulator_required_bits = max(
+                (
+                    values.get('accumulator_required_bits', 0.)
+                    for values in layer_diagnostics.values()
+                ),
+                default=0.,
+            )
+            accumulator_headroom_bits = min(
+                (
+                    values.get('accumulator_headroom_bits', 0.)
+                    for values in layer_diagnostics.values()
+                ),
+                default=0.,
+            )
             utilization_p999 = [
                 float(values['activation_utilization_p999'])
                 for values in layer_diagnostics.values()
                 if 'activation_utilization_p999' in values
             ]
+            qat_group_lrs = [0.] * 6
+            for parameter_group in self.optim.optimizer.param_groups:
+                group_index = int(parameter_group.get('qat_group_index', -1))
+                if 0 <= group_index < len(qat_group_lrs):
+                    qat_group_lrs[group_index] = max(
+                        qat_group_lrs[group_index],
+                        float(parameter_group['lr']),
+                    )
             losses_str += (
                 f" | hardware_qat=enabled{int(qat_enabled)}/observer{int(qat_observer)}"
                 f"/alpha{float(getattr(model, 'hardware_qat_blend_alpha', 0.)):.4f}"
                 f"/groups[{','.join(f'{value:.2f}' for value in qat_group_alphas)}]"
                 f" | qat_lr={hardware_qat_lr:.3e}"
+                f" | qat_group_lr=[{','.join(f'{value:.2e}' for value in qat_group_lrs)}]"
                 f" | qat_rvq_margin={float(getattr(model, '_last_hardware_qat_rvq_margin', 0.)):.6f}"
                 f" | optimizer_scope={'encoder_only' if self.encoder_only_training else 'generator'}"
                 f"/decoder_requires_grad={int(any(p.requires_grad for p in model.decoder.parameters()))}"
@@ -7360,6 +7457,9 @@ class SoundStreamTrainer(nn.Module):
                 f" | qat_accumulator_overflow_max={accumulator_overflow:.6e}"
                 f" | qat_bias_overflow_max={bias_overflow:.6e}"
                 f" | qat_product_peak_max={product_peak:.3e}"
+                f" | qat_accumulator_peak_max={accumulator_peak:.3e}"
+                f"/required_bits={accumulator_required_bits:.0f}"
+                f"/headroom_bits={accumulator_headroom_bits:.0f}"
                 f" | qat_activation_saturation_max={output_saturation:.6f}"
                 f" | qat_u999_mean="
                 f"{(sum(utilization_p999) / len(utilization_p999) if utilization_p999 else 0.):.4f}"
@@ -7724,7 +7824,9 @@ class SoundStreamTrainer(nn.Module):
                     not self.hardware_qat_sensitivity_scan_done or
                     int(online_model.hardware_qat_active_group.item()) < 0
                 ) and
-                steps >= getattr(online_model, 'hardware_qat_start_step', 0) and
+                steps >= getattr(
+                    online_model, 'hardware_qat_activation_start_step', 0
+                ) and
                 not bool(online_model.hardware_qat_accepted_groups.all())
             ):
                 self.run_hardware_qat_sensitivity_scan(steps)

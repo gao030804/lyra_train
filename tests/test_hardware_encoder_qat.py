@@ -460,6 +460,12 @@ def test_hardware_qat_causal_conv_quantizes_bias_and_backpropagates():
     assert report["accumulator_values"] > 0
     assert report["output_values"] > 0
     assert 0. <= report["accumulator_overflow_rate"] <= 1.
+    assert report["accumulator_peak"] >= 0.
+    assert report["accumulator_required_bits"] >= 1.
+    assert (
+        report["accumulator_headroom_bits"] ==
+        report["accumulator_bits"] - report["accumulator_required_bits"]
+    )
     assert 0. <= report["output_saturation_rate"] <= 1.
     assert len(report["requant_multiplier"]) == 8
     assert len(report["requant_shift"]) == 8

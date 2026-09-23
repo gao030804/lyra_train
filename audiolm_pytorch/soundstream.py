@@ -44,6 +44,7 @@ from gateloop_transformer import SimpleGateLoopLayer as GateLoop
 
 from audiolm_pytorch.utils import curtail_to_multiple
 from audiolm_pytorch.hardware_quantization import (
+    HARDWARE_QUANTIZATION_CONTRACT_VERSION,
     INT8_QMIN,
     INT8_QMAX,
     INT32_QMIN,
@@ -720,6 +721,10 @@ class CausalConv1d(Module):
             qinput, qweight, None, self.conv.stride, self.conv.padding,
             self.conv.dilation, self.conv.groups
         )
+        accumulator_peak = accumulator.detach().abs().amax().float()
+        accumulator_required_bits = (
+            torch.ceil(torch.log2(accumulator_peak + 1.)).add(1.)
+        )
         qbias_unclamped = None
         if self.conv.bias is not None:
             bias_scale = (
@@ -737,6 +742,13 @@ class CausalConv1d(Module):
                 .float().mean().detach()
             ),
             'accumulator_bits': self.hardware_accumulator_bits,
+            'accumulator_peak': accumulator_peak,
+            'accumulator_required_bits': accumulator_required_bits,
+            'accumulator_headroom_bits': (
+                accumulator_required_bits.new_tensor(
+                    float(self.hardware_accumulator_bits)
+                ) - accumulator_required_bits
+            ),
             'activation_bits': self.hardware_activation_bits,
             'product_peak': (
                 qinput.detach().abs().amax() * qweight.detach().abs().amax()
@@ -3626,7 +3638,10 @@ class SoundStream(Module):
         pkg = dict(
             model = self.state_dict(),
             config = self._configs,
-            version = __version__
+            version = __version__,
+            hardware_quantization_contract_version = (
+                HARDWARE_QUANTIZATION_CONTRACT_VERSION
+            )
         )
 
         torch.save(pkg, str(path))
