@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from tools.rvq_scale_qat import ScaleRVQ, integer_encoder, make_projection, project_integer, export_projection, retention_summary
+from tools.rvq_scale_qat import ScaleRVQ, integer_encoder, make_projection, project_integer, export_projection, retention_summary, projection_output_scale, audio_first_key
 from tools.analyze_rvq_codebook_quantization import read_manifest, extract_books, audio_metrics, nmse
 from tools.integer_rvq_reference import clip16, round_away, quantize_books, run_integer, export_package, lookup
 
@@ -23,11 +23,31 @@ def digest(path):
     return h.hexdigest()
 
 
+def verify_ptq_baseline(report, baseline):
+    """Fail closed on different files/crops or changed step-zero numerics."""
+    key=lambda r:(str(Path(r['path']).resolve()),r['start_sample'])
+    expected={key(r):r for r in baseline['per_file']}
+    actual={key(r):r for r in report['per_file']}
+    if expected.keys()!=actual.keys():
+        raise ValueError('Step0 baseline files/crops differ from PTQ report')
+    for k in expected:
+        for metric in ('aligned_si_sdr_delta','aligned_corr_delta','vqout_nmse'):
+            if not np.isclose(actual[k][metric],expected[k][metric],rtol=1e-4,atol=1e-5):
+                raise ValueError(f'Step0 baseline mismatch: {k} {metric}: {actual[k][metric]} vs {expected[k][metric]}')
+        e=expected[k]
+        saturation=sum(e.get(name,0) for name in ('input_saturation','residual_saturation','output_saturation'))
+        if actual[k]['saturation']!=saturation:
+            raise ValueError(f'Step0 saturation mismatch: {k}')
+
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     for name in ('checkpoint','ptq-report','train-manifest','validation-manifest','test-manifest','output-dir'):
         p.add_argument('--'+name,type=Path,required=True)
-    p.add_argument('--steps',type=int,default=2000)
+    p.add_argument('--steps',type=int,default=0,help='Default: integer PTQ validation only; explicitly set >0 for scale QAT')
+    p.add_argument('--scale-mode',choices=['v1','v2'],default='v1')
+    p.add_argument('--frontend',choices=['integer','rvq-only'],default='integer',
+                   help='rvq-only freezes QAT-float Encoder/float Projection; requires matching PTQ validation report')
     p.add_argument('--eval-every',type=int,default=250)
     p.add_argument('--lr',type=float,default=1e-3)
     p.add_argument('--max-ratio',type=float,default=1.15)
@@ -37,7 +57,9 @@ def main():
     p.add_argument('--seed',type=int,default=42)
     p.add_argument('--device',choices=['cpu','cuda'],default='cuda')
     args=p.parse_args()
-    if min(args.steps,args.eval_every,args.lr,args.segment_seconds)<=0:
+    if args.frontend=='rvq-only' and args.scale_mode!='v1':
+        raise ValueError('RVQ-only baseline reproduction currently requires V1')
+    if args.steps < 0 or min(args.eval_every,args.lr,args.segment_seconds)<=0:
         raise ValueError('Steps, LR, interval and duration must be positive')
     from infer_soundstream import load_checkpoint,soundstream_from_checkpoint,load_audio
     from tools.export_encoder_integer_goldens import full_qat_proven
@@ -86,29 +108,35 @@ def main():
             wave=wave[:,start:start+length].unsqueeze(0)
             # The integer Encoder consumes the same explicitly rounded PCM as teacher.
             pcm=clip16(round_away(wave.numpy()*32768))
-            wave=torch.from_numpy(pcm.astype(np.float32)/32768)
-            encoder_int,encoder_scale=integer_encoder(model,wave)
-            if projection is None:
-                linear=model.rq_input_projection
-                projection=make_projection(linear.weight.detach().cpu().numpy(),
-                    None if linear.bias is None else linear.bias.detach().cpu().numpy(),encoder_scale,initial[0])
-            if not np.isclose(encoder_scale,projection['input_scale'],rtol=1e-6,atol=0):
-                raise RuntimeError('Encoder output scale changed')
-            query_int,saturation=project_integer(encoder_int.transpose(1,2).numpy(),projection)
+            extra={}
+            if args.frontend=='integer':
+                wave=torch.from_numpy(pcm.astype(np.float32)/32768)
+                encoder_int,encoder_scale=integer_encoder(model,wave)
+                if projection is None:
+                    linear=model.rq_input_projection
+                    projection=make_projection(linear.weight.detach().cpu().numpy(),
+                        None if linear.bias is None else linear.bias.detach().cpu().numpy(),encoder_scale,initial[0])
+                if not np.isclose(encoder_scale,projection['input_scale'],rtol=1e-6,atol=0):
+                    raise RuntimeError('Encoder output scale changed')
+                extra['encoder_int']=encoder_int.transpose(1,2).numpy()
+                query=(extra['encoder_int'].astype(float)*encoder_scale) @ (
+                    projection['weight'].astype(float)*projection['weight_scale'][:,None]).T + projection['bias']*encoder_scale*projection['weight_scale']
             fp_query=model.rq_input_projection(model.encoder(wave.to(args.device)).transpose(1,2))
+            if args.frontend=='rvq-only':
+                # Match PTQ exactly: no additional PCM conversion or integer frontend.
+                query=fp_query.cpu().numpy()
             fp_out,fp_indices,_=model.rq(fp_query,freeze_codebook=True)
             selected_sum=sum(book[fp_indices[0,...,q].cpu().numpy()] for q,book in enumerate(books))
             np.testing.assert_allclose(fp_out.cpu().numpy(),selected_sum,rtol=1e-4,atol=1e-5)
             audio=model.decode(model.rq_output_projection(fp_out)).cpu().numpy()
-            records.append(dict(path=str(path),start_sample=start,pcm=pcm,encoder_int=encoder_int.transpose(1,2).numpy(),
-                query_int=query_int,query=query_int.astype(float)*initial[0],teacher_query=fp_query.cpu().numpy(),
+            records.append(dict(path=str(path),start_sample=start,pcm=pcm,**extra,
+                query=query,teacher_query=fp_query.cpu().numpy(),
                 teacher_out=fp_out.cpu().numpy(),teacher_indices=fp_indices[0].cpu().numpy(),
-                teacher_audio=audio,wave=wave.numpy(),projection_saturation=saturation))
+                teacher_audio=audio,wave=wave.numpy()))
             print(f'cached {i+1}/{len(split)} {path.name}',flush=True)
         return records
-    train=collect(paths[0])
     validation=collect(paths[1])
-    student=ScaleRVQ(books,initial,output_scale,args.max_ratio,args.topk,args.temperature).to(args.device)
+    student=ScaleRVQ(books,initial,output_scale,args.max_ratio,args.topk,args.temperature,args.scale_mode).to(args.device)
     optimizer=torch.optim.Adam(student.parameters(),lr=args.lr,weight_decay=0)
     provenance=dict(checkpoint=str(args.checkpoint.resolve()),checkpoint_sha256=digest(args.checkpoint),
                     ptq_report=str(args.ptq_report.resolve()),ptq_report_sha256=digest(args.ptq_report),
@@ -120,22 +148,35 @@ def main():
     def evaluate(records,step,save=False):
         scales=student.scales().cpu().numpy()
         qbooks=quantize_books(books,scales)
+        residual_scales = None if args.scale_mode == 'v1' else initial
+        eval_projection = projection_output_scale(projection, scales[0]) if projection is not None and args.scale_mode == 'v1' else projection
         rows=[]
         for i,r in enumerate(records):
-            y,indices,trace=run_integer(r['query_int'],qbooks,scales,output_scale,residual_scales=initial)
-            oracle,oi,_=run_integer(r['query_int'],qbooks,scales,output_scale,residual_scales=initial,squared_distance=True)
+            if args.frontend=='rvq-only':
+                raw=round_away(r['query']/float(scales[0]))
+                query_int=clip16(raw)
+                projection_sat=int(np.count_nonzero((raw < -32768)|(raw > 32767)))
+            else:
+                query_int,projection_sat=project_integer(r['encoder_int'],eval_projection)
+            y,indices,trace=run_integer(query_int,qbooks,scales,output_scale,residual_scales=residual_scales)
+            oracle,oi,_=run_integer(query_int,qbooks,scales,output_scale,residual_scales=residual_scales,squared_distance=True)
             np.testing.assert_array_equal(indices,oi)
             np.testing.assert_array_equal(y,oracle)
             np.testing.assert_array_equal(y,lookup(indices,qbooks,scales,output_scale))
             # Count final output clipping as well as search/state boundaries.
             from tools.integer_rvq_reference import requant,ratio_parameters
             pre_output=sum(requant(book[indices[...,q]].astype(np.int64),*ratio_parameters(scales[q]/output_scale)) for q,book in enumerate(qbooks))
-            sat=r['projection_saturation']+sum(t['saturation']+t['search_saturation'] for t in trace)+int(np.count_nonzero((pre_output < -32768)|(pre_output > 32767)))
-            decoded=model.decode(model.rq_output_projection(torch.tensor(y.astype(float)*output_scale,device=args.device,dtype=torch.float32))).cpu().numpy()
+            saturation_detail=dict(projection=projection_sat,search=[t['search_saturation'] for t in trace],
+                residual=[t['saturation'] for t in trace],output=int(np.count_nonzero((pre_output < -32768)|(pre_output > 32767))))
+            sat=projection_sat+sum(saturation_detail['search'])+sum(saturation_detail['residual'])+saturation_detail['output']
+            if args.frontend=='rvq-only':
+                saturation_detail['rvq_input']=saturation_detail.pop('projection')
+            latent=y.astype(np.float32)*output_scale if args.frontend=='rvq-only' else y.astype(float)*output_scale
+            decoded=model.decode(model.rq_output_projection(torch.tensor(latent,device=args.device,dtype=torch.float32))).cpu().numpy()
             before=audio_metrics(r['wave'],r['teacher_audio'],sr)
             after=audio_metrics(r['wave'],decoded,sr)
             row=dict(path=r['path'],start_sample=r['start_sample'],aligned_si_sdr_delta=after['aligned_si_sdr']-before['aligned_si_sdr'],
-                     aligned_corr_delta=after['aligned_corr']-before['aligned_corr'],vqout_nmse=nmse(y.astype(float)*output_scale,r['teacher_out']),saturation=sat)
+                     aligned_corr_delta=after['aligned_corr']-before['aligned_corr'],vqout_nmse=nmse(y.astype(float)*output_scale,r['teacher_out']),saturation=sat,saturation_detail=saturation_detail)
             residual=r['teacher_query'].astype(float).copy()
             base_energy=max(float(np.mean(residual**2)),1e-12)
             for q,book in enumerate(books):
@@ -143,7 +184,12 @@ def main():
                 margin=np.sort(distances,axis=-1)[...,1]-distances.min(-1)
                 qmargin=(np.sort(trace[q]['scores'].astype(float),axis=-1)[...,1]-trace[q]['scores'].min(-1))*scales[q]**2
                 flip=indices[...,q]!=r['teacher_indices'][...,q]
-                row[f'q{q:02d}']=dict(index_flip=float(flip.mean()),energy_weighted_flip=float(flip.mean()*np.mean(residual**2)/base_energy),
+                selected=book[r['teacher_indices'][...,q]]
+                energy=np.mean(residual**2,axis=-1)
+                row[f'q{q:02d}']=dict(index_flip=float(flip.mean()),energy_weighted_flip=float(np.mean(flip*energy)/base_energy),
+                    residual_energy=float(energy.mean()),selected_codeword_energy=float(np.mean(selected**2)),
+                    selected_codeword_nmse=nmse(qbooks[q][indices[...,q]].astype(float)*scales[q],selected),
+                    codebook_nmse=nmse(qbooks[q].astype(float)*scales[q],book),
                     teacher_margin=float(margin.mean()),integer_margin=float(qmargin.mean()),
                     teacher_margin_at_flip=float(margin[flip].mean()) if flip.any() else None,
                     integer_margin_at_flip=float(qmargin[flip].mean()) if flip.any() else None)
@@ -153,12 +199,15 @@ def main():
                 import soundfile as sf
                 for label,audio in [('original',r['wave']),('fp_codebook',r['teacher_audio']),('scale_qat',decoded)]:
                     sf.write(str(args.output_dir/f'{i:02d}_{label}.wav'),audio.reshape(-1),sr,subtype='FLOAT')
-                golden=dict(pcm=r['pcm'],encoder_int16=r['encoder_int'],projection_int16=r['query_int'],indices=indices,output_int16=y)
+                golden=dict(input_int16=query_int,indices=indices,output_int16=y)
+                if args.frontend=='integer':
+                    golden.update(pcm=r['pcm'],encoder_int16=r['encoder_int'],projection_int16=query_int)
                 for q,t in enumerate(trace):
                     for key in ('stored_residual','residual','scores','after_subtract'):
                         golden[f'q{q:02d}_{key}']=t[key]
                 np.savez(args.output_dir/f'golden_{i:02d}.npz',**golden)
-        report=dict(step=step,scales=scales.tolist(),summary=retention_summary(rows),per_file=rows,rtl_verified=False)
+        report=dict(step=step,frontend=args.frontend,scale_mode=args.scale_mode,scales=scales.tolist(),summary=retention_summary(rows),per_file=rows,rtl_verified=False,
+                    rtl_index_mismatch_count=None,rtl_latent_mismatch_count=None)
         return report
 
     best_key=None
@@ -167,14 +216,24 @@ def main():
         nonlocal best_key,best_step
         report=evaluate(validation,step)
         (args.output_dir/f'validation_{step:05d}.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
+        if step==0 and args.frontend=='rvq-only':
+            verify_ptq_baseline(report,ptq)
+            print('Step0 PTQ baseline reproduction PASSED',flush=True)
         s=report['summary']
         print(f'integer validation step={step} {s}',flush=True)
-        key=(s['mean_vqout_nmse'],-s['worst_si_sdr_delta'],-s['p10_si_sdr_delta'])
+        key=audio_first_key(s)
         if s['passed'] and (best_key is None or key<best_key):
             best_key,best_step=key,step
             torch.save(dict(scale_state=student.state_dict(),step=step,validation=report,provenance=provenance),args.output_dir/'best_scales.pt')
     validate(0)
-    for step in range(1,args.steps+1):
+    train=[]
+    training_steps=args.steps
+    if best_step == 0:
+        print('Initial integer PTQ passed; skipping scale optimization.',flush=True)
+        training_steps=0
+    elif training_steps:
+        train=collect(paths[0])
+    for step in range(1,training_steps+1):
         r=rng.choice(train)
         query=torch.tensor(r['query'],device=args.device)
         teacher_query=torch.tensor(r['teacher_query'],device=args.device)
@@ -191,7 +250,7 @@ def main():
         optimizer.step()
         if step%25==0:
             print(f'{step}: loss={loss.item():.6f} vqout={vq.item():.6f} distance={dist.item():.6f} codebook={cb.item():.6f} scale_grad={grad:.6g}',flush=True)
-        if step%args.eval_every==0 or step==args.steps:
+        if step%args.eval_every==0 or step==training_steps:
             validate(step)
             torch.save(dict(scale_state=student.state_dict(),optimizer=optimizer.state_dict(),step=step,provenance=provenance),args.output_dir/'latest_scales.pt')
     for before,after in zip(books,extract_books(model)):
@@ -206,9 +265,10 @@ def main():
     if not final['summary']['passed']:
         raise SystemExit('Final test retention failed; no deployment export.')
     scales=student.scales().detach().cpu().numpy()
-    manifest=export_package(args.output_dir/'export',quantize_books(books,scales),scales,output_scale,provenance=provenance,residual_scales=initial)
-    export_projection(args.output_dir/'export',projection)
-    manifest.update(projection_quantized=True,projection_manifest='projection_manifest.json',
+    manifest=export_package(args.output_dir/'export',quantize_books(books,scales),scales,output_scale,provenance=provenance,residual_scales=None if args.scale_mode=='v1' else initial)
+    if args.frontend=='integer':
+        export_projection(args.output_dir/'export',projection_output_scale(projection,scales[0]) if args.scale_mode=='v1' else projection)
+    manifest.update(frontend=args.frontend,projection_quantized=args.frontend=='integer',projection_manifest='projection_manifest.json' if args.frontend=='integer' else None,
                     output_projection_quantized=False,rtl_verified=False)
     (args.output_dir/'export'/'rvq_manifest.json').write_text(json.dumps(manifest,indent=2),encoding='utf-8')
     print(f'Complete: best step={best_step}, export={args.output_dir / "export"}',flush=True)

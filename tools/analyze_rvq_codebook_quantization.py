@@ -14,7 +14,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tools.integer_rvq_reference import (
-    clip16, export_package, lookup, quantize_books, ratio_parameters, round_away, run_integer,
+    clip16, export_package, lookup, quantize_books, ratio_parameters, round_away, run_integer, requant,
 )
 
 
@@ -117,9 +117,11 @@ def main():
     p.add_argument('--device', default='cpu', choices=['cpu', 'cuda'])
     p.add_argument('--segment-seconds', type=float, default=4.)
     p.add_argument('--percentiles', nargs='+', type=float, default=[100., 99.99, 99.9, 99.5])
-    p.add_argument('--max-si-sdr-drop', type=float, default=.1)
+    p.add_argument('--max-si-sdr-drop', type=float, default=.05)
+    p.add_argument('--max-p10-si-sdr-drop', type=float, default=.20)
+    p.add_argument('--max-worst-si-sdr-drop', type=float, default=.30)
     p.add_argument('--max-corr-drop', type=float, default=.01)
-    p.add_argument('--max-vqout-nmse', type=float, default=.05)
+    p.add_argument('--max-vqout-nmse', type=float, default=.04)
     p.add_argument('--export', action='store_true', help='Export only if held-out retention gates pass')
     args = p.parse_args()
     from infer_soundstream import load_audio, load_checkpoint, soundstream_from_checkpoint
@@ -200,16 +202,27 @@ def main():
             audio = model.decode(model.rq_output_projection(latent)).cpu().numpy()
             before = audio_metrics(record['wave'], record['baseline'], sr)
             after = audio_metrics(record['wave'], audio, sr)
+            pre_output=sum(requant(book[indices[...,q]].astype(np.int64),*ratio_parameters(scales[q]/output_scale)) for q,book in enumerate(qbooks))
             row = dict(path=record['path'], start_sample=record['start_sample'],
                        aligned_si_sdr_delta=after['aligned_si_sdr']-before['aligned_si_sdr'],
                        aligned_corr_delta=after['aligned_corr']-before['aligned_corr'],
                        vqout_nmse=nmse(value.astype(float)*output_scale, record['quantized']),
                        input_saturation=int(np.count_nonzero((raw < -32768)|(raw > 32767))),
-                       residual_saturation=sum(t['saturation'] for t in trace))
+                       residual_saturation=sum(t['saturation'] for t in trace),
+                       output_saturation=int(np.count_nonzero((pre_output < -32768)|(pre_output > 32767))))
+            teacher_residual=record['query'].astype(float).copy()
+            base_energy=max(float(np.mean(teacher_residual**2)),1e-12)
             for q in range(len(books)):
                 row[f'q{q:02d}_index_flip'] = float(np.mean(indices[...,q] != record['indices'][...,q]))
                 row[f'q{q:02d}_selected_codeword_nmse'] = nmse(qbooks[q][indices[...,q]].astype(float)*scales[q], books[q][record['indices'][...,q]])
                 row[f'q{q:02d}_residual_rms'] = float(np.sqrt(np.mean((trace[q]['residual']*scales[q])**2)))
+                selected=books[q][record['indices'][...,q]]
+                energy=np.mean(teacher_residual**2,axis=-1)
+                flip=indices[...,q] != record['indices'][...,q]
+                row[f'q{q:02d}_weighted_index_flip']=float(np.mean(flip*energy)/base_energy)
+                row[f'q{q:02d}_residual_energy']=float(energy.mean())
+                row[f'q{q:02d}_selected_codeword_energy']=float(np.mean(selected**2))
+                teacher_residual-=selected
             row['final_residual_rms'] = float(np.sqrt(np.mean((trace[-1]['after_subtract']*scales[-1])**2)))
             rows.append(row)
             traces.append((query, value, indices, trace))
@@ -218,14 +231,25 @@ def main():
                 for label, data in [('original', record['wave']), ('fp_codebook', record['baseline']), ('int8_codebook', audio)]:
                     sf.write(str(out/f'{i:02d}_{label}.wav'), data.reshape(-1), sr, subtype='FLOAT')
         means = {k: float(np.mean([r[k] for r in rows])) for k in rows[0] if k not in ('path', 'start_sample')}
+        means['p10_si_sdr_delta']=float(np.percentile([r['aligned_si_sdr_delta'] for r in rows],10))
+        means['worst_si_sdr_delta']=min(r['aligned_si_sdr_delta'] for r in rows)
+        means['saturation_count']=sum(r['input_saturation']+r['residual_saturation']+r['output_saturation'] for r in rows)
         return means, rows, traces
 
-    def rank(metrics, element_nmse):
-        audio_ok = (metrics['aligned_si_sdr_delta'] >= -args.max_si_sdr_drop and metrics['aligned_corr_delta'] >= -args.max_corr_drop)
-        early = sum(metrics[f'q{q:02d}_index_flip'] for q in range(min(3, len(books))))
-        return (not audio_ok, 0 if audio_ok else -metrics['aligned_si_sdr_delta'],
-                0 if audio_ok else -metrics['aligned_corr_delta'], metrics['vqout_nmse'], early, element_nmse)
+    def eligible(metrics):
+        return (metrics['aligned_si_sdr_delta'] >= -args.max_si_sdr_drop and
+                metrics['p10_si_sdr_delta'] >= -args.max_p10_si_sdr_drop and
+                metrics['worst_si_sdr_delta'] >= -args.max_worst_si_sdr_drop and
+                metrics['aligned_corr_delta'] >= -args.max_corr_drop and
+                metrics['vqout_nmse'] <= args.max_vqout_nmse and metrics['saturation_count']==0)
 
+    def rank(metrics, element_nmse):
+        early = sum(metrics[f'q{q:02d}_weighted_index_flip'] for q in range(min(3, len(books))))
+        return (not eligible(metrics), -metrics['aligned_si_sdr_delta'], -metrics['p10_si_sdr_delta'],
+                -metrics['worst_si_sdr_delta'], -metrics['aligned_corr_delta'], metrics['vqout_nmse'], early, element_nmse)
+
+    max_scale_metrics,_,_=assess(scales,calibration,verify=True)
+    max_scales=scales.copy()
     trials = []
     for q, book in enumerate(books):
         choices = []
@@ -241,8 +265,7 @@ def main():
         scales[q] = min(choices, key=lambda x:x[0])[1]
         print(f'stage {q}: selected scale={scales[q]:.9g}', flush=True)
     metrics, rows, traces = assess(scales, evaluation, save_audio=True, verify=True)
-    passed = (metrics['aligned_si_sdr_delta'] >= -args.max_si_sdr_drop and
-              metrics['aligned_corr_delta'] >= -args.max_corr_drop and metrics['vqout_nmse'] <= args.max_vqout_nmse)
+    passed = eligible(metrics)
     for a, b in zip(original_books, extract_books(model)):
         np.testing.assert_array_equal(a, b)  # EMA must never mutate master codebooks
     qbooks = quantize_books(books, scales)
@@ -254,11 +277,15 @@ def main():
                   scopes='QAT Encoder fixed; external projections and audio Decoder remain float',
                   scales=scales, output_scale=output_scale, metrics=metrics, per_file=rows,
                   codebook_nmse=[nmse(b.astype(float)*s, fp) for b,s,fp in zip(qbooks,scales,books)],
-                  calibration_trials=trials, retention_pass=bool(passed),
-                  thresholds=dict(si_sdr_drop=args.max_si_sdr_drop, corr_drop=args.max_corr_drop, vqout_nmse=args.max_vqout_nmse),
+                  calibration_trials=trials, retention_pass=bool(passed),scale_mode='v1',
+                  max_scale_baseline=dict(scales=max_scales,calibration_metrics=max_scale_metrics),
+                  thresholds=dict(si_sdr_drop=args.max_si_sdr_drop,p10_si_sdr_drop=args.max_p10_si_sdr_drop,
+                                  worst_si_sdr_drop=args.max_worst_si_sdr_drop,saturation_count=0,
+                                  corr_drop=args.max_corr_drop, vqout_nmse=args.max_vqout_nmse),
                   integer_squared_distance_oracle_pass=True, decoder_lookup_exact=True,
                   pytorch_quantized_oracle_pass=True,
-                  rtl_verified=False)
+                  rtl_verified=False,rtl_index_mismatch_count=None,rtl_latent_mismatch_count=None,
+                  codebook_storage_bytes=dict(int8=sum(b.size for b in books),fp32=4*sum(b.size for b in books)))
     (out/'rvq_ptq_report.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
     if args.export and passed:
         digest = hashlib.sha256(args.checkpoint.read_bytes()).hexdigest()

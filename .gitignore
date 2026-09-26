@@ -195,3 +195,4 @@ corpora/
 .DS_Store
 Thumbs.db
 desktop.ini
+!tools/compare_rvq_integer_goldens.py

@@ -19,7 +19,7 @@ def fake_quant(x, scale, low, high):
 
 
 class ScaleRVQ(nn.Module):
-    def __init__(self, books, scales, output_scale, max_ratio=1.15, topk=8, temperature=.1):
+    def __init__(self, books, scales, output_scale, max_ratio=1.15, topk=8, temperature=.1, scale_mode='v1'):
         super().__init__()
         if max_ratio <= 1 or temperature <= 0 or topk < 2:
             raise ValueError('Invalid scale bounds or distance distillation configuration')
@@ -30,6 +30,9 @@ class ScaleRVQ(nn.Module):
         self.delta = nn.Parameter(torch.zeros(len(scales), dtype=torch.float64))
         self.log_range = math.log(max_ratio)
         self.topk, self.temperature = topk, temperature
+        if scale_mode not in ('v1', 'v2'):
+            raise ValueError('scale_mode must be v1 or v2')
+        self.scale_mode = scale_mode
 
     def scales(self):
         # Exact interval [s0 / max_ratio, s0 * max_ratio].
@@ -37,7 +40,8 @@ class ScaleRVQ(nn.Module):
 
     def forward(self, query, teacher_query):
         scales = self.scales()
-        residual = fake_quant(query.double(), self.initial[0], -32768, 32767)
+        residual_scales = scales if self.scale_mode == 'v1' else self.initial
+        residual = fake_quant(query.double(), residual_scales[0], -32768, 32767)
         teacher_residual = teacher_query.detach().double()
         quantized = torch.zeros_like(residual)
         dist_loss, cb_loss = residual.new_zeros(()), residual.new_zeros(())
@@ -60,9 +64,9 @@ class ScaleRVQ(nn.Module):
                 reduction='none').sum(-1).mean()
             selected = qb[distances.detach().argmin(-1)]
             quantized = quantized + fake_quant(selected, self.output_scale, -2**31, 2**31-1)
-            residual = residual - fake_quant(selected, self.initial[q], -32768,32767)
+            residual = residual - (selected if self.scale_mode == 'v1' else fake_quant(selected, self.initial[q], -32768,32767))
             if q+1 < len(scales):
-                residual = fake_quant(residual, self.initial[q+1], -32768,32767)
+                residual = fake_quant(residual, residual_scales[q+1], -32768,32767)
             teacher_residual = teacher_residual - book[tk]
             cb_loss = cb_loss + (qb-book).square().mean()/book.square().mean().clamp_min(1e-12)
         quantized = fake_quant(quantized, self.output_scale, -32768,32767)
@@ -100,6 +104,18 @@ def project_integer(x, spec):
         channels.append(np.asarray(values,dtype=np.int64).reshape(acc.shape[:-1]))
     raw=np.stack(channels,axis=-1)
     return clip16(raw), int(np.count_nonzero((raw < -32768)|(raw > 32767)))
+
+
+def projection_output_scale(spec, output_scale):
+    """Change only requant units, never weights/bias or the projection geometry."""
+    params = [ratio_parameters(spec['input_scale'] * s / output_scale) for s in spec['weight_scale']]
+    return dict(spec, output_scale=float(output_scale), multiplier=np.array([p[0] for p in params]),
+                shift=np.array([p[1] for p in params]))
+
+
+def audio_first_key(summary):
+    return (-summary['mean_si_sdr_delta'], -summary['p10_si_sdr_delta'],
+            -summary['worst_si_sdr_delta'], -summary['mean_corr_delta'], summary['mean_vqout_nmse'])
 
 
 def export_projection(directory, spec):

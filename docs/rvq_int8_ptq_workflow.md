@@ -77,3 +77,12 @@ output_group/reduction_group/4/8；两种权重布局择一使用，padding不�
 现有训练checkpoint不修改；码本导出包与golden不是训练checkpoint。
 RTL对拍尚需testbench接入导出格式，报告始终标明 rtl_verified=false。
 若PTQ验证失败先分析报告再决定codebook-aware微调；此次未重新开启EMA或增加训练阶段。
+# 2026-09-26 门槛和流程更新
+
+当前推荐 V1 PTQ 优先，码本与残差每级共享scale，zero_point=0。
+默认mean SI-SDR退化不超过0.05dB、P10不超过0.20dB、worst不超过0.30dB、
+mean VQout NMSE不超过0.04；保留correlation门槛，新增输入/残差/输出饱和总数必须为0。
+校准候选按音频优先排序，记录max-scale校准基线、能量加权翻码率和选中码字能量。
+旧版已通过报告应按新规则重新验证，不追溯修改原文件。
+该工具仅验证整数RVQ，Encoder是QAT浮点执行、Projection与Decoder浮点，不代表完整整数前端通过。
+完整整数前端及可选scale训练见 `rvq_scale_qat_workflow.md` 的2026-09-26更新。

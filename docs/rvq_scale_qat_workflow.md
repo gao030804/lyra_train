@@ -1,5 +1,59 @@
 # Projection整数化与RVQ scale-only QAT
 
+## 2026-09-27 RVQ-only 隔离实验
+
+新增 `--frontend rvq-only --scale-mode v1`，固定原QAT浮点执行Encoder和浮点Projection输出，
+不运行整数Encoder、不再次做PCM舍入；和独立PTQ使用相同的中心裁剪及浮点解码数值路径。
+默认frontend仍为integer，不影响原完整链路实验。
+RVQ-only step0强制逐文件验证路径、start_sample、SI-SDR/corr delta、VQout NMSE、饱和数
+与初始化PTQ报告一致（浮点rtol=1e-4、atol=1e-5）；不一致即停止，禁止带着不同baseline训练。
+使用max-scale报告 `results/rvq-v1-maxscale-20260926-235517/rvq_ptq_report.json`，
+并继续使用 `results/rvq-scale-qat-20260924-092506-manifests` 中三个CSV。
+建议首轮 `--steps 500 --eval-every 100 --lr 0.001 --max-ratio 1.15`。
+只有9个scale可训练，输出scale和码本保持冻结；没有合格checkpoint则不评测试、不导出。
+RVQ-only导出仅含RVQ，projection_quantized=false，golden输入是RVQ INT16 query，
+不含伪造的整数Encoder/Projection输出，不代表完整端到端整数链路已通过。
+如需继续训练，不支持resume，必须显式新建实验；保留原max-scale结果不覆盖。
+
+## 2026-09-26 更新（优先于下文旧 V2 说明）
+
+默认 `--scale-mode v1 --steps 0`：只做完整整数前端/PTQ验证，不训练。
+V1 每级 codebook/residual 共用 scale；V2 分离 scale 必须显式指定 `--scale-mode v2`。
+显式设置 `--steps 2000` 才允许验证失败后训练；step0通过时仍跳过训练，直接评最终测试。
+测试失败不导出，不能根据测试集结果反复选 scale。
+先缓存验证集，只有需要训练时才缓存训练集；旧日志中固定32条训练缓存优先的顺序已改变。
+V1训练时 residual scale 随 codebook scale 变化；Projection只更新输出单位的乘子/移位，
+权重、Bias和几何映射不变。导出Projection与最佳scale使用一致的输出单位。
+合格候选改为音频优先（mean/P10/worst SI-SDR、correlation），再比较VQout NMSE。
+报告新增分来源饱和计数、真正按逐帧能量加权的flip、selected-codeword误差和能量。
+
+推荐首先重跑独立 `analyze_rvq_codebook_quantization.py` 的 V1 PTQ。
+该工具保持浮点Projection，不与完整整数前端报告混为同一实验；已增加max-scale校准基线、
+P10/worst门槛及输入/残差/输出零饱和门槛。旧报告的PASS不能自动等同新版门槛PASS。
+只训练9个scale无法保证补偿整数Encoder/Projection的误差，完整前端失败应先定位边界。
+
+9级K=[256,128×8]、D=32：INT8为40960字节，FP32为163840字节。
+这不包含norm、requant、Projection、运行state。两个codebook布局文件是同一数据的不同排列，
+不要默认两份都烧录。
+
+新增 `tools/compare_rvq_integer_goldens.py`：
+
+```bash
+python tools/compare_rvq_integer_goldens.py \
+  --golden "$PTQ_DIR/golden_00.npz" \
+  --rtl-dump "$RTL_DUMP" \
+  --report "$COMPARE_REPORT"
+```
+
+RTL_DUMP必须是真实仿真转换得到的NPZ（不能用golden冒充），数组名/shape与golden一致，
+包括indices、output_int16及各stage residual/scores/after_subtract。
+缺失数组、shape错误、浮点payload均拒绝；任何逐元素不一致返回失败。
+PTQ/QAT报告的RTL mismatch默认null而不是0，未执行RTL不能声称bit-exact。
+该比较器不负责运行RTL或验证dump来源；目前仍需外部仿真器产生数据。
+
+同步清单还需加入 `tools/compare_rvq_integer_goldens.py` 和 `tests/test_rvq_golden_compare.py`。
+回归测试：两个原RVQ测试以及 `python -m unittest discover -s tests -p test_rvq_golden_compare.py -v`。
+
 ## 实现范围
 
 新增独立 `tools/train_rvq_quant_scales.py`，从已通过Encoder W8A16/ACC40 QAT的checkpoint和

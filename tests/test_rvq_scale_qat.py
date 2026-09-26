@@ -4,11 +4,24 @@ from pathlib import Path
 import struct
 import numpy as np
 import torch
-from tools.rvq_scale_qat import ScaleRVQ,make_projection,project_integer,retention_summary
+from tools.rvq_scale_qat import ScaleRVQ,make_projection,project_integer,retention_summary,projection_output_scale,audio_first_key
 from tools.integer_rvq_reference import run_integer,lookup,export_package,ratio_parameters
 
 
 class ScaleQATTests(unittest.TestCase):
+    def test_step_zero_baseline_guard(self):
+        from tools.train_rvq_quant_scales import verify_ptq_baseline
+        row=dict(path='audio.flac',start_sample=100,aligned_si_sdr_delta=.07,
+                 aligned_corr_delta=.001,vqout_nmse=.047,saturation=0)
+        baseline=dict(per_file=[dict(row,input_saturation=0,residual_saturation=0,output_saturation=0)])
+        verify_ptq_baseline(dict(per_file=[row]),baseline)
+        with self.assertRaises(ValueError):
+            verify_ptq_baseline(dict(per_file=[dict(row,vqout_nmse=.08)]),baseline)
+        with self.assertRaises(ValueError):
+            verify_ptq_baseline(dict(per_file=[dict(row,start_sample=101)]),baseline)
+        with self.assertRaises(ValueError):
+            verify_ptq_baseline(dict(per_file=[dict(row,saturation=1)]),baseline)
+
     def test_only_scales_train_and_receive_gradient(self):
         rng=np.random.default_rng(6)
         books=[rng.normal(size=(16,8)),rng.normal(size=(8,8))]
@@ -22,7 +35,7 @@ class ScaleQATTests(unittest.TestCase):
         self.assertGreater(float(model.delta.grad.abs().sum()),0)
         optimizer=torch.optim.Adam(model.parameters(),lr=.001)
         optimizer.step()
-        self.assertGreater(float(model.delta.abs().sum()),0)
+        self.assertGreater(float(model.delta.detach().abs().sum()),0)
         np.testing.assert_array_equal(model.book_0.numpy(),books[0])
         with torch.no_grad():
             model.delta.copy_(torch.tensor([-100.,100.]))
@@ -39,6 +52,31 @@ class ScaleQATTests(unittest.TestCase):
         np.testing.assert_array_equal(indices,oi)
         np.testing.assert_array_equal(y,oracle)
         np.testing.assert_array_equal(y,lookup(indices,books,scales,.05))
+
+    def test_v1_and_v2_initially_identical(self):
+        rng=np.random.default_rng(13)
+        books=[rng.normal(size=(16,8)) for _ in range(2)]
+        x=torch.tensor(rng.normal(size=(1,10,8)))
+        a=ScaleRVQ(books,[.02,.015],.001,scale_mode='v1')
+        b=ScaleRVQ(books,[.02,.015],.001,scale_mode='v2')
+        torch.testing.assert_close(a(x,x)[0],b(x,x)[0])
+        for model in (a,b):
+            y,d,c=model(x,x)
+            (y.square().mean()+d+c).backward()
+            self.assertTrue(torch.isfinite(model.delta.grad).all())
+            self.assertGreater(model.delta.grad.abs().sum().item(),0)
+
+    def test_projection_retarget_and_audio_first_selection(self):
+        spec=make_projection(np.eye(2),None,.01,.01)
+        updated=projection_output_scale(spec,.02)
+        x=np.array([[[100,-100]]],dtype=np.int16)
+        y,_=project_integer(x,updated)
+        np.testing.assert_array_equal(y,[[[50,-50]]])
+        np.testing.assert_array_equal(spec['weight'],updated['weight'])
+        self.assertEqual(spec['output_scale'],.01)
+        a=dict(mean_si_sdr_delta=.1,p10_si_sdr_delta=0,worst_si_sdr_delta=-.1,mean_corr_delta=0,mean_vqout_nmse=.035)
+        b=dict(a,mean_si_sdr_delta=0,mean_vqout_nmse=.01)
+        self.assertLess(audio_first_key(a),audio_first_key(b))
 
     def test_projection_identity_and_wide_bias(self):
         spec=make_projection(np.eye(4),None,.01,.01)
