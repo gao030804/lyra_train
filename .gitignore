@@ -39,6 +39,12 @@
 !tools/reconstruct_long_test10.py
 !tools/select_stage1_checkpoint.py
 !tools/validate_stage2_init.py
+!tools/analyze_rvq_codebook_quantization.py
+!tools/integer_rvq_reference.py
+!tools/train_rvq_quant_scales.py
+!tools/rvq_scale_qat.py
+!tools/prepare_rvq_scale_manifests.py
+!tools/export_encoder_integer_goldens.py
 # ============================================================
 # Keep source code directories
 # ============================================================

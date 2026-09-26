@@ -130,17 +130,27 @@ def integer_conv1d_reference(
 
 
 def _conv_followed_by_hardware_relu(encoder: torch.nn.Module) -> set[str]:
+    def terminal_conv(module, prefix):
+        # DSCNN/LowRank的输出来自net最后一个子模块；ReLU挂在包装器之外。
+        if hasattr(module, "hardware_output_fake_quant"):
+            return prefix
+        sequence = module if isinstance(module, torch.nn.Sequential) else getattr(module, "net", None)
+        if isinstance(sequence, torch.nn.Sequential) and len(sequence):
+            key, child = tuple(sequence.named_children())[-1]
+            base = prefix if sequence is module else prefix + ".net"
+            return terminal_conv(child, base + "." + key)
+        return None
+
     result: set[str] = set()
     for parent_name, parent in encoder.named_modules():
         if not isinstance(parent, torch.nn.Sequential):
             continue
         children = tuple(parent.named_children())
         for (producer_key, producer), (_, consumer) in zip(children, children[1:]):
-            if (
-                hasattr(producer, "hardware_output_fake_quant") and
-                consumer.__class__.__name__ == "HardwareReLU"
-            ):
-                result.add(".".join(filter(None, (parent_name, producer_key))))
+            if consumer.__class__.__name__ == "HardwareReLU":
+                leaf = terminal_conv(producer, ".".join(filter(None, (parent_name, producer_key))))
+                if leaf is not None:
+                    result.add(leaf)
     return result
 
 
@@ -300,12 +310,32 @@ def export_hardware_encoder_package(
             module.residual_scale,
         )
         offset = len(residual_blob)
+        identity_scale = float(convs[0].hardware_input_fake_quant.scale.item())
+        branch_scale = float(convs[-1].hardware_output_fake_quant.scale.item())
+        add_scale = float(residual_add.fake_quant.scale.item())
+        def fixed_alignment(ratio):
+            right_shift = 48
+            while right_shift and math.floor(ratio * (1 << right_shift) + .5) > 0x7fffffff:
+                right_shift -= 1
+            coefficient = math.floor(ratio * (1 << right_shift) + .5)
+            if ratio < 0 or coefficient > 0x7fffffff:
+                raise ValueError(f"{name}: residual scale ratio out of range")
+            return {"multiplier": coefficient, "shift": right_shift}
         residual_blob.extend(_int_tensor_bytes(multiplier, torch.int32))
         residual_blob.extend(_int_tensor_bytes(shift, torch.uint8))
         residuals.append({
             "name": name,
             "channels": channels,
             "residual_scale": float(module.residual_scale),
+            "identity_scale": float(convs[0].hardware_input_fake_quant.scale.item()),
+            "branch_scale": float(convs[-1].hardware_output_fake_quant.scale.item()),
+            "output_scale": float(residual_add.fake_quant.scale.item()),
+            "alignment": {
+                "identity": fixed_alignment(identity_scale/add_scale),
+                "branch": fixed_alignment(branch_scale/add_scale),
+                "gain": fixed_alignment(float(module.residual_scale)),
+                "order": "sat16(identity_align) + gain(sat16(branch_align)), then sat16",
+            },
             "parameter_offset": offset,
             "parameter_bytes": channels * 5,
             "accumulator": f"int{accumulator_bits}",
