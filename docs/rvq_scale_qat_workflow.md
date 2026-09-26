@@ -1,5 +1,37 @@
 # Projection整数化与RVQ scale-only QAT
 
+## 2026-09-27 批量微调与双门槛（最新）
+
+不再仅在通过时保存：每次验证保存`scales_step_XXXXX.pt`（含step0）、
+`best_candidate_scales.pt`（全部step音频优先）、`best_audio_candidate_scales.pt`（仅音频门槛通过）。
+它们只是诊断候选，不能直接作为通过验收的参数；candidate可能是step0。
+`best_scales.pt`严格要求mean/P90 NMSE<=0.04/0.08；
+`best_experimental_scales.pt`使用0.05/0.10，其他SI-SDR/零饱和条件相同。
+默认`--gate-profile strict`不变；显式`--gate-profile experimental`才允许以实验候选进入最终测试。
+最终测试仍只评验证集选定的一个候选，不用测试集重新选参数。
+实验导出写入`experimental_export/`，严格导出写入`export/`；manifest同时记录strict retention、
+experimental retention、门槛和`deployment_approved=false`，RTL验证仍需单独完成。
+不能把旧step200日志恢复成checkpoint；需要重新运行才能保存其新实验对应参数。
+
+新版默认batch-size=4（逐文件梯度累积取平均，文件NMSE等权）、lr=0.0003、
+max-ratio=1.08、eval-every=100、distance-weight=0.1、codebook-weight=0.02。
+steps仍默认0以保留PTQ优先政策；训练需显式`--steps 1000`。
+仅优化scale，码本及EMA保持冻结。日志输出平均loss、加权辅助loss、实际batch和梯度范数，
+验证summary增加q00/q01/q02的flip与逐帧能量加权flip。
+
+下一轮推荐在原max-scale初始化和原三份CSV基础上添加：
+
+```bash
+--frontend rvq-only --scale-mode v1 \
+--steps 1000 --eval-every 100 --batch-size 4 \
+--lr 0.0003 --max-ratio 1.08 \
+--distance-weight 0.1 --codebook-weight 0.02 \
+--gate-profile experimental
+```
+
+step0复现检查继续强制执行；通过实验门槛不代表听感或硬件已验收。
+若新一轮仍长期停留在约0.047，不应自动继续堆步数；先试听已保存候选再决定。
+
 ## 2026-09-27 RVQ-only 隔离实验
 
 新增 `--frontend rvq-only --scale-mode v1`，固定原QAT浮点执行Encoder和浮点Projection输出，

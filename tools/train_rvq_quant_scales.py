@@ -48,9 +48,13 @@ def main():
     p.add_argument('--scale-mode',choices=['v1','v2'],default='v1')
     p.add_argument('--frontend',choices=['integer','rvq-only'],default='integer',
                    help='rvq-only freezes QAT-float Encoder/float Projection; requires matching PTQ validation report')
-    p.add_argument('--eval-every',type=int,default=250)
-    p.add_argument('--lr',type=float,default=1e-3)
-    p.add_argument('--max-ratio',type=float,default=1.15)
+    p.add_argument('--eval-every',type=int,default=100)
+    p.add_argument('--lr',type=float,default=3e-4)
+    p.add_argument('--max-ratio',type=float,default=1.08)
+    p.add_argument('--batch-size',type=int,default=4,help='Number of cached files averaged per optimizer step')
+    p.add_argument('--distance-weight',type=float,default=.1)
+    p.add_argument('--codebook-weight',type=float,default=.02)
+    p.add_argument('--gate-profile',choices=['strict','experimental'],default='strict')
     p.add_argument('--topk',type=int,default=8)
     p.add_argument('--temperature',type=float,default=.1)
     p.add_argument('--segment-seconds',type=float,default=4.)
@@ -61,6 +65,8 @@ def main():
         raise ValueError('RVQ-only baseline reproduction currently requires V1')
     if args.steps < 0 or min(args.eval_every,args.lr,args.segment_seconds)<=0:
         raise ValueError('Steps, LR, interval and duration must be positive')
+    if args.batch_size < 1 or min(args.distance_weight,args.codebook_weight) < 0:
+        raise ValueError('Invalid batch size or loss weights')
     from infer_soundstream import load_checkpoint,soundstream_from_checkpoint,load_audio
     from tools.export_encoder_integer_goldens import full_qat_proven
     torch.manual_seed(args.seed)
@@ -206,12 +212,14 @@ def main():
                     for key in ('stored_residual','residual','scores','after_subtract'):
                         golden[f'q{q:02d}_{key}']=t[key]
                 np.savez(args.output_dir/f'golden_{i:02d}.npz',**golden)
-        report=dict(step=step,frontend=args.frontend,scale_mode=args.scale_mode,scales=scales.tolist(),summary=retention_summary(rows),per_file=rows,rtl_verified=False,
+        report=dict(step=step,frontend=args.frontend,scale_mode=args.scale_mode,scales=scales.tolist(),summary=retention_summary(rows,args.gate_profile),per_file=rows,rtl_verified=False,
                     rtl_index_mismatch_count=None,rtl_latent_mismatch_count=None)
         return report
 
     best_key=None
     best_step=None
+    saved_keys={}
+    selected_name='best_scales.pt' if args.gate_profile=='strict' else 'best_experimental_scales.pt'
     def validate(step):
         nonlocal best_key,best_step
         report=evaluate(validation,step)
@@ -222,9 +230,21 @@ def main():
         s=report['summary']
         print(f'integer validation step={step} {s}',flush=True)
         key=audio_first_key(s)
+        payload=dict(scale_state=student.state_dict(),optimizer=optimizer.state_dict(),step=step,
+                     validation=report,provenance=provenance,retention_pass=s['strict_pass'],
+                     experimental_pass=s['experimental_pass'],deployment_approved=False)
+        torch.save(payload,args.output_dir/f'scales_step_{step:05d}.pt')
+        for filename,eligible in (
+            ('best_candidate_scales.pt',True),
+            ('best_audio_candidate_scales.pt',s['audio_pass']),
+            ('best_scales.pt',s['strict_pass']),
+            ('best_experimental_scales.pt',s['experimental_pass'])):
+            if eligible and (filename not in saved_keys or key < saved_keys[filename]):
+                saved_keys[filename]=key
+                torch.save(dict(payload,candidate_only=filename in ('best_candidate_scales.pt','best_audio_candidate_scales.pt')),args.output_dir/filename)
+                print(f'saving {filename} step={step} strict={s["strict_pass"]} experimental={s["experimental_pass"]}',flush=True)
         if s['passed'] and (best_key is None or key<best_key):
             best_key,best_step=key,step
-            torch.save(dict(scale_state=student.state_dict(),step=step,validation=report,provenance=provenance),args.output_dir/'best_scales.pt')
     validate(0)
     train=[]
     training_steps=args.steps
@@ -234,30 +254,34 @@ def main():
     elif training_steps:
         train=collect(paths[0])
     for step in range(1,training_steps+1):
-        r=rng.choice(train)
-        query=torch.tensor(r['query'],device=args.device)
-        teacher_query=torch.tensor(r['teacher_query'],device=args.device)
-        target=torch.tensor(r['teacher_out'],device=args.device)
-        y,dist,cb=student(query,teacher_query)
-        vq=(y-target).square().mean()/target.square().mean().clamp_min(1e-12)
-        loss=vq+.2*dist+.02*cb
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        batch=rng.sample(train,k=min(args.batch_size,len(train)))
+        totals=np.zeros(4)
+        # Sequential gradient accumulation keeps only one file's graph in memory.
+        for r in batch:
+            query=torch.tensor(r['query'],device=args.device)
+            teacher_query=torch.tensor(r['teacher_query'],device=args.device)
+            target=torch.tensor(r['teacher_out'],device=args.device)
+            y,dist,cb=student(query,teacher_query)
+            vq=(y-target).square().mean()/target.square().mean().clamp_min(1e-12)
+            loss=vq+args.distance_weight*dist+args.codebook_weight*cb
+            (loss/len(batch)).backward()
+            totals+=np.array([loss.item(),vq.item(),dist.item(),cb.item()])/len(batch)
         if student.delta.grad is None or not torch.isfinite(student.delta.grad).all():
             raise RuntimeError('Scale gradient missing or nonfinite')
         grad=float(student.delta.grad.norm())
         torch.nn.utils.clip_grad_norm_(student.parameters(),1.)
         optimizer.step()
         if step%25==0:
-            print(f'{step}: loss={loss.item():.6f} vqout={vq.item():.6f} distance={dist.item():.6f} codebook={cb.item():.6f} scale_grad={grad:.6g}',flush=True)
+            print(f'{step}: loss={totals[0]:.6f} vqout={totals[1]:.6f} distance={totals[2]:.6f} codebook={totals[3]:.6f} scale_grad={grad:.6g} batch={len(batch)} distance_weighted={args.distance_weight*totals[2]:.6f} codebook_weighted={args.codebook_weight*totals[3]:.6f}',flush=True)
         if step%args.eval_every==0 or step==training_steps:
             validate(step)
             torch.save(dict(scale_state=student.state_dict(),optimizer=optimizer.state_dict(),step=step,provenance=provenance),args.output_dir/'latest_scales.pt')
     for before,after in zip(books,extract_books(model)):
         np.testing.assert_array_equal(before,after)
     if best_step is None:
-        raise SystemExit('No integer-validation eligible scale checkpoint; see validation reports, no export.')
-    saved=torch.load(args.output_dir/'best_scales.pt',map_location=args.device,weights_only=False)
+        raise SystemExit('No eligible checkpoint under selected gate; diagnostic candidates and step snapshots retained, no final test or export.')
+    saved=torch.load(args.output_dir/selected_name,map_location=args.device,weights_only=False)
     student.load_state_dict(saved['scale_state'])
     test=collect(paths[2])  # test is not consulted for checkpoint selection
     final=evaluate(test,best_step,save=True)
@@ -265,13 +289,16 @@ def main():
     if not final['summary']['passed']:
         raise SystemExit('Final test retention failed; no deployment export.')
     scales=student.scales().detach().cpu().numpy()
-    manifest=export_package(args.output_dir/'export',quantize_books(books,scales),scales,output_scale,provenance=provenance,residual_scales=None if args.scale_mode=='v1' else initial)
+    export_dir=args.output_dir/('export' if args.gate_profile=='strict' else 'experimental_export')
+    manifest=export_package(export_dir,quantize_books(books,scales),scales,output_scale,provenance=provenance,residual_scales=None if args.scale_mode=='v1' else initial)
     if args.frontend=='integer':
-        export_projection(args.output_dir/'export',projection_output_scale(projection,scales[0]) if args.scale_mode=='v1' else projection)
+        export_projection(export_dir,projection_output_scale(projection,scales[0]) if args.scale_mode=='v1' else projection)
     manifest.update(frontend=args.frontend,projection_quantized=args.frontend=='integer',projection_manifest='projection_manifest.json' if args.frontend=='integer' else None,
-                    output_projection_quantized=False,rtl_verified=False)
-    (args.output_dir/'export'/'rvq_manifest.json').write_text(json.dumps(manifest,indent=2),encoding='utf-8')
-    print(f'Complete: best step={best_step}, export={args.output_dir / "export"}',flush=True)
+                    output_projection_quantized=False,rtl_verified=False,gate_profile=args.gate_profile,
+                    retention_pass=final['summary']['strict_pass'],experimental_retention_pass=final['summary']['experimental_pass'],
+                    deployment_approved=False,thresholds=final['summary']['thresholds'])
+    (export_dir/'rvq_manifest.json').write_text(json.dumps(manifest,indent=2),encoding='utf-8')
+    print(f'Complete: best step={best_step}, export={export_dir}',flush=True)
 
 
 if __name__=='__main__':

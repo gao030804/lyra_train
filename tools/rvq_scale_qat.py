@@ -172,7 +172,9 @@ def integer_encoder(model, wave):
     return walk(model.encoder,x,scale)
 
 
-def retention_summary(rows):
+def retention_summary(rows, gate_profile='strict'):
+    if gate_profile not in ('strict','experimental'):
+        raise ValueError('Unknown gate profile')
     sdr=np.array([r['aligned_si_sdr_delta'] for r in rows])
     errors=np.array([r['vqout_nmse'] for r in rows])
     result=dict(mean_si_sdr_delta=float(sdr.mean()),median_si_sdr_delta=float(np.median(sdr)),
@@ -180,7 +182,19 @@ def retention_summary(rows):
                 mean_corr_delta=float(np.mean([r['aligned_corr_delta'] for r in rows])),
                 mean_vqout_nmse=float(errors.mean()),p90_vqout_nmse=float(np.percentile(errors,90)),
                 worst_vqout_nmse=float(errors.max()),saturation=sum(r['saturation'] for r in rows))
-    result['passed']=bool(result['mean_si_sdr_delta'] >= -.05 and result['p10_si_sdr_delta'] >= -.20
-                          and result['worst_si_sdr_delta'] >= -.30 and result['mean_vqout_nmse'] <= .04
-                          and result['p90_vqout_nmse'] <= .08 and result['saturation']==0)
+    audio_ok=bool(result['mean_si_sdr_delta'] >= -.05 and result['p10_si_sdr_delta'] >= -.20
+                  and result['worst_si_sdr_delta'] >= -.30 and result['saturation']==0)
+    result['audio_pass']=audio_ok
+    result['strict_pass']=bool(audio_ok and result['mean_vqout_nmse'] <= .04 and result['p90_vqout_nmse'] <= .08)
+    result['experimental_pass']=bool(audio_ok and result['mean_vqout_nmse'] <= .05 and result['p90_vqout_nmse'] <= .10)
+    result['gate_profile']=gate_profile
+    result['thresholds']=dict(mean_si_sdr_delta=-.05,p10_si_sdr_delta=-.20,worst_si_sdr_delta=-.30,
+        mean_vqout_nmse=.04 if gate_profile=='strict' else .05,
+        p90_vqout_nmse=.08 if gate_profile=='strict' else .10,saturation=0)
+    result['passed']=result[gate_profile+'_pass']
+    for q in range(3):
+        key=f'q{q:02d}'
+        if all(key in r for r in rows):
+            for metric in ('index_flip','energy_weighted_flip'):
+                result[f'{key}_{metric}']=float(np.mean([r[key][metric] for r in rows]))
     return result

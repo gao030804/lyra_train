@@ -9,6 +9,35 @@ from tools.integer_rvq_reference import run_integer,lookup,export_package,ratio_
 
 
 class ScaleQATTests(unittest.TestCase):
+    def test_experimental_gate_does_not_override_strict(self):
+        rows=[dict(aligned_si_sdr_delta=-.01,aligned_corr_delta=0,vqout_nmse=.047,
+                   saturation=0,q00=dict(index_flip=.1,energy_weighted_flip=.02)) for _ in range(10)]
+        strict=retention_summary(rows)
+        experiment=retention_summary(rows,'experimental')
+        self.assertFalse(strict['passed'])
+        self.assertTrue(experiment['passed'])
+        self.assertFalse(experiment['strict_pass'])
+        self.assertTrue(experiment['audio_pass'])
+        self.assertAlmostEqual(experiment['q00_index_flip'],.1)
+        self.assertAlmostEqual(experiment['q00_energy_weighted_flip'],.02)
+        rows[0]['saturation']=1
+        self.assertFalse(retention_summary(rows,'experimental')['passed'])
+
+    def test_accumulated_batch_matches_mean_gradient(self):
+        rng=np.random.default_rng(21)
+        books=[rng.normal(size=(8,4)) for _ in range(2)]
+        a=ScaleRVQ(books,[.02,.01],.001,max_ratio=1.08)
+        b=ScaleRVQ(books,[.02,.01],.001,max_ratio=1.08)
+        queries=[torch.tensor(rng.normal(size=(1,8,4))) for _ in range(4)]
+        losses=[]
+        for x in queries:
+            y,d,c=a(x,x)
+            losses.append(y.square().mean()+.1*d+.02*c)
+            y,d,c=b(x,x)
+            ((y.square().mean()+.1*d+.02*c)/len(queries)).backward()
+        torch.stack(losses).mean().backward()
+        torch.testing.assert_close(a.delta.grad,b.delta.grad)
+
     def test_step_zero_baseline_guard(self):
         from tools.train_rvq_quant_scales import verify_ptq_baseline
         row=dict(path='audio.flac',start_sample=100,aligned_si_sdr_delta=.07,
