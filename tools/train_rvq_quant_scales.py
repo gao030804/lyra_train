@@ -13,6 +13,7 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from tools.rvq_scale_qat import ScaleRVQ, integer_encoder, make_projection, project_integer, export_projection, retention_summary, projection_output_scale, audio_first_key
 from tools.analyze_rvq_codebook_quantization import read_manifest, extract_books, audio_metrics, nmse
 from tools.integer_rvq_reference import clip16, round_away, quantize_books, run_integer, export_package, lookup
+from tools.rvq_output_calibration import raw_output, output_diagnostics, calibrate_output_scale
 
 
 def digest(path):
@@ -40,6 +41,55 @@ def verify_ptq_baseline(report, baseline):
             raise ValueError(f'Step0 saturation mismatch: {k}')
 
 
+def restore_scales(student, saved, provenance):
+    """Warm start delta only, rejecting foreign models, scales and numerical modes."""
+    old=saved['provenance']
+    for key in ('checkpoint_sha256','ptq_report_sha256'):
+        if old[key]!=provenance[key]:
+            raise ValueError(f'Resume provenance mismatch: {key}')
+    for key in ('frontend','scale_mode','max_ratio'):
+        if old['args'][key]!=provenance['args'][key]:
+            raise ValueError(f'Resume numerical configuration mismatch: {key}')
+    state=saved['scale_state']
+    for key,value in student.state_dict().items():
+        if key!='delta' and (key not in state or not torch.equal(value.cpu(),state[key].cpu())):
+            raise ValueError(f'Resume frozen state mismatch: {key}')
+    delta=state['delta']
+    if delta.shape!=student.delta.shape or not torch.isfinite(delta).all():
+        raise ValueError('Invalid resume delta')
+    floor=saved.get('scale_floor',torch.zeros_like(student.initial)).to(student.initial)
+    if floor.shape!=student.initial.shape or not torch.isfinite(floor).all() or (floor<0).any() or (floor>student.initial*np.exp(student.log_range)).any():
+        raise ValueError('Invalid resume scale floor')
+    with torch.no_grad():
+        student.delta.copy_(delta)
+        student.scale_floor.copy_(floor)
+
+
+def crop_starts(samples, length, positions):
+    if samples<length or any(not 0<=p<=1 for p in positions):
+        raise ValueError('Invalid crop duration/positions')
+    return list(dict.fromkeys(int((samples-length)*p) for p in positions))
+
+
+def restore_calibrated_candidate(student, artifact, provenance, gate_profile):
+    if artifact.get('artifact_type')!='frozen_output_calibration':
+        raise ValueError('Expected frozen output-calibration artifact, not a training checkpoint')
+    validation=artifact['validation']
+    if not validation['summary'].get(gate_profile+'_pass',False):
+        raise ValueError('Candidate has not passed requested validation gate')
+    if not validation.get('indices_unchanged',False):
+        raise ValueError('Candidate has no unchanged-index calibration verification')
+    scale=float(artifact['calibrated_output_scale'])
+    if not np.isfinite(scale) or scale<=0 or scale!=float(artifact['calibration']['new_output_scale']):
+        raise ValueError('Invalid or inconsistent calibrated output scale')
+    if scale!=float(validation['output_scale']):
+        raise ValueError('Validated output scale differs from artifact')
+    restore_scales(student,artifact,provenance)
+    if not np.array_equal(student.scales().detach().cpu().numpy(),np.asarray(validation['scales'])):
+        raise ValueError('Loaded scales differ from calibrated validation')
+    return scale
+
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     for name in ('checkpoint','ptq-report','train-manifest','validation-manifest','test-manifest','output-dir'):
@@ -55,18 +105,39 @@ def main():
     p.add_argument('--distance-weight',type=float,default=.1)
     p.add_argument('--codebook-weight',type=float,default=.02)
     p.add_argument('--gate-profile',choices=['strict','experimental'],default='strict')
+    p.add_argument('--resume-scales',type=Path,help='Warm start scale delta; fresh optimizer and local step counter')
+    p.add_argument('--train-crop-positions',type=float,nargs='+',default=[.25,.5,.75])
+    p.add_argument('--energy-weighted-kl',action=argparse.BooleanOptionalAction,default=True)
+    p.add_argument('--anchor-weight',type=float,default=.001)
+    p.add_argument('--input-scale-safety-margin',type=float,default=1.01,help='Train-only query-derived q0 floor, 0 disables')
+    p.add_argument('--diagnostic-test-candidate',action='store_true',help='Evaluate one audio candidate on test; never export')
+    p.add_argument('--calibrate-output-only',action='store_true',help='Frozen candidate, train-only output calibration, validation listening; no training/test/export')
+    p.add_argument('--output-headroom',type=float,default=1.05)
+    p.add_argument('--evaluate-output-calibrated',type=Path,
+                   help='One frozen calibrated candidate on test only; no training, calibration, selection or export')
     p.add_argument('--topk',type=int,default=8)
     p.add_argument('--temperature',type=float,default=.1)
     p.add_argument('--segment-seconds',type=float,default=4.)
     p.add_argument('--seed',type=int,default=42)
     p.add_argument('--device',choices=['cpu','cuda'],default='cuda')
     args=p.parse_args()
+    if args.evaluate_output_calibrated and (args.steps!=0 or args.frontend!='rvq-only' or args.scale_mode!='v1' or
+            args.resume_scales or args.calibrate_output_only or args.diagnostic_test_candidate):
+        raise ValueError('Calibrated test requires steps=0, rvq-only/V1 and no other resume/calibration/test mode')
+    if args.calibrate_output_only and (not args.resume_scales or args.steps!=0 or args.frontend!='rvq-only' or args.scale_mode!='v1' or args.diagnostic_test_candidate):
+        raise ValueError('Output calibration requires resume-scales, steps=0, rvq-only/V1 and no diagnostic-test-candidate')
+    if not np.isfinite(args.output_headroom) or args.output_headroom<1:
+        raise ValueError('Output headroom must be finite and >=1')
     if args.frontend=='rvq-only' and args.scale_mode!='v1':
         raise ValueError('RVQ-only baseline reproduction currently requires V1')
     if args.steps < 0 or min(args.eval_every,args.lr,args.segment_seconds)<=0:
         raise ValueError('Steps, LR, interval and duration must be positive')
     if args.batch_size < 1 or min(args.distance_weight,args.codebook_weight) < 0:
         raise ValueError('Invalid batch size or loss weights')
+    if args.anchor_weight<0 or any(not 0<=x<=1 for x in args.train_crop_positions):
+        raise ValueError('Invalid anchor/crop settings')
+    if args.input_scale_safety_margin!=0 and args.input_scale_safety_margin<1:
+        raise ValueError('Input safety margin must be >=1 or zero')
     from infer_soundstream import load_checkpoint,soundstream_from_checkpoint,load_audio
     from tools.export_encoder_integer_goldens import full_qat_proven
     torch.manual_seed(args.seed)
@@ -103,14 +174,17 @@ def main():
         raise ValueError('Segment too short')
     projection=None
     @torch.no_grad()
-    def collect(split):
+    def collect(split,training=False):
         nonlocal projection
         records=[]
-        for i,path in enumerate(split):
+        jobs=[]
+        for path in split:
+            samples=load_audio(path,sr).shape[-1]
+            jobs.extend((path,start) for start in crop_starts(samples,length,args.train_crop_positions if training else [.5]))
+        for i,(path,start) in enumerate(jobs):
             wave=load_audio(path,sr)
             if wave.shape[-1]<length:
                 raise ValueError(f'Audio too short: {path}')
-            start=(wave.shape[-1]-length)//2
             wave=wave[:,start:start+length].unsqueeze(0)
             # The integer Encoder consumes the same explicitly rounded PCM as teacher.
             pcm=clip16(round_away(wave.numpy()*32768))
@@ -139,10 +213,10 @@ def main():
                 query=query,teacher_query=fp_query.cpu().numpy(),
                 teacher_out=fp_out.cpu().numpy(),teacher_indices=fp_indices[0].cpu().numpy(),
                 teacher_audio=audio,wave=wave.numpy()))
-            print(f'cached {i+1}/{len(split)} {path.name}',flush=True)
+            print(f'cached {i+1}/{len(jobs)} {path.name} start={start}',flush=True)
         return records
-    validation=collect(paths[1])
-    student=ScaleRVQ(books,initial,output_scale,args.max_ratio,args.topk,args.temperature,args.scale_mode).to(args.device)
+    validation=[] if args.evaluate_output_calibrated else collect(paths[1])
+    student=ScaleRVQ(books,initial,output_scale,args.max_ratio,args.topk,args.temperature,args.scale_mode,args.energy_weighted_kl).to(args.device)
     optimizer=torch.optim.Adam(student.parameters(),lr=args.lr,weight_decay=0)
     provenance=dict(checkpoint=str(args.checkpoint.resolve()),checkpoint_sha256=digest(args.checkpoint),
                     ptq_report=str(args.ptq_report.resolve()),ptq_report_sha256=digest(args.ptq_report),
@@ -151,7 +225,10 @@ def main():
     (args.output_dir/'run_config.json').write_text(json.dumps(provenance,indent=2),encoding='utf-8')
 
     @torch.no_grad()
-    def evaluate(records,step,save=False):
+    def evaluate(records,step,save=False,save_dir=None):
+        destination=args.output_dir if save_dir is None else save_dir
+        if save:
+            destination.mkdir(parents=True,exist_ok=True)
         scales=student.scales().cpu().numpy()
         qbooks=quantize_books(books,scales)
         residual_scales = None if args.scale_mode == 'v1' else initial
@@ -171,7 +248,7 @@ def main():
             np.testing.assert_array_equal(y,lookup(indices,qbooks,scales,output_scale))
             # Count final output clipping as well as search/state boundaries.
             from tools.integer_rvq_reference import requant,ratio_parameters
-            pre_output=sum(requant(book[indices[...,q]].astype(np.int64),*ratio_parameters(scales[q]/output_scale)) for q,book in enumerate(qbooks))
+            pre_output=raw_output(indices,qbooks,scales,output_scale)
             saturation_detail=dict(projection=projection_sat,search=[t['search_saturation'] for t in trace],
                 residual=[t['saturation'] for t in trace],output=int(np.count_nonzero((pre_output < -32768)|(pre_output > 32767))))
             sat=projection_sat+sum(saturation_detail['search'])+sum(saturation_detail['residual'])+saturation_detail['output']
@@ -182,7 +259,9 @@ def main():
             before=audio_metrics(r['wave'],r['teacher_audio'],sr)
             after=audio_metrics(r['wave'],decoded,sr)
             row=dict(path=r['path'],start_sample=r['start_sample'],aligned_si_sdr_delta=after['aligned_si_sdr']-before['aligned_si_sdr'],
-                     aligned_corr_delta=after['aligned_corr']-before['aligned_corr'],vqout_nmse=nmse(y.astype(float)*output_scale,r['teacher_out']),saturation=sat,saturation_detail=saturation_detail)
+                     aligned_corr_delta=after['aligned_corr']-before['aligned_corr'],vqout_nmse=nmse(y.astype(float)*output_scale,r['teacher_out']),saturation=sat,saturation_detail=saturation_detail,
+                     output_diagnostics=output_diagnostics(pre_output,output_scale),
+                     indices_sha256=hashlib.sha256(indices.astype('<i4').tobytes()).hexdigest())
             residual=r['teacher_query'].astype(float).copy()
             base_energy=max(float(np.mean(residual**2)),1e-12)
             for q,book in enumerate(books):
@@ -204,15 +283,15 @@ def main():
             if save:
                 import soundfile as sf
                 for label,audio in [('original',r['wave']),('fp_codebook',r['teacher_audio']),('scale_qat',decoded)]:
-                    sf.write(str(args.output_dir/f'{i:02d}_{label}.wav'),audio.reshape(-1),sr,subtype='FLOAT')
+                    sf.write(str(destination/f'{i:02d}_{label}.wav'),audio.reshape(-1),sr,subtype='FLOAT')
                 golden=dict(input_int16=query_int,indices=indices,output_int16=y)
                 if args.frontend=='integer':
                     golden.update(pcm=r['pcm'],encoder_int16=r['encoder_int'],projection_int16=query_int)
                 for q,t in enumerate(trace):
                     for key in ('stored_residual','residual','scores','after_subtract'):
                         golden[f'q{q:02d}_{key}']=t[key]
-                np.savez(args.output_dir/f'golden_{i:02d}.npz',**golden)
-        report=dict(step=step,frontend=args.frontend,scale_mode=args.scale_mode,scales=scales.tolist(),summary=retention_summary(rows,args.gate_profile),per_file=rows,rtl_verified=False,
+                np.savez(destination/f'golden_{i:02d}.npz',**golden)
+        report=dict(step=step,frontend=args.frontend,scale_mode=args.scale_mode,scales=scales.tolist(),output_scale=output_scale,summary=retention_summary(rows,args.gate_profile),per_file=rows,rtl_verified=False,
                     rtl_index_mismatch_count=None,rtl_latent_mismatch_count=None)
         return report
 
@@ -224,13 +303,10 @@ def main():
         nonlocal best_key,best_step
         report=evaluate(validation,step)
         (args.output_dir/f'validation_{step:05d}.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
-        if step==0 and args.frontend=='rvq-only':
-            verify_ptq_baseline(report,ptq)
-            print('Step0 PTQ baseline reproduction PASSED',flush=True)
         s=report['summary']
         print(f'integer validation step={step} {s}',flush=True)
         key=audio_first_key(s)
-        payload=dict(scale_state=student.state_dict(),optimizer=optimizer.state_dict(),step=step,
+        payload=dict(scale_state=student.state_dict(),effective_scales=student.scales().detach().cpu(),scale_floor=student.scale_floor.detach().cpu(),optimizer=optimizer.state_dict(),step=step,
                      validation=report,provenance=provenance,retention_pass=s['strict_pass'],
                      experimental_pass=s['experimental_pass'],deployment_approved=False)
         torch.save(payload,args.output_dir/f'scales_step_{step:05d}.pt')
@@ -245,6 +321,84 @@ def main():
                 print(f'saving {filename} step={step} strict={s["strict_pass"]} experimental={s["experimental_pass"]}',flush=True)
         if s['passed'] and (best_key is None or key<best_key):
             best_key,best_step=key,step
+    if args.frontend=='rvq-only' and not args.evaluate_output_calibrated:
+        baseline_paths=[Path(r['path']).resolve() for r in ptq['per_file']]
+        # Enlarged validation must retain the original baseline cohort (no test leakage).
+        if not set(baseline_paths)<=set(paths[1]):
+            raise ValueError('Validation manifest must contain all original PTQ evaluation files')
+        subset=[r for r in validation if Path(r['path']).resolve() in set(baseline_paths)]
+        baseline=evaluate(subset,0)
+        verify_ptq_baseline(baseline,ptq)
+        (args.output_dir/'ptq_baseline_reproduction.json').write_text(json.dumps(baseline,indent=2),encoding='utf-8')
+        print('Step0 PTQ baseline reproduction PASSED (before resume)',flush=True)
+    if args.evaluate_output_calibrated:
+        artifact=torch.load(args.evaluate_output_calibrated,map_location=args.device,weights_only=False)
+        # The selected test cohort may be expanded, but not overlap any prior optimization/calibration/validation source.
+        prior=artifact['provenance']
+        used={Path(x).resolve() for key in ('train_sources','validation_sources') for x in prior[key]}
+        used.update(Path(r['path']).resolve() for r in artifact['calibration']['calibration_sources'])
+        if used & set(paths[2]) or {digest(x) for x in used} & hashes[2]:
+            raise ValueError('Final test overlaps candidate training/calibration/validation data')
+        output_scale=restore_calibrated_candidate(student,artifact,provenance,args.gate_profile)
+        student.requires_grad_(False)
+        source_step=artifact['source_step']
+        print(f'Frozen calibrated test: source_step={source_step}, output_scale={output_scale:.12g}',flush=True)
+        final=evaluate(collect(paths[2]),source_step,save=True,save_dir=args.output_dir/'test_audio')
+        final.update(evaluation_only=True,candidate=str(args.evaluate_output_calibrated.resolve()),
+                     candidate_sha256=digest(args.evaluate_output_calibrated),
+                     deployment_approved=False,full_integer_frontend_verified=False,
+                     test_used_for_selection=False,export_allowed=False)
+        (args.output_dir/'calibrated_test_report.json').write_text(json.dumps(final,indent=2),encoding='utf-8')
+        print(f'Calibrated test summary: {final["summary"]}',flush=True)
+        print('Test complete; no training, recalibration or deployment export. Do not tune on this test set.',flush=True)
+        if not final['summary']['passed']:
+            raise SystemExit('Frozen calibrated candidate failed final test retention; report saved.')
+        return
+    if args.resume_scales:
+        saved=torch.load(args.resume_scales,map_location=args.device,weights_only=False)
+        restore_scales(student,saved,provenance)
+        provenance['scale_resume']=dict(path=str(args.resume_scales.resolve()),sha256=digest(args.resume_scales),source_step=saved['step'],optimizer_restored=False)
+        print(f'Restored scales from source step={saved["step"]}; fresh optimizer',flush=True)
+    anchor=student.scales().detach().clone()
+    (args.output_dir/'run_config.json').write_text(json.dumps(provenance,indent=2),encoding='utf-8')
+    if args.calibrate_output_only:
+        student.requires_grad_(False)
+        frozen={k:v.detach().clone() for k,v in student.state_dict().items()}
+        source_step=provenance['scale_resume']['source_step']
+        before=evaluate(validation,source_step,save=True,save_dir=args.output_dir/'before')
+        (args.output_dir/'before_report.json').write_text(json.dumps(before,indent=2),encoding='utf-8')
+        calibration=collect(paths[0],training=True)
+        scales=student.scales().detach().cpu().numpy()
+        qbooks=quantize_books(books,scales)
+        index_batches=[]
+        for r in calibration:
+            query=clip16(round_away(r['query']/float(scales[0])))
+            _,indices,_=run_integer(query,qbooks,scales,output_scale)
+            index_batches.append(indices)
+        output_scale,calibration_info=calibrate_output_scale(index_batches,qbooks,scales,output_scale,args.output_headroom)
+        calibration_info.update(calibration_sources=[dict(path=r['path'],start_sample=r['start_sample']) for r in calibration],
+                                scale_selection_split='train',validation_used_for_scale_selection=False)
+        (args.output_dir/'output_calibration.json').write_text(json.dumps(calibration_info,indent=2),encoding='utf-8')
+        after=evaluate(validation,source_step,save=True,save_dir=args.output_dir/'after')
+        for old,new in zip(before['per_file'],after['per_file']):
+            if old['indices_sha256']!=new['indices_sha256']:
+                raise RuntimeError('Output calibration changed RVQ indices')
+        for key,value in frozen.items():
+            torch.testing.assert_close(student.state_dict()[key],value,rtol=0,atol=0)
+        for original,current in zip(books,extract_books(model)):
+            np.testing.assert_array_equal(original,current)
+        after.update(diagnostic_only=True,export_allowed=False,deployment_approved=False,
+                     indices_unchanged=True,test_evaluated=False)
+        (args.output_dir/'after_report.json').write_text(json.dumps(after,indent=2),encoding='utf-8')
+        torch.save(dict(artifact_type='frozen_output_calibration',scale_state=student.state_dict(),
+            scale_floor=student.scale_floor.detach().cpu(),calibrated_output_scale=output_scale,
+            source_step=source_step,provenance=provenance,calibration=calibration_info,
+            validation=after,deployment_approved=False),args.output_dir/'output_calibrated_candidate.pt')
+        print(f'Output calibration complete: {calibration_info["old_output_scale"]:.9g} -> {output_scale:.9g}',flush=True)
+        print(f'Before: {before["summary"]}',flush=True)
+        print(f'After: {after["summary"]}',flush=True)
+        print('Validation listening written to before/ and after/; no training, no test, no deployment export.',flush=True)
+        return
     validate(0)
     train=[]
     training_steps=args.steps
@@ -252,11 +406,20 @@ def main():
         print('Initial integer PTQ passed; skipping scale optimization.',flush=True)
         training_steps=0
     elif training_steps:
-        train=collect(paths[0])
+        train=collect(paths[0],training=True)
+        if args.frontend=='rvq-only' and args.input_scale_safety_margin:
+            floor=args.input_scale_safety_margin*max(float(np.abs(r['query']).max()) for r in train)/32767.
+            if floor>float(student.initial[0]*np.exp(student.log_range)):
+                raise ValueError('Training-derived input scale floor exceeds allowed scale range')
+            # Do not silently alter the warm-start working point.
+            if floor>float(student.scales()[0].detach()):
+                raise ValueError('Input safety floor would alter initialization; inspect saturation and recalibrate first')
+            student.scale_floor[0]=max(float(student.scale_floor[0]),floor)
+            print(f'Train-only q0 scale floor={float(student.scale_floor[0]):.9g}',flush=True)
     for step in range(1,training_steps+1):
         optimizer.zero_grad(set_to_none=True)
         batch=rng.sample(train,k=min(args.batch_size,len(train)))
-        totals=np.zeros(4)
+        totals=np.zeros(5)
         # Sequential gradient accumulation keeps only one file's graph in memory.
         for r in batch:
             query=torch.tensor(r['query'],device=args.device)
@@ -264,25 +427,39 @@ def main():
             target=torch.tensor(r['teacher_out'],device=args.device)
             y,dist,cb=student(query,teacher_query)
             vq=(y-target).square().mean()/target.square().mean().clamp_min(1e-12)
-            loss=vq+args.distance_weight*dist+args.codebook_weight*cb
+            anchor_loss=torch.log(student.scales()/anchor).square().sum()
+            loss=vq+args.distance_weight*dist+args.codebook_weight*cb+args.anchor_weight*anchor_loss
             (loss/len(batch)).backward()
-            totals+=np.array([loss.item(),vq.item(),dist.item(),cb.item()])/len(batch)
+            totals+=np.array([loss.item(),vq.item(),dist.item(),cb.item(),anchor_loss.item()])/len(batch)
         if student.delta.grad is None or not torch.isfinite(student.delta.grad).all():
             raise RuntimeError('Scale gradient missing or nonfinite')
         grad=float(student.delta.grad.norm())
         torch.nn.utils.clip_grad_norm_(student.parameters(),1.)
         optimizer.step()
         if step%25==0:
-            print(f'{step}: loss={totals[0]:.6f} vqout={totals[1]:.6f} distance={totals[2]:.6f} codebook={totals[3]:.6f} scale_grad={grad:.6g} batch={len(batch)} distance_weighted={args.distance_weight*totals[2]:.6f} codebook_weighted={args.codebook_weight*totals[3]:.6f}',flush=True)
+            print(f'{step}: loss={totals[0]:.6f} vqout={totals[1]:.6f} distance={totals[2]:.6f} codebook={totals[3]:.6f} scale_grad={grad:.6g} batch={len(batch)} distance_weighted={args.distance_weight*totals[2]:.6f} anchor_weighted={args.anchor_weight*totals[4]:.8f}',flush=True)
         if step%args.eval_every==0 or step==training_steps:
             validate(step)
-            torch.save(dict(scale_state=student.state_dict(),optimizer=optimizer.state_dict(),step=step,provenance=provenance),args.output_dir/'latest_scales.pt')
+            torch.save(dict(scale_state=student.state_dict(),scale_floor=student.scale_floor.detach().cpu(),optimizer=optimizer.state_dict(),step=step,provenance=provenance),args.output_dir/'latest_scales.pt')
     for before,after in zip(books,extract_books(model)):
         np.testing.assert_array_equal(before,after)
+    if args.diagnostic_test_candidate:
+        candidate=args.output_dir/'best_audio_candidate_scales.pt'
+        if not candidate.is_file():
+            raise SystemExit('No audio-eligible diagnostic candidate; test not consulted')
+        saved=torch.load(candidate,map_location=args.device,weights_only=False)
+        student.load_state_dict(saved['scale_state'])
+        student.scale_floor.copy_(saved['scale_floor'].to(args.device))
+        diagnostic=evaluate(collect(paths[2]),saved['step'],save=True)
+        diagnostic.update(diagnostic_only=True,export_allowed=False,deployment_approved=False)
+        (args.output_dir/'diagnostic_test_report.json').write_text(json.dumps(diagnostic,indent=2),encoding='utf-8')
+        print('Diagnostic test complete; export prohibited. Do not tune on this test set.',flush=True)
+        return
     if best_step is None:
         raise SystemExit('No eligible checkpoint under selected gate; diagnostic candidates and step snapshots retained, no final test or export.')
     saved=torch.load(args.output_dir/selected_name,map_location=args.device,weights_only=False)
     student.load_state_dict(saved['scale_state'])
+    student.scale_floor.copy_(saved['scale_floor'].to(args.device))
     test=collect(paths[2])  # test is not consulted for checkpoint selection
     final=evaluate(test,best_step,save=True)
     (args.output_dir/'final_test_report.json').write_text(json.dumps(final,indent=2),encoding='utf-8')

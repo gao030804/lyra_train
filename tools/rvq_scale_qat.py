@@ -19,7 +19,7 @@ def fake_quant(x, scale, low, high):
 
 
 class ScaleRVQ(nn.Module):
-    def __init__(self, books, scales, output_scale, max_ratio=1.15, topk=8, temperature=.1, scale_mode='v1'):
+    def __init__(self, books, scales, output_scale, max_ratio=1.15, topk=8, temperature=.1, scale_mode='v1', energy_weighted=True):
         super().__init__()
         if max_ratio <= 1 or temperature <= 0 or topk < 2:
             raise ValueError('Invalid scale bounds or distance distillation configuration')
@@ -33,10 +33,12 @@ class ScaleRVQ(nn.Module):
         if scale_mode not in ('v1', 'v2'):
             raise ValueError('scale_mode must be v1 or v2')
         self.scale_mode = scale_mode
+        self.energy_weighted = energy_weighted
+        self.register_buffer('scale_floor',torch.zeros(len(scales),dtype=torch.float64),persistent=False)
 
     def scales(self):
         # Exact interval [s0 / max_ratio, s0 * max_ratio].
-        return self.initial * torch.exp(self.log_range * torch.tanh(self.delta))
+        return torch.maximum(self.initial * torch.exp(self.log_range * torch.tanh(self.delta)),self.scale_floor)
 
     def forward(self, query, teacher_query):
         scales = self.scales()
@@ -59,9 +61,16 @@ class ScaleRVQ(nn.Module):
                 normalization = td_top.mean(-1, keepdim=True).clamp_min(1e-8)
                 prob = (-td_top/normalization/self.temperature).softmax(-1)
             student_top = distances.gather(-1, candidates)
-            dist_loss = dist_loss + weights[min(q,8)] * F.kl_div(
+            kl = F.kl_div(
                 (-student_top/normalization/self.temperature).log_softmax(-1), prob,
-                reduction='none').sum(-1).mean()
+                reduction='none').sum(-1)
+            if self.energy_weighted:
+                energy=teacher_residual.detach().square().mean(-1)
+                frame_weight=(energy/energy.mean().clamp_min(1e-8)).clamp(.25,4.)
+                stage_kl=(kl*frame_weight).sum()/frame_weight.sum().clamp_min(1e-8)
+            else:
+                stage_kl=kl.mean()
+            dist_loss = dist_loss + weights[min(q,8)] * stage_kl
             selected = qb[distances.detach().argmin(-1)]
             quantized = quantized + fake_quant(selected, self.output_scale, -2**31, 2**31-1)
             residual = residual - (selected if self.scale_mode == 'v1' else fake_quant(selected, self.initial[q], -32768,32767))

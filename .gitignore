@@ -196,3 +196,6 @@ corpora/
 Thumbs.db
 desktop.ini
 !tools/compare_rvq_integer_goldens.py
+!tools/rvq_output_calibration.py
+!tools/integer_codec_package.py
+!tools/reconstruct_integer_codec.py

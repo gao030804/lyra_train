@@ -1,5 +1,129 @@
 # Projection整数化与RVQ scale-only QAT
 
+## 校准候选的独立测试入口（2026-09-27）
+
+新增 `--evaluate-output-calibrated <output_calibrated_candidate.pt>`，配合steps=0、
+frontend=rvq-only、scale-mode=v1、max-ratio=1.08、gate-profile=experimental。
+不能同时resume-scales、calibrate-output-only或diagnostic-test-candidate。
+只加载已在validation通过指定门槛的校准artifact，核对原模型/PTQ报告哈希、
+冻结state、码本scale、校准output_scale与验证报告一致。
+直接对指定test清单评价，不重新训练、校准或根据test选候选，也不自动导出。
+检查test与本轮及候选历史train/validation/calibration的路径和内容哈希无交集。
+不再对验证集重跑模型，仅读取其清单用于隔离检查。
+
+结果 `calibrated_test_report.json`、`test_audio/`同编号的original/fp_codebook/scale_qat音频及golden。
+保持原segment-seconds=4为中心片段评价，并非长流stateful测试。
+该模式使用独立新output-dir，不能覆写校准目录。
+测试失败保存报告后非零退出；通过也只表示RVQ-only测试通过，不是全整数或RTL通过。
+推荐使用新的固定50条测试清单；若其中部分测试音频此前已用于调参，应另留未见数据，
+程序只能检查文件隔离，不能证明实验历史中没有看过test。
+
+## 2026-09-27 冻结候选的输出范围校准（不训练、不碰测试集）
+
+新增 `--calibrate-output-only --output-headroom 1.05`，必须组合
+`--resume-scales <原始scale快照> --steps 0 --frontend rvq-only --scale-mode v1`。
+与diagnostic-test-candidate互斥。推荐先固定local-refine step50这一个候选，
+不要根据测试结果反复挑选候选/裕量。
+
+步骤：复现原PTQ → 加载候选并冻结 → 保存验证集before音频和指标 →
+只用train多裁剪缓存的实际选中INT8码字之和，计算输出范围及5%裕量 →
+重算每级输出乘子/移位并检查校准集零输出饱和 → 验证集after音频和整数评价。
+新output_scale不小于原值，预留逐级舍入误差；若校准集仍饱和，只根据校准集适当扩大。
+验证集不参与scale选择，若验证仍失败如实记录，不自动放大来通过。
+逐文件核对indices哈希不变、scale参数和浮点码本不变。
+
+需同步新增 `tools/rvq_output_calibration.py` 与修改的 `tools/train_rvq_quant_scales.py`，
+测试新增 `tests/test_rvq_output_calibration.py`。原有依赖也应保持最新版。
+
+```bash
+cd /home/deploy/gyh/lyra_md
+conda activate lyra
+python -m py_compile tools/train_rvq_quant_scales.py tools/rvq_output_calibration.py
+python -m unittest discover -s tests -p test_rvq_output_calibration.py -v
+
+RUN_TAG="rvq-output-cal-step50-$(date +%Y%m%d-%H%M%S)"
+CAL_DIR="results/$RUN_TAG"
+CAL_LOG="logs/$RUN_TAG.log"
+mkdir -p logs
+nohup setsid env CUDA_VISIBLE_DEVICES=0 python -u tools/train_rvq_quant_scales.py \
+  --checkpoint results/hardware-qat-w8a16-reference-fix-20260922-222030/best_full_qat.pt \
+  --ptq-report results/rvq-v1-maxscale-20260926-235517/rvq_ptq_report.json \
+  --train-manifest results/rvq-scale-qat-20260924-092506-manifests/train.csv \
+  --validation-manifest results/rvq-scale-qat-20260924-092506-manifests/validation.csv \
+  --test-manifest results/rvq-scale-qat-20260924-092506-manifests/test.csv \
+  --resume-scales results/rvq-v1-local-refine-20260927-010027/scales_step_00050.pt \
+  --output-dir "$CAL_DIR" --frontend rvq-only --scale-mode v1 \
+  --steps 0 --max-ratio 1.08 --calibrate-output-only --output-headroom 1.05 \
+  --train-crop-positions 0.25 0.5 0.75 --gate-profile experimental \
+  --segment-seconds 4 --device cuda </dev/null >"$CAL_LOG" 2>&1 &
+echo "PID=$! LOG=$CAL_LOG RESULTS=$CAL_DIR"
+tail -F "$CAL_LOG"
+```
+
+仍要求test-manifest以校验split隔离，但此模式不运行测试集前向/评价。
+输出：`output_calibration.json`、`before_report.json`、`after_report.json`、
+`before/`和`after/`同编号试听wav及golden。音频为4秒中心片段，不是完整长音频。
+每条新增output_diagnostics：preclip min/max、超出整数幅度和最多16个位置（B,T,D）。
+`output_calibrated_candidate.pt`是独立校准诊断artifact，包含原scale_state和新的calibrated_output_scale，
+不冒充可直接resume的训练checkpoint；未提供直接部署加载入口。
+报告始终diagnostic_only=true/deployment_approved=false，没有硬件export目录；
+后续正式集成需同时使用新输出scale和各级输出requant参数，并在独立测试与RTL完成验收。
+
+## 2026-09-27 step100 局部 refine（最新）
+
+新增 `--resume-scales`：仅恢复delta及已保存的scale安全下界，fresh Adam、不恢复旧LR或步数。
+校验来源checkpoint/PTQ报告SHA256、frontend、scale-mode、max-ratio、所有冻结码本和initial/output scale。
+不兼容就拒绝，禁止用另一模型的scale续训。新实验step0是加载后的候选，不是原PTQ；
+`ptq_baseline_reproduction.json`先在delta=0时对原PTQ验证文件单独复现。
+扩大的validation必须包含旧PTQ报告全部文件；使用相同数据根目录、seed和排序生成60条时保留原20条。
+`run_config.json`记录源快照哈希、源step和optimizer_restored=false。
+
+训练集默认三裁剪 `--train-crop-positions 0.25 0.5 0.75`，比例定义为可用起始位置范围
+`[0, samples-segment_length]`中的25/50/75%，不是三个裁剪中心；重复位置自动去重。
+validation/test固定中心不变。清单生成默认128训练/60验证/50测试，说话人划分不变。
+旧CSV不会自动扩容，必须在新目录重新生成；旧的20条已反复用于调参，不把新增测试数据用于选择。
+
+`--energy-weighted-kl`默认启用，按每级teacher residual逐帧能量归一化，
+权重clip到[0.25,4]，用加权和除权重和；teacher能量不参与梯度。
+可用`--no-energy-weighted-kl`复现旧损失，margin-aware weighting本轮不引入。
+新增 `--anchor-weight 0.001`，约束sum(log(s/s_ref)^2)，s_ref为加载后的候选；不改变码本参数。
+
+RVQ-only训练时q0安全下界默认 `1.01*max_train_abs_query/32767`，只从训练缓存计算。
+若超出scale允许上界或会立刻改变初始化工作点，直接报错要求检查/重新校准，不静默改候选。
+`--input-scale-safety-margin 0`可关闭。此下界不保证后级residual或最终output不饱和，
+仍检查saturation_detail并保持零饱和门槛；不能假定先前step200饱和来自q0。
+
+推荐服务器参数（原checkpoint/PTQ及扩大后的CSV路径沿用启动参数）：
+
+```bash
+--resume-scales results/rvq-only-v1-batch4-20260927-003008/scales_step_00100.pt \
+--frontend rvq-only --scale-mode v1 \
+--steps 400 --eval-every 50 --batch-size 8 \
+--lr 0.00005 --max-ratio 1.08 --distance-weight 0.1 --codebook-weight 0.02 \
+--anchor-weight 0.001 --energy-weighted-kl \
+--train-crop-positions 0.25 0.5 0.75 --gate-profile experimental
+```
+
+先生成新清单：
+
+```bash
+python tools/prepare_rvq_scale_manifests.py \
+  --audio-dir data/librispeech/LibriSpeech/train-clean-100 \
+  --output-dir "$NEW_MANIFEST_DIR" \
+  --train-count 128 --validation-count 60 --test-count 50 --seed 42
+```
+
+本轮没有改动严格/实验门槛，不因0.100034而放宽P90标准。
+可显式添加 `--diagnostic-test-candidate`：训练结束只加载本轮best_audio_candidate，
+生成 `diagnostic_test_report.json`、试听WAV和RVQ debug golden，然后无条件return，禁止export。
+与`--resume-scales ... --steps 0`组合可只诊断一个候选（在当前验证集audio_pass才允许）。
+无音频合格候选则不碰测试集。诊断测试也是测试集使用，应固定方案只评一次，不能test后再调参。
+该开关并非跳过门槛生成部署包；报告保留实际passed和diagnostic_only/export_allowed=false标记。
+
+需同步：train_rvq_quant_scales.py、rvq_scale_qat.py、prepare_rvq_scale_manifests.py及test_rvq_scale_qat.py。
+12项单元测试覆盖恢复来源/冻结state、裁剪去重、能量加权与梯度、batch累积、双门槛、整数参考等。
+真实step100 checkpoint续训、扩大数据集评价和RTL测试尚需服务器执行。
+
 ## 2026-09-27 批量微调与双门槛（最新）
 
 不再仅在通过时保存：每次验证保存`scales_step_XXXXX.pt`（含step0）、

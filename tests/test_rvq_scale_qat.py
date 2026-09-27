@@ -9,6 +9,59 @@ from tools.integer_rvq_reference import run_integer,lookup,export_package,ratio_
 
 
 class ScaleQATTests(unittest.TestCase):
+    def test_calibrated_artifact_loads_new_output_scale(self):
+        from tools.train_rvq_quant_scales import restore_calibrated_candidate
+        model=ScaleRVQ([np.ones((4,2))],[.01],.001,max_ratio=1.08)
+        prov=dict(checkpoint_sha256='a',ptq_report_sha256='b',
+                  args=dict(frontend='rvq-only',scale_mode='v1',max_ratio=1.08))
+        artifact=dict(artifact_type='frozen_output_calibration',provenance=prov,
+            scale_state=model.state_dict(),calibrated_output_scale=.002,
+            calibration=dict(new_output_scale=.002),validation=dict(output_scale=.002,
+                indices_unchanged=True,scales=[.01],summary=dict(experimental_pass=True,strict_pass=False)))
+        self.assertEqual(restore_calibrated_candidate(model,artifact,prov,'experimental'),.002)
+        with self.assertRaises(ValueError):
+            restore_calibrated_candidate(model,artifact,prov,'strict')
+        with self.assertRaises(ValueError):
+            restore_calibrated_candidate(model,dict(artifact,calibrated_output_scale=.003),prov,'experimental')
+        with self.assertRaises(ValueError):
+            restore_calibrated_candidate(model,dict(artifact,artifact_type='training'),prov,'experimental')
+
+    def test_resume_delta_only_and_reject_foreign_state(self):
+        from tools.train_rvq_quant_scales import restore_scales,crop_starts
+        model=ScaleRVQ([np.ones((4,2))],[.01],.001,max_ratio=1.08)
+        provenance=dict(checkpoint_sha256='a',ptq_report_sha256='b',
+                        args=dict(frontend='rvq-only',scale_mode='v1',max_ratio=1.08))
+        state={k:v.clone() for k,v in model.state_dict().items()}
+        state['delta'].fill_(.2)
+        saved=dict(provenance=provenance,scale_state=state)
+        restore_scales(model,saved,provenance)
+        self.assertAlmostEqual(model.delta.item(),.2)
+        with self.assertRaises(ValueError):
+            restore_scales(model,saved,dict(provenance,checkpoint_sha256='different'))
+        state['book_0'].zero_()
+        with self.assertRaises(ValueError):
+            restore_scales(model,saved,provenance)
+        self.assertEqual(crop_starts(100,20,[.25,.5,.75]),[20,40,60])
+        self.assertEqual(crop_starts(20,20,[.25,.5,.75]),[0])
+
+    def test_energy_weighted_kl_and_floor(self):
+        rng=np.random.default_rng(37)
+        books=[rng.normal(size=(8,4)) for _ in range(2)]
+        x=torch.tensor(rng.normal(size=(1,10,4)))
+        x[:,0]*=10
+        a=ScaleRVQ(books,[.02,.01],.001,energy_weighted=True)
+        b=ScaleRVQ(books,[.02,.01],.001,energy_weighted=False)
+        ya,da,_=a(x,x)
+        yb,db,_=b(x,x)
+        torch.testing.assert_close(ya,yb)
+        self.assertNotAlmostEqual(da.item(),db.item(),places=7)
+        da.backward()
+        self.assertTrue(torch.isfinite(a.delta.grad).all())
+        with torch.no_grad():
+            a.scale_floor[0]=.019
+            a.delta[0]=-100
+        self.assertAlmostEqual(a.scales()[0].item(),.019)
+
     def test_experimental_gate_does_not_override_strict(self):
         rows=[dict(aligned_si_sdr_delta=-.01,aligned_corr_delta=0,vqout_nmse=.047,
                    saturation=0,q00=dict(index_flip=.1,energy_weighted_flip=.02)) for _ in range(10)]
